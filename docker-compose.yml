@@ -1,0 +1,37 @@
+services:
+  tuya-bridge:
+    container_name: tuya-bridge
+    restart: unless-stopped
+    stop_grace_period: 10s
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    volumes:
+      - ./data/config:/app/config
+      - ./data/state:/app/state
+      - ./data/logs:/app/logs
+      - ./data/backup:/app/backup
+      # Монтируем .env внутрь контейнера (для переменных окружения)
+      - ./bridge/.env:/app/.env:ro
+    environment:
+      - TZ=${TZ:-Europe/Moscow}
+
+  tuya-webui:
+    container_name: tuya-webui
+    restart: unless-stopped
+    stop_grace_period: 5s
+    cap_add:
+      - NET_RAW
+    build:
+      context: ./webui
+      dockerfile: Dockerfile
+    ports:
+      - "${WEBUI_PORT:-5386}:5386"
+    volumes:
+      - ./data/config/devices_config.json:/app/devices_config.json:ro
+      - ./data/logs:/app/logs:ro
+      - ./data/webui_state:/app/webui_state
+      # Монтируем .env внутрь контейнера (для переменных окружения)
+      - ./webui/.env:/app/.env:ro
+    environment:
+      - TZ=${TZ:-Europe/Moscow}
