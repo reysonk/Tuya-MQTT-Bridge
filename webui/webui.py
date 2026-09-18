@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Tuya Bridge WebUI — отдельный контейнер.
-Версия: 1.24.5
+
+Версия: 1.26.0
+
 """
 
 import json
@@ -16,11 +18,12 @@ import threading
 import logging
 import uuid
 import copy
-from collections import deque
 import shutil
 import socket as _socket
 import queue as _queue
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -48,7 +51,6 @@ TOPIC_PREFIX = os.getenv("TOPIC_PREFIX", "tuya")
 WEBUI_PORT = int(os.getenv("WEBUI_PORT", 5386))
 WEBUI_HOST = os.getenv("WEBUI_HOST", "0.0.0.0")
 
-WEBUI_VERSION = "1.24.5"
 CONFIG_FILE = "devices_config.json"
 LOG_FILE = "logs/bridge.log"
 LOG_FILE_WEBUI = "logs/webui.log"
@@ -120,6 +122,424 @@ MAC_VENDOR_MAP = {
     "F4:F5:D8": "Google", "54:60:09": "Google", "1C:F2:9A": "Google",
     "00:1A:22": "Apple", "F0:18:98": "Apple", "AC:BC:32": "Apple",
 }
+
+# ============================================================
+# v1.25.0 (task #C): словари русских имён DP.
+# ============================================================
+
+DP_CODE_NAMES_RU = {
+    "switch_led": "Свет",
+    "switch_led_1": "Свет 1",
+    "switch": "Реле",
+    "switch_1": "Реле 1",
+    "switch_2": "Реле 2",
+    "switch_3": "Реле 3",
+    "switch_4": "Реле 4",
+    "bright_value": "Яркость",
+    "bright_value_1": "Яркость 1",
+    "temp_value": "Цветовая температура",
+    "temp_value_1": "Цветовая температура",
+    "colour_data": "Цвет (RGB)",
+    "colour_data_v2": "Цвет (RGB v2)",
+    "work_mode": "Режим работы",
+    "scene_data": "Сцены",
+    "flash_scene_1": "Сцена 1",
+    "flash_scene_2": "Сцена 2",
+    "music_data": "Музыкальный режим",
+    "control_data": "Управление",
+    "countdown": "Таймер",
+    "countdown_1": "Таймер 1",
+    "countdown_2": "Таймер 2",
+    "countdown_3": "Таймер 3",
+    "countdown_4": "Таймер 4",
+    "va_temperature": "Текущая температура",
+    "temp_current": "Текущая температура",
+    "temp_set": "Уставка температуры",
+    "temp_current_f": "Текущая темп. (°F)",
+    "va_humidity": "Влажность",
+    "humidity": "Влажность",
+    "battery_percentage": "Батарея (%)",
+    "battery_state": "Состояние батареи",
+    "battery_value": "Уровень батареи",
+    "cur_voltage": "Напряжение",
+    "cur_current": "Ток",
+    "cur_power": "Мощность",
+    "add_ele": "Накопленная энергия",
+    "forward_energy_total": "Энергия (всего)",
+    "reverse_energy_total": "Энергия (обратно)",
+    "phase_a": "Фаза A",
+    "phase_b": "Фаза B",
+    "phase_c": "Фаза C",
+    "fault": "Ошибка",
+    "leakage_current": "Ток утечки",
+    "supply_frequency": "Частота сети",
+    "power_factor": "Коэффициент мощности",
+    "electric_total": "Электроэнергия",
+    "total_forward_energy": "Общая прямая энергия",
+    "output_voltage": "Напряжение",
+    "output_current": "Ток",
+    "output_power": "Активная мощность",
+    "relay_status": "Состояние при включении",
+    "switch_backlight": "Подсветка",
+    "switch_prepayment": "Предоплата",
+    "switch_inching": "Импульсный режим",
+    "switch_type": "Тип выключателя",
+    "cycle_time": "Циклический таймер",
+    "random_time": "Случайный таймер",
+    "inching_time": "Время импульса",
+    "test_bit": "Результат теста",
+    "overcharge_switch": "Защита от перезарядки",
+    "light_mode": "Режим индикатора",
+    "child_lock": "Блокировка от детей",
+    "doorcontact_state": "Дверь",
+    "pir": "Движение",
+    "motion_sensitivity": "Чувствительность движения",
+    "watersensor_state": "Протечка",
+    "smoke_sensor_status": "Дым",
+    "gas_sensor_status": "Газ",
+    "temp_alarm": "Тревога температуры",
+    "hum_alarm": "Тревога влажности",
+    "mode": "Режим работы",
+    "preset_mode": "Пресет",
+    "eco": "Эко",
+    "window_check": "Обнаружение окна",
+    "frost": "Защита от замерзания",
+    "valve_check": "Обнаружение клапана",
+    "temp_correction": "Коррекция температуры",
+    "upper_temp": "Верхний порог",
+    "upper_temp_f": "Верхний порог (°F)",
+    "lower_temp": "Нижний порог",
+    "maxtemp_set": "Верхний порог температуры",
+    "minitemp_set": "Нижний порог температуры",
+    "maxhum_set": "Верхний порог влажности",
+    "minihum_set": "Нижний порог влажности",
+    "temp_unit_convert": "Единицы температуры",
+    "temp_set_f": "Уставка (°F)",
+    "temp_sensitivity": "Чувствительность температуры",
+    "hum_sensitivity": "Чувствительность влажности",
+    "temp_periodic_report": "Период отчёта температуры",
+    "work_days": "Рабочие дни",
+    "holiday_days_set": "Дней в режиме отпуска",
+    "factory_reset": "Сброс к заводским",
+    "do_not_disturb": "Не беспокоить",
+    "alarm_set_1": "Настройка тревоги 1",
+    "alarm_set_2": "Настройка тревоги 2",
+    "clear_energy": "Сброс энергии",
+    "clr_all_energy": "Сброс энергии",
+    "breaker_id": "ID устройства",
+    "refresh": "Обновить",
+    "balance_energy": "Остаток энергии",
+    "charge_energy": "Пополнение энергии",
+    "leakagecurr_test": "Тест тока утечки",
+    "voltage_coe": "Калибровка напряжения",
+    "electric_coe": "Калибровка тока",
+    "power_coe": "Калибровка мощности",
+    "electricity_coe": "Калибровка энергии",
+}
+
+DP_CN_NAMES_RU = {
+    "开关": "Выключатель",
+    "开关1": "Выключатель 1",
+    "开关2": "Выключатель 2",
+    "开关3": "Выключатель 3",
+    "开关4": "Выключатель 4",
+    "开关1倒计时": "Таймер выключателя 1",
+    "开关2倒计时": "Таймер выключателя 2",
+    "开关3倒计时": "Таймер выключателя 3",
+    "开关4倒计时": "Таймер выключателя 4",
+    "上电状态": "Состояние при включении",
+    "上电状态设置": "Настройка состояния при включении",
+    "背光开关": "Подсветка",
+    "循环定时": "Циклический таймер",
+    "随机定时": "Случайный таймер",
+    "点动开关": "Импульсный режим",
+    "开关类型": "Тип выключателя",
+    "产测结果位": "Результат теста",
+    "故障告警": "Аварийная сигнализация",
+    "过充保护": "Защита от перезарядки",
+    "模式": "Режим работы",
+    "亮度值": "Яркость",
+    "冷暖值": "Цветовая температура",
+    "场景": "Сцены",
+    "倒计时1": "Таймер",
+    "倒计时剩余时间": "Остаток таймера",
+    "彩光": "RGB-цвет",
+    "音乐灯": "Музыкальный режим",
+    "调节": "Управление",
+    "勿扰模式": "Не беспокоить",
+    "温标切换": "Единицы температуры",
+    "温标切换设置": "Настройка единиц температуры",
+    "温度上限设置": "Верхний порог температуры",
+    "温度下限设置": "Нижний порог температуры",
+    "湿度上限设置": "Верхний порог влажности",
+    "湿度下限设置": "Нижний порог влажности",
+    "温度报警": "Тревога температуры",
+    "湿度报警": "Тревога влажности",
+    "温度灵敏度": "Чувствительность температуры",
+    "湿度灵敏度": "Чувствительность влажности",
+    "温度周期上报": "Период отчёта температуры",
+    "当前温度": "Текущая температура",
+    "湿度数值": "Влажность",
+    "电池电量": "Батарея",
+    "电池电量百分比": "Батарея (%)",
+    "电池电量状态": "Состояние батареи",
+    "门磁状态": "Дверь",
+    "人体感应状态": "Датчик движения",
+    "水浸检测状态": "Датчик протечки",
+    "工作模式": "Режим работы",
+    "温度设置": "Уставка температуры",
+    "目标温度_F": "Уставка (°F)",
+    "设置温度上限": "Верхний порог",
+    "设置温度上限_F": "Верхний порог (°F)",
+    "当前温度_F": "Текущая темп. (°F)",
+    "开窗检测": "Обнаружение окна",
+    "防霜冻功能": "Защита от замерзания",
+    "阀门检测": "Обнаружение клапана",
+    "工作日设置": "Рабочие дни",
+    "假日模式天数设置": "Дней в режиме отпуска",
+    "恢复出厂设置": "Сброс к заводским",
+    "童锁": "Блокировка от детей",
+    "当前电压": "Текущее напряжение",
+    "当前电流": "Текущий ток",
+    "当前功率": "Текущая мощность",
+    "电压校准系数": "Калибровка напряжения",
+    "电流校准系数": "Калибровка тока",
+    "功率校准系数": "Калибровка мощности",
+    "电量校准系数": "Калибровка энергии",
+    "增加电量": "Накопленная энергия",
+    "指示灯状态设置": "Режим индикатора",
+    "童锁开关": "Блокировка от детей",
+    "正向总有功电量": "Общая прямая энергия",
+    "剩余可用电量清零": "Сбросить остаток",
+    "剩余可用电量显示": "Остаток энергии",
+    "电量充值": "Пополнение энергии",
+    "剩余电流显示": "Ток утечки",
+    "剩余电流测试": "Тест тока утечки",
+    "预付费功能开关": "Предоплата",
+    "断路器开关": "Главный выключатель",
+    "告警设置1": "Настройка тревоги 1",
+    "告警设置2": "Настройка тревоги 2",
+    "设备号显示": "ID устройства",
+    "功率因素": "Коэффициент мощности",
+    "供电频率": "Частота сети",
+    "有功功率": "Активная мощность",
+    "清电量": "Сброс энергии",
+    "刷新上报": "Обновить",
+    "A相电压，电流及功率": "Фаза A (U/I/P)",
+    "Voltage": "Напряжение",
+    "Current": "Ток",
+}
+
+# v1.25.0 (fix #cloud_dps): индексы Cloud-mapping для обогащения
+# dps_map в /api/status. Загружаются при старте и после /api/cloud/fetch.
+TUYA_CLOUD_MAPPING_BY_ID = {}
+TUYA_CLOUD_MAPPING_BY_NAME = {}
+TUYA_CLOUD_MAPPING_LOCK = threading.Lock()
+
+
+def _load_cloud_mappings():
+    """Загрузить mapping из webui_state/tuya_cloud_cache.json в память.
+    Ключи: tuya_id и name (friendly) — оба индекса для надёжности."""
+    global TUYA_CLOUD_MAPPING_BY_ID, TUYA_CLOUD_MAPPING_BY_NAME
+    by_id = {}
+    by_name = {}
+    try:
+        if not os.path.exists(TUYA_CLOUD_CACHE_FILE):
+            log.info("[CloudDPS] Кэш Cloud не найден — обогащение пропущено")
+            with TUYA_CLOUD_MAPPING_LOCK:
+                TUYA_CLOUD_MAPPING_BY_ID = {}
+                TUYA_CLOUD_MAPPING_BY_NAME = {}
+            return
+        with open(TUYA_CLOUD_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        devices = data.get("devices") or []
+        for d in devices:
+            if not isinstance(d, dict):
+                continue
+            mapping = d.get("mapping") or {}
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            did = d.get("id") or ""
+            dname = d.get("name") or ""
+            if did:
+                by_id[did] = mapping
+            if dname:
+                by_name[dname] = mapping
+        with TUYA_CLOUD_MAPPING_LOCK:
+            TUYA_CLOUD_MAPPING_BY_ID = by_id
+            TUYA_CLOUD_MAPPING_BY_NAME = by_name
+        log.info(f"[CloudDPS] Загружено mapping: by_id={len(by_id)}, by_name={len(by_name)}")
+    except Exception as e:
+        log.warning(f"[CloudDPS] load failed: {e}")
+
+
+def _get_cloud_mapping(tuya_id, friendly_name):
+    """Достать Cloud-mapping для устройства по tuya_id или friendly_name."""
+    with TUYA_CLOUD_MAPPING_LOCK:
+        if tuya_id and tuya_id in TUYA_CLOUD_MAPPING_BY_ID:
+            return TUYA_CLOUD_MAPPING_BY_ID[tuya_id]
+        if friendly_name and friendly_name in TUYA_CLOUD_MAPPING_BY_NAME:
+            return TUYA_CLOUD_MAPPING_BY_NAME[friendly_name]
+    return {}
+
+
+def _enrich_dps_map_from_cache(dps_map, cache, tuya_id, friendly_name):
+    """Дополнить dps_map теми DP, что есть в cache, но нет в config.
+    Берём code из Cloud-mapping. DP без Cloud-code — пропускаем.
+    Возвращает НОВЫЙ dict (не мутирует входной)."""
+    if not cache or not isinstance(cache, dict):
+        return dps_map
+    cloud_map = _get_cloud_mapping(tuya_id, friendly_name)
+    if not cloud_map:
+        return dps_map
+    out = dict(dps_map or {})
+    added = 0
+    for dp in cache.keys():
+        dp_str = str(dp)
+        if dp_str in out:
+            continue
+        m = cloud_map.get(dp_str) or cloud_map.get(dp)
+        if not isinstance(m, dict):
+            continue
+        code = (m.get("code") or "").strip()
+        if not code:
+            continue
+        entry = {
+            "component": "sensor",  # перезапишется ниже по dtype
+            "name": code,
+            "_name_source": "cloud",
+            "_from_cache": True,
+        }
+        # v1.25.0 (release): правильный component по dtype.
+        # Раньше всё кроме Boolean → sensor. Теперь:
+        #   Boolean → switch
+        #   Enum    → select
+        #   Integer с min/max → number (иначе sensor)
+        #   String/Json/Raw → sensor
+        dtype = m.get("type", "")
+        if dtype:
+            entry["_cloud_type"] = dtype
+        vals = m.get("values", {})
+        if isinstance(vals, dict):
+            for k in ("unit", "scale", "min", "max", "step"):
+                if k in vals:
+                    entry[k] = vals[k]
+        # v1.25.12: component определяется по dtype независимо
+        # от того, пришли values или нет (vals может быть None/строкой).
+        if dtype == "Boolean":
+            entry["component"] = "switch"
+        elif dtype == "Enum":
+            entry["component"] = "select"
+        elif dtype == "Integer":
+            if isinstance(vals, dict) and "min" in vals and "max" in vals:
+                entry["component"] = "number"
+            else:
+                entry["component"] = "sensor"
+        else:
+            entry["component"] = "sensor"
+        # v1.25.0 (fix #cache_en): оставляем name = code (английское),
+        # _name_source = "cloud" (истинный источник). Русский перевод
+        # будет в тултипе (frontend).
+        out[dp_str] = entry
+        added += 1
+    if added:
+        log.debug(f"[CloudDPS] {friendly_name}: +{added} DP из Cloud-mapping")
+    return out
+
+
+_CJK_RE = None
+
+
+def _has_cjk(s):
+    """True, если в строке есть CJK-иероглифы (кит./яп./кор.)."""
+    global _CJK_RE
+    if _CJK_RE is None:
+        import re as _re
+        _CJK_RE = _re.compile(
+            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+            r"\u3040-\u30ff\uac00-\ud7af]"
+        )
+    return bool(_CJK_RE.search(s or ""))
+
+
+def _enrich_dps_names(dps_map, cloud_generated=None):
+    """v1.25.0 (task #C): проставить человеческое имя каждому DP.
+
+    Приоритет:
+      1. dps_map[dp].name — непустое и без CJK.
+      2. cloud_generated[dp].name — непустое и без CJK.
+      3. DP_CODE_NAMES_RU[code].
+      4. DP_CN_NAMES_RU[оригинальное_китайское_имя].
+      5. (пусто) — _name_source='none', _name_original=<китайский>.
+    """
+    out = {}
+    cloud_generated = cloud_generated or {}
+    for dp, info in (dps_map or {}).items():
+        info = dict(info or {})
+        code = info.get("code", "") or ""
+        name = (info.get("name") or "").strip()
+        orig_cn = ""
+
+        if name and not _has_cjk(name):
+            info["_name_source"] = "config"
+        else:
+            if name and _has_cjk(name):
+                orig_cn = name
+
+            cname = ""
+            cg = cloud_generated.get(str(dp)) or {}
+            if isinstance(cg, dict):
+                cname = (cg.get("name") or "").strip()
+
+            if cname and not _has_cjk(cname):
+                info["name"] = cname
+                info["_name_source"] = "cloud"
+            elif cname and _has_cjk(cname):
+                if not orig_cn:
+                    orig_cn = cname
+                if code in DP_CODE_NAMES_RU:
+                    info["name"] = DP_CODE_NAMES_RU[code]
+                    info["_name_source"] = "dict"
+                elif orig_cn in DP_CN_NAMES_RU:
+                    info["name"] = DP_CN_NAMES_RU[orig_cn]
+                    info["_name_source"] = "cn"
+                else:
+                    info["name"] = ""
+                    info["_name_source"] = "none"
+            elif code in DP_CODE_NAMES_RU:
+                info["name"] = DP_CODE_NAMES_RU[code]
+                info["_name_source"] = "dict"
+            elif orig_cn in DP_CN_NAMES_RU:
+                info["name"] = DP_CN_NAMES_RU[orig_cn]
+                info["_name_source"] = "cn"
+            else:
+                info["name"] = ""
+                info["_name_source"] = "none"
+
+        if orig_cn:
+            info["_name_original"] = orig_cn
+        out[dp] = info
+    return out
+
+
+def _load_cloud_generated_for(device_name):
+    """Достать dps_map_generated из tuya_cloud_cache.json по name или id."""
+    try:
+        if not os.path.exists(TUYA_CLOUD_CACHE_FILE):
+            return {}
+        with open(TUYA_CLOUD_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for d in (data.get("devices") or []):
+            if not isinstance(d, dict):
+                continue
+            if d.get("name") == device_name or d.get("id") == device_name:
+                gen = d.get("dps_map_generated") or {}
+                if isinstance(gen, dict):
+                    return gen
+    except Exception as e:
+        log.debug(f"[Names] cloud_generated for {device_name}: {e}")
+    return {}
+
 
 JUNK_DP_CODES = {
     "refresh", "clear_energy", "clr_all_energy",
@@ -215,11 +635,19 @@ def _check_tz_for_quiet():
     """P2 1.22.0: quiet hours привязаны к локальному времени контейнера."""
     try:
         import datetime as _dt
-        tzname = _dt.datetime.now().astimezone().tzname() or "?"
-        offset = _dt.datetime.now().astimezone().utcoffset()
-        off_h = int(offset.total_seconds() // 3600) if offset else 0
-        log.info(f"[Quiet] TZ контейнера: {tzname} (UTC{off_h:+d})")
-        if off_h == 0 and tzname.upper() in ("UTC", "GMT"):
+        now_dt = _dt.datetime.now().astimezone()
+        tzname = now_dt.tzname() or "?"
+        offset = now_dt.utcoffset()
+        off_min = int(offset.total_seconds() // 60) if offset else 0
+        off_h = off_min // 60
+        off_m = abs(off_min % 60)
+        off_str = f"UTC{off_h:+d}" + (f":{off_m:02d}" if off_m else "")
+        log.info(f"[Quiet] TZ контейнера: {tzname} ({off_str})")
+        # v1.25.12: ложное срабатывание для Europe/London зимой
+        # (tzname="GMT", off=0). Считаем UTC только если tzname
+        # явно UTC/GMT и НЕ задан TZ через env.
+        env_tz = os.environ.get("TZ", "")
+        if off_h == 0 and off_m == 0 and not env_tz and tzname.upper() in ("UTC", "GMT"):
             log.warning("[Quiet] TZ=UTC — проверь docker-compose (TZ=Asia/Novosibirsk)")
     except Exception as e:
         log.warning(f"[Quiet] TZ check: {e}")
@@ -280,6 +708,11 @@ def quiet_until_ts(name):
         return 0
     nm = _quiet_now_minutes()
     now = time.time()
+    # v1.25.12: сначала ищем окно, в котором мы СЕЙЧАС (is_quiet),
+    # возвращаем его end. Это правильнее, чем брать первое попавшееся:
+    # при пересечении окон (напр. 23:00-08:00 и 08:00-09:00)
+    # _quiet_window_contains матчит оба, а мы должны вернуть то,
+    # которое реально определяет текущий quiet.
     for w in wins:
         if _quiet_window_contains(w, nm):
             t_ = _quiet_parse_hm(w.get("to"))
@@ -287,14 +720,22 @@ def quiet_until_ts(name):
                 continue
             delta_min = (t_ - nm) % (24 * 60)
             return int(now + delta_min * 60)
+    # Не в окне — ищем окно, из которого только что вышли (grace).
     grace_min = max(1, QUIET_GRACE_SEC // 60)
+    best_end = 0
+    best_diff = None
     for w in wins:
         t_ = _quiet_parse_hm(w.get("to"))
         if t_ is None:
             continue
         diff = (nm - t_) % (24 * 60)
         if 0 <= diff <= grace_min:
-            return int(now - diff * 60 + grace_min * 60)
+            # выбираем окно с минимальной diff — оно самое «свежее».
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_end = t_
+    if best_end:
+        return int(now - best_diff * 60 + grace_min * 60)
     return 0
 
 
@@ -407,6 +848,17 @@ def load_device_meta():
                         "device_class": "current", "unit": "A", "state_class": "measurement"}
                     meta["dps_map"]["6_power"] = {"name": "power", "component": "sensor",
                         "device_class": "power", "unit": "kW", "state_class": "measurement"}
+                # v1.25.0 (task #C): обогащаем имена DP —
+                # config → cloud → code-словарь → cn-словарь.
+                try:
+                    # v1.25.12: d["name"] — snake_case из config,
+                    # а в tuya_cloud_cache.json name = friendly. Ищем по id.
+                    _cg = _load_cloud_generated_for(
+                        d.get("id") or d.get("friendly_name") or d["name"]
+                    )
+                    meta["dps_map"] = _enrich_dps_names(meta["dps_map"], _cg)
+                except Exception as _e:
+                    log.debug(f"[Names] enrich {d.get('name')}: {_e}")
                 new_meta[d["name"]] = meta
         with DEVICE_META_LOCK:
             DEVICE_META = new_meta
@@ -686,21 +1138,47 @@ def db_query_flaps_hourly(period_hours=24):
 
 
 def _db_query_flaps_hourly_excluding(period_hours, exclude_devs):
-    """v1.22.3: переходы по часам, исключая указанные устройства (quiet-hours)."""
-    if not ANALYTICS_ENABLED or not exclude_devs:
-        return db_query_flaps_hourly(period_hours)
+    """v1.22.3: переходы по часам, исключая указанные устройства (quiet-hours).
+    v1.24.6: возвращаем и список устройств по каждому часу —
+    devices: [{name, count}, ...]."""
+    if not ANALYTICS_ENABLED:
+        return []
     cutoff = int(time.time()) - period_hours * 3600
-    placeholders = ",".join("?" * len(exclude_devs))
     with _db_lock:
         try:
-            cur = _db_conn.execute(
-                f"SELECT (ts/3600)*3600 AS hour_ts, COUNT(*) "
-                f"FROM status_events WHERE ts>=? AND dev NOT IN ({placeholders}) "
-                f"GROUP BY hour_ts ORDER BY hour_ts",
-                (cutoff, *exclude_devs)
-            )
-            return [{"ts": r[0], "flaps": r[1]} for r in cur.fetchall()]
-        except: return []
+            if exclude_devs:
+                # v1.25.13: явный tuple — детерминированный порядок
+                # параметров (set давал произвольный).
+                ex_list = tuple(exclude_devs)
+                placeholders = ",".join("?" * len(ex_list))
+                cur = _db_conn.execute(
+                    f"SELECT (ts/3600)*3600 AS hour_ts, dev, COUNT(*) "
+                    f"FROM status_events WHERE ts>=? AND dev NOT IN ({placeholders}) "
+                    f"GROUP BY hour_ts, dev ORDER BY hour_ts",
+                    (cutoff, *ex_list)
+                )
+            else:
+                cur = _db_conn.execute(
+                    "SELECT (ts/3600)*3600 AS hour_ts, dev, COUNT(*) "
+                    "FROM status_events WHERE ts>=? "
+                    "GROUP BY hour_ts, dev ORDER BY hour_ts",
+                    (cutoff,)
+                )
+            by_hour = {}
+            for hour_ts, dev, cnt in cur.fetchall():
+                by_hour.setdefault(hour_ts, []).append({"name": dev, "count": cnt})
+            out = []
+            for hour_ts in sorted(by_hour.keys()):
+                devs = sorted(by_hour[hour_ts],
+                              key=lambda x: (-x["count"], x["name"]))
+                out.append({
+                    "ts": hour_ts,
+                    "flaps": sum(d["count"] for d in devs),
+                    "devices": devs,
+                })
+            return out
+        except Exception:
+            return []
 
 
 def db_query_dev_history(dev, period_hours=24, limit=100):
@@ -859,6 +1337,15 @@ def _do_latency_round():
     devices = [d for d in devices if not is_quiet_now(d)]
     meta_snap = snapshot_device_meta()
     if not devices:
+        # v1.25.13: не оставляем UI в состоянии «running» —
+        # иначе прогресс-бар висит 0/0 до конца тика.
+        with LATENCY_REFRESH_STATE_LOCK:
+            LATENCY_REFRESH_STATE["running"] = False
+            LATENCY_REFRESH_STATE["current"] = 0
+            LATENCY_REFRESH_STATE["total"] = 0
+            LATENCY_REFRESH_STATE["device"] = ""
+            LATENCY_REFRESH_STATE["finished_at"] = int(time.time())
+            LATENCY_REFRESH_STATE["ok"] = True
         return
 
     with LATENCY_REFRESH_STATE_LOCK:
@@ -964,13 +1451,32 @@ def latency_worker():
                 if STOP_EVENT.wait(LATENCY_INTERVAL): break
                 continue
             _LATENCY_REFRESH_RUNNING[0] = True
+        # v1.25.0 (fix #1): синхронизируем публичное состояние прогресса —
+        # иначе _do_latency_round() не обновляет total/current/device
+        # (там условие `if LATENCY_REFRESH_STATE["running"]:`).
+        with LATENCY_REFRESH_STATE_LOCK:
+            if not LATENCY_REFRESH_STATE["running"]:
+                LATENCY_REFRESH_STATE["running"] = True
+                LATENCY_REFRESH_STATE["current"] = 0
+                LATENCY_REFRESH_STATE["total"] = 0
+                LATENCY_REFRESH_STATE["device"] = ""
+                LATENCY_REFRESH_STATE["started_at"] = int(time.time())
+                LATENCY_REFRESH_STATE["finished_at"] = 0
+                LATENCY_REFRESH_STATE["ok"] = None
+        _latency_ok = True
         try:
             _do_latency_round()
         except Exception as e:
             log.warning(f"[Latency] error: {e}")
+            _latency_ok = False
         finally:
             with _LATENCY_REFRESH_LOCK:
                 _LATENCY_REFRESH_RUNNING[0] = False
+            with LATENCY_REFRESH_STATE_LOCK:
+                if LATENCY_REFRESH_STATE["running"]:
+                    LATENCY_REFRESH_STATE["running"] = False
+                    LATENCY_REFRESH_STATE["finished_at"] = int(time.time())
+                    LATENCY_REFRESH_STATE["ok"] = _latency_ok
         if STOP_EVENT.wait(LATENCY_INTERVAL): break
     log.info("[Latency] Воркер остановлен")
 
@@ -1747,7 +2253,12 @@ def tuya_cloud_fetch(access_id, access_secret, region, fetch_mappings=True):
                 except Exception as e:
                     log.warning(f"[Cloud] props for {d['id']}: {e}")
 
-        save_tinytuya_devices_json(normalized)
+        # v1.25.0 (fix3): Cloud fetch больше НЕ перезаписывает
+        # tinytuya_devices.json. Только tuya_cloud_cache.json
+        # (через save_cloud_cache в /api/cloud/fetch handler).
+        # tinytuya_devices.json обновляется только через
+        # /api/base/tinytuya/rebuild (кнопка «🔄 Пересобрать tinytuya.json»).
+        # save_tinytuya_devices_json(normalized)  ← было, убрано
 
         return {"ok": True, "devices": normalized}
     except Exception as e:
@@ -2181,8 +2692,36 @@ def _rebuild_tinytuya_json_worker(device_names):
             continue
 
         matched = {}
-        cloud_status_meta = cfg.get("_cloud_status_meta", []) or []
-        cloud_current_values = cfg.get("_cloud_status_values", {}) or {}
+        # v1.25.0 (release): cloud_status_meta берём из Cloud-индексов
+        # (TUYA_CLOUD_MAPPING_BY_ID), а не из cfg — в devices_config.json
+        # этих полей нет, поэтому match_dps_to_codes() всегда работал
+        # по пустым спискам и не сопоставлял DP.
+        cloud_status_meta = []
+        cloud_current_values = {}
+        _cm = _get_cloud_mapping(dev_id, cfg.get("friendly_name", name))
+        if _cm:
+            for _dp, _m in _cm.items():
+                if not isinstance(_m, dict):
+                    continue
+                _code = _m.get("code", "")
+                if not _code:
+                    continue
+                cloud_status_meta.append({
+                    "code": _code,
+                    "type": _m.get("type", ""),
+                    "values": _m.get("values", {}),
+                    "name": _m.get("name", ""),
+                })
+            # current_values — из _raw_cloud.status, если есть
+            _raw = (load_cloud_cache() or {}).get("devices") or []
+            for _d in _raw:
+                if _d.get("id") == dev_id:
+                    _st = _d.get("_raw_cloud", {}).get("status", [])
+                    if isinstance(_st, list):
+                        for _item in _st:
+                            if isinstance(_item, dict) and _item.get("code"):
+                                cloud_current_values[_item["code"]] = _item.get("value")
+                    break
         if cloud_status_meta and cloud_current_values:
             try:
                 matched = match_dps_to_codes(local_dps, cloud_status_meta, cloud_current_values)
@@ -2341,6 +2880,59 @@ HTML_PAGE = r"""<!DOCTYPE html>
     flex-basis: 100%; width: 100%; order: 999; margin-top: 0; }
   .health-detail .hd-row { display:flex; gap:16px; }
   .health-detail .hd-key { color:var(--muted); min-width:90px; }
+  /* v1.25.0 (task #B-css): красивая health-карточка на русском. */
+  .health-detail { padding: 14px 18px; line-height: 1.7; }
+  .health-detail .hd-head {
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom: 10px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .health-detail .hd-head-title {
+    font-weight: 600; font-size: 13px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .health-detail .hd-close {
+    background:none; border:1px solid var(--border);
+    padding:2px 8px; font-size:12px; cursor:pointer;
+    border-radius:6px; color:var(--fg);
+  }
+  .health-detail .hd-close:hover { border-color: var(--accent); }
+  .health-detail .hd-grid {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 6px 14px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+    }
+  .health-detail .hd-lbl { color: var(--muted); }
+  .health-detail .hd-val { color: var(--fg); }
+  .health-detail .hd-dot {
+    display:inline-block; width:8px; height:8px; border-radius:50%;
+    margin-right:6px; vertical-align:middle;
+  }
+  .health-detail .hd-dot.g { background: var(--green); }
+  .health-detail .hd-dot.r { background: var(--red); }
+  .health-detail .hd-dot.y { background: var(--yellow); }
+  .health-detail .hd-badge {
+    display:inline-block; padding:1px 7px; border-radius:10px;
+    font-size:11px; font-weight:600;
+    background: var(--border); color: var(--muted); margin-left:6px;
+    /* v1.25.0 (fix2): cursor:help только у .muted (там есть title).
+       У .ok/.warn/.err — обычный вид. */
+    cursor: default;
+  }
+  .health-detail .hd-badge.ok { background: rgba(46,160,67,0.18); color: var(--green); }
+  .health-detail .hd-badge.warn { background: rgba(176,136,0,0.18); color: var(--yellow); }
+  .health-detail .hd-badge.err { background: rgba(215,58,73,0.18); color: var(--red); }
+  .health-detail .hd-badge.muted { background: var(--border); color: var(--muted); cursor: help; }
+  .health-detail .hd-section {
+    margin-top: 12px; padding-top: 10px;
+    border-top: 1px dashed var(--border);
+  }
+  .health-detail .hd-section-title {
+    color: var(--muted); font-size:11px; text-transform:uppercase;
+    letter-spacing:0.5px; margin-bottom:6px;
+  }
   .modal-header .refresh-btn { background:none; border:1px solid var(--border);
     padding:2px 10px; font-size:14px; line-height:1.4; cursor:pointer; border-radius:6px;
     color:var(--fg); margin-right:6px; }
@@ -2497,6 +3089,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .type-badge.climate { background:rgba(219,109,40,0.18); color:#db6d28; }
   .type-badge.sensor { background:rgba(56,139,253,0.18); color:#388bfd; }
   .type-badge.binary_sensor { background:rgba(163,113,247,0.18); color:#a371f7; }
+  /* v1.25.0 (fix3): цветной бейдж для component DP. */
+  .component-badge { display:inline-block; padding:1px 6px; font-size:11px; border-radius:4px;
+    background:var(--border); color:var(--muted); }
+  .component-badge.switch        { background: rgba(46,160,67,0.18);  color: var(--green); }
+  .component-badge.sensor        { background: rgba(56,139,253,0.18); color: #388bfd; }
+  .component-badge.binary_sensor { background: rgba(163,113,247,0.18); color: #a371f7; }
+  .component-badge.select        { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.number        { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.preset        { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.light         { background: rgba(210,153,34,0.18); color: #d29922; }
+  .component-badge.climate       { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.button        { background: rgba(139,148,158,0.18); color: var(--muted); }
+  .component-badge.time          { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .component-badge.lock          { background: rgba(215,58,73,0.18);  color: var(--red); }
+  .component-badge.phase_a       { background: rgba(210,153,34,0.18); color: #d29922; }
+  /* v1.25.0 (fix3): статусные кнопки баз DP. */
+  .base-info-actions button.btn-success {
+    background: rgba(46,160,67,0.18);
+    color: var(--green);
+    border-color: rgba(46,160,67,0.4);
+  }
+  .base-info-actions button.btn-error {
+    background: rgba(215,58,73,0.18);
+    color: var(--red);
+    border-color: rgba(215,58,73,0.4);
+  }
+  .base-info-actions button .spin {
+    margin-right: 4px;
+    vertical-align: middle;
+  }
   .state-on { color:var(--green); font-weight:600; }
   .state-off { color:var(--muted); }
   .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.55); z-index:1000; align-items:center; justify-content:center; padding:20px; overscroll-behavior: contain; }
@@ -2593,6 +3215,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     margin-top: 12px;
     align-items: center;
     flex-wrap: wrap;
+  }
+  /* v1.25.12: имя DP + ☁ в кэше — flex, значок не съезжает. */
+  .cache-dp-name {
+    display: inline-flex;
+    align-items: baseline;
+    flex-wrap: nowrap;
+    gap: 2px;
+    max-width: 100%;
+  }
+  .cache-dp-name > span {
+    flex-shrink: 0;
+  }
+  .cache-details .detail-table td:first-child {
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
   }
   /* v1.23.10: секция «Кэш состояния» в модалке — сворачиваемая. */
   .cache-details > summary {
@@ -2701,6 +3339,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .tools-list-item.active .tools-list-ip { color:rgba(255,255,255,0.7); }
   .tools-detail { padding:16px; overflow-y:auto; max-height:70vh; }
   .tools-error { padding:24px; text-align:center; color:var(--red); }
+  /* v1.25.12: обёртка для горизонтального скролла широких таблиц
+     (глобально, не только в мобильном медиа). */
+  .wide-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -14px;
+    padding: 0 14px;
+  }
   pre.json-view { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:12px; font-size:12px; overflow-x:auto; max-height:600px; margin:0; }
   pre.json-view code { background:none; padding:0; }
   html[data-theme="dark"] .hljs-attr { color:#79c0ff; }
@@ -2784,7 +3430,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .radio-row { display:flex; gap:8px; align-items:center; margin:8px 0; cursor:pointer; }
   .radio-row input[type="radio"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
   .radio-row label { cursor:pointer; margin:0; font-size:13px; color:var(--fg); }
-  .ui-confirm-text { margin:0 0 16px 0; font-size:14px; line-height:1.5; }
+  /* v1.25.14: pre-wrap — uiConfirm/uiAlert используют textContent,
+     без этого \n в сообщениях теряются (склеиваются в одну строку). */
+  .ui-confirm-text { margin:0 0 16px 0; font-size:14px; line-height:1.5; white-space: pre-wrap; }
   .ui-alert-icon { font-size:32px; text-align:center; margin-bottom:8px; }
   .modal-footer { display:flex; gap:8px; justify-content:flex-end; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg); }
   .latency-spark-labels { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); margin-top:2px; }
@@ -2798,6 +3446,96 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .legend-bar { display:inline-block; width:12px; height:10px; border-radius:2px; }
   .legend-bar.flaps { background:var(--yellow); }
 
+  /* v1.24.6: tooltip для графиков. */
+  .chart-tooltip {
+    position: fixed;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+    pointer-events: none;
+    z-index: 2500;
+    max-width: 280px;
+    font-family: ui-monospace, monospace;
+    line-height: 1.45;
+  }
+  .chart-tooltip .tt-head {
+    color: var(--muted);
+    font-size: 11px;
+    margin-bottom: 4px;
+    white-space: nowrap;
+  }
+  .chart-tooltip .tt-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    white-space: nowrap;
+  }
+  .chart-tooltip .tt-name {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+  .chart-tooltip .tt-val { color: var(--muted); }
+  .chart-tooltip .tt-more {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .chart-tooltip .tt-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .chart-tooltip .tt-badge.good { background: rgba(46,160,67,0.18); color: var(--green); }
+  .chart-tooltip .tt-badge.mid  { background: rgba(176,136,0,0.18); color: var(--yellow); }
+  .chart-tooltip .tt-badge.bad  { background: rgba(215,58,73,0.18); color: var(--red); }
+  .chart-tooltip .tt-badge.online  { background: rgba(46,160,67,0.18); color: var(--green); }
+  .chart-tooltip .tt-badge.offline { background: rgba(215,58,73,0.18); color: var(--red); }
+
+  /* v1.24.6: подсветка элементов на hover/tap. */
+  svg .hoverable { transition: opacity 0.1s; }
+  svg .hoverable.dim { opacity: 0.35; }
+  svg rect.bar-hover { cursor: pointer; }
+  svg rect.bar-hover.hover { stroke: var(--fg); stroke-width: 1.5; }
+  svg rect.seg-hover { cursor: pointer; }
+  svg rect.seg-hover.hover { stroke: var(--fg); stroke-width: 1.5; }
+
+  /* v1.25.6: превью-таблица DP — 5 колонок, а не 7.
+     Фиксируем ширины по назначению, чтобы table-layout: fixed
+     из .wide-table не растягивал «Имя» и «Component». */
+  .detail-table.wide-table.preview-dp-table th:nth-child(1),
+  .detail-table.wide-table.preview-dp-table td:nth-child(1) {
+    width: 44px;
+    max-width: 44px;
+  }
+  .detail-table.wide-table.preview-dp-table th:nth-child(2),
+  .detail-table.wide-table.preview-dp-table td:nth-child(2) {
+    width: 60px;
+    max-width: 60px;
+  }
+  .detail-table.wide-table.preview-dp-table th:nth-child(3),
+  .detail-table.wide-table.preview-dp-table td:nth-child(3) {
+    width: 200px;
+    max-width: 220px;
+  }
+  .detail-table.wide-table.preview-dp-table th:nth-child(4),
+  .detail-table.wide-table.preview-dp-table td:nth-child(4) {
+    width: auto;
+    max-width: none;
+  }
+  .detail-table.wide-table.preview-dp-table th:nth-child(5),
+  .detail-table.wide-table.preview-dp-table td:nth-child(5) {
+    width: 110px;
+    max-width: 130px;
+  }
+
   /* v1.23.0: probe-подсветка карточки */
   .preview-device.probing { border-left: 3px solid var(--yellow); }
   .preview-device.probe-ok { border-left: 3px solid var(--green); transition: border-color 0.5s; }
@@ -2805,6 +3543,190 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   /* v1.23.0: короткие метки кнопок (по умолчанию скрыты, показываются на мобиле) */
   .btn-label-short { display: none; }
+
+  /* v1.25.12: code в wide-table — box-sizing: border-box,
+     компактный padding, фон. Короткое — nowrap + ellipsis.
+     Длинное — 2 строки через -webkit-box. */
+  .detail-table.wide-table code {
+    box-sizing: border-box;
+    padding: 2px 5px;
+    border-radius: 3px;
+    background: var(--code-bg);
+    display: block;
+    width: 100%;
+    font-size: 11px;
+    line-height: 1.35;
+    vertical-align: top;
+  }
+  .detail-table.wide-table code.nowrap-short {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: normal;
+    overflow-wrap: normal;
+  }
+  .detail-table.wide-table code.trunc-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: anywhere;
+    max-height: calc(1.35em * 2 + 4px);
+    cursor: help;
+  }
+  /* v1.25.12: пустое значение — просто muted-прочерк, без фона. */
+  .detail-table.wide-table td.cell > .cell-inner > span.muted {
+    display: inline;
+    background: transparent;
+    padding: 0;
+  }
+
+  /* v1.25.12: table-layout: fixed + colgroup — колонки фиксированы,
+     содержимое ячеек обёрнуто в .cell-inner для overflow: hidden. */
+  .detail-table.wide-table {
+    table-layout: fixed;
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .detail-table.wide-table col.col-check     { width: 40px; }
+  .detail-table.wide-table col.col-dp        { width: 60px; }
+  .detail-table.wide-table col.col-code      { width: 160px; }
+  .detail-table.wide-table col.col-name      { width: 200px; }
+  .detail-table.wide-table col.col-type      { width: 90px; }
+  .detail-table.wide-table col.col-values    { width: 240px; }
+  .detail-table.wide-table col.col-current   { width: 220px; }
+  .detail-table.wide-table col.col-component { width: 110px; }
+  .detail-table.wide-table td.cell {
+    padding: 6px 8px;
+    vertical-align: top;
+    overflow: hidden;
+    white-space: normal;
+    word-break: normal;
+  }
+  .detail-table.wide-table td.cell > .cell-inner {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .detail-table.wide-table td.cell.col-dp > .cell-inner,
+  .detail-table.wide-table td.cell.col-code > .cell-inner,
+  .detail-table.wide-table td.cell.col-type > .cell-inner,
+  .detail-table.wide-table td.cell.col-component > .cell-inner {
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .detail-table.wide-table td.cell > .cell-trunc {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  /* v1.25.8: не рвём по буквам. overflow-wrap: break-word
+     рвёт только если слово не влезает целиком. word-break: normal
+     сохраняет перенос по границам токенов (пробел, запятая). */
+  .detail-table.wide-table th,
+  .detail-table.wide-table td {
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
+    vertical-align: top;
+    overflow: hidden;
+    padding: 6px 8px;
+  }
+  /* узкие колонки — nowrap */
+  .detail-table.wide-table td:nth-child(1),
+  .detail-table.wide-table th:nth-child(1),
+  .detail-table.wide-table td:nth-child(2),
+  .detail-table.wide-table th:nth-child(2),
+  .detail-table.wide-table td:nth-child(3),
+  .detail-table.wide-table th:nth-child(3),
+  .detail-table.wide-table td:nth-child(4),
+  .detail-table.wide-table th:nth-child(4),
+  .detail-table.wide-table td:nth-child(7),
+  .detail-table.wide-table th:nth-child(7) {
+    white-space: nowrap;
+  }
+  /* .copy-row и бейджи — не вылезают */
+  .detail-table.wide-table .copy-row {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  .detail-table.wide-table .copy-hint {
+    display: none;
+  }
+  .detail-table.wide-table .badge.junk,
+  .detail-table.wide-table .type-badge,
+  .detail-table.wide-table .component-badge {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+  }
+  /* v1.25.8: колонки «Значения»/«Текущее» — шире,
+     чтобы влезали короткие JSON без переноса. */
+  .detail-table.wide-table td:nth-child(5),
+  .detail-table.wide-table th:nth-child(5) {
+    width: 240px;
+    max-width: 240px;
+  }
+  .detail-table.wide-table td:nth-child(6),
+  .detail-table.wide-table th:nth-child(6) {
+    width: 220px;
+    max-width: 220px;
+  }
+  /* v1.25.8: code в колонках Значения/Текущее —
+     word-break: normal, overflow-wrap: break-word.
+     Плюс внутренний скролл для огромных JSON (scene_data),
+     которые всё равно не влезают в 260px. */
+  /* v1.25.10: содержимое td:nth-child(5)/(6) управляется
+     классами .nowrap-short и .trunc-2 — они дают overflow: hidden. */
+
+  /* Fallback: если code без класса (не через _truncCell) —
+     обрезаем с ellipsis. */
+  .detail-table.wide-table td:nth-child(5) code:not(.nowrap-short):not(.trunc-2),
+  .detail-table.wide-table td:nth-child(6) code:not(.nowrap-short):not(.trunc-2) {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    font-size: 11px;
+  }
+  .detail-table.wide-table .copy-row code {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
+  }
+  /* «STATUS ИЗ ОБЛАКА» — 2 колонки (Код + Значение).
+     v1.25.6: правила согласованы для td и th.
+     max-width: 0 не даём — таблица не fixed, поэтому ширины
+     работают как обычные (проценты от 100%). */
+  .detail-table.wide-table.wide-table-2col td:nth-child(1),
+  .detail-table.wide-table.wide-table-2col th:nth-child(1) {
+    width: 35%;
+    max-width: 260px;
+  }
+  .detail-table.wide-table.wide-table-2col td:nth-child(2),
+  .detail-table.wide-table.wide-table-2col th:nth-child(2) {
+    width: 65%;
+    max-width: 520px;
+  }
+  .detail-table.wide-table.wide-table-2col td:nth-child(2) code,
+  .detail-table.wide-table.wide-table-2col td:nth-child(2) .copy-row code {
+    display: block;
+    white-space: normal;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    max-width: 100%;
+  }
 
   /* v1.23.3: мобильная адаптация — burger-меню + grid. */
   @media (max-width: 700px) {
@@ -2942,22 +3864,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     /* WebUI: плашка «Все» — компактная, как активная кнопка уровня.
        НЕ растягивается на всю ширину. */
-    #log-level-note-webui {
-      display: inline-flex;
-      align-items: center;
-      width: auto;
-      max-width: none;
-      margin: 0;
-      padding: 5px 10px;
-      font-size: 11px;
-      border: 1px solid var(--accent);
-      border-radius: 6px;
-      background: var(--accent);
-      color: #fff;
-      font-weight: 500;
-    }
-    #log-level-note-webui.hidden { display: none !important; }
-
+    /* v1.25.13: дубль #log-level-note-webui удалён —
+       глобальное правило выше (вне @media) уже задаёт стили,
+       мобильное переопределение было no-op. */
     .logs-toolbar .time-btn-group {
       display: flex;
       width: 100%;
@@ -2999,18 +3908,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       font-size: 14px;
     }
     /* v1.23.4: диапазоны (30мин/1час/Сутки/Всё) — на всю ширину, равные */
-    .logs-toolbar .time-btn-group {
-      display: flex;
-      width: 100%;
-      margin-left: 0 !important;
-    }
-    .logs-toolbar .time-btn-group button {
-      flex: 1 1 0;
-      padding: 8px 4px;
-      font-size: 12px;
-      min-height: 36px;
-    }
-
+    /* v1.25.13: дубль .logs-toolbar .time-btn-group удалён —
+       выше уже есть такой же блок (после .logs-tb-search). */
     /* v1.23.4: import-actions — 3 строки */
     #import-actions {
       flex-wrap: wrap;
@@ -3089,28 +3988,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     .modal.small { max-height: calc(100dvh - 24px); }
 
-    /* v1.23.10 (мобиль): модалка устройства — таблица в одну колонку.
-       Длинные подписи («Последняя активность», «Версия протокола»)
-       больше не выдавливают значение. */
-    .detail-table,
-    .detail-table tbody,
-    .detail-table tr,
-    .detail-table td {
+    /* v1.23.10 (мобиль): info-таблицы в модалке (Status, Info,
+       Last seen) ломаем в одну колонку — label сверху, значение снизу.
+       НЕ трогаем .wide-table (много-колоночные) и .cache-details.
+       v1.25.1: :not(.wide-table) — чтобы не перебивать широкие таблицы. */
+    .detail-table:not(.wide-table):not(.cache-details .detail-table),
+    .detail-table:not(.wide-table):not(.cache-details .detail-table) tbody,
+    .detail-table:not(.wide-table):not(.cache-details .detail-table) tr,
+    .detail-table:not(.wide-table):not(.cache-details .detail-table) td {
       display: block;
       width: 100%;
     }
-    .detail-table tr {
+    .detail-table:not(.wide-table) tr {
       padding: 6px 0;
       border-bottom: 1px solid var(--border);
     }
-    .detail-table tr:last-child { border-bottom: none; }
-    .detail-table td {
+    .detail-table:not(.wide-table) tr:last-child { border-bottom: none; }
+    .detail-table:not(.wide-table) td {
       padding: 0;
       border-bottom: none;
       white-space: normal;
       word-break: break-word;
     }
-    .detail-table td:first-child {
+    .detail-table:not(.wide-table) td:first-child {
       width: 100%;
       font-size: 11px;
       color: var(--muted);
@@ -3118,9 +4018,55 @@ HTML_PAGE = r"""<!DOCTYPE html>
       margin-bottom: 2px;
       white-space: normal;
     }
-    .detail-table td:last-child {
+    .detail-table:not(.wide-table) td:last-child {
       font-size: 13px;
       color: var(--fg);
+    }
+
+    /* v1.25.11: старый v1.25.1 блок .wide-table удалён. */
+
+    /* v1.25.1: обёртка для горизонтального скролла широких таблиц. */
+    /* v1.25.5: на мобиле — уже колонки, тот же перенос. */
+    .detail-table.wide-table td:nth-child(5),
+    .detail-table.wide-table th:nth-child(5) {
+      width: 30%;
+      max-width: 140px;
+      min-width: 100px;
+    }
+    .detail-table.wide-table td:nth-child(6),
+    .detail-table.wide-table th:nth-child(6) {
+      width: 22%;
+      max-width: 110px;
+      min-width: 80px;
+    }
+    /* v1.25.6: .wide-table-wrap объявлен один раз выше (в Fix A). */
+
+
+    /* v1.25.1: «Кэш состояния» — 2 колонки, не ломаем через :not(). */
+
+    .cache-details .detail-table tbody {
+      display: table-row-group !important;
+    }
+    .cache-details .detail-table tr {
+      display: table-row !important;
+    }
+    .cache-details .detail-table td {
+      display: table-cell !important;
+      width: auto !important;
+      padding: 4px 8px !important;
+      border-bottom: 1px solid var(--border);
+    }
+    .cache-details .detail-table td:first-child {
+      width: 55% !important;
+      color: var(--fg) !important;
+      font-size: 12px !important;
+      text-transform: none !important;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    .cache-details .detail-table td:last-child {
+      font-size: 12px !important;
     }
 
     /* v1.23.7 (мобиль): узкие карточки «Хронология» и «Мерцающие» —
@@ -3136,17 +4082,255 @@ HTML_PAGE = r"""<!DOCTYPE html>
       max-height: 340px;
     }
 
-    /* v1.23.7 (мобиль): «Локальные базы DP» — кнопки в столбик. */
-    .base-info { flex-direction: column; align-items: stretch; gap: 8px; }
-    .base-info-item { justify-content: space-between; }
+    /* v1.25.7 (мобиль): «Локальные базы DP» — 2 колонки.
+       Инфо-строки: label слева, значение справа (grid 1fr auto).
+       Кнопки: grid 1fr 1fr (2 колонки, каждая на всю ширину ячейки).
+       Последняя кнопка («Пересобрать tinytuya.json») растягивается
+       на 2 колонки. */
+    .base-info {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      padding: 12px 14px;
+    }
+    .base-info-item {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+    }
+    .base-info-item b {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .base-info-item span {
+      font-size: 12px;
+      text-align: right;
+    }
     .base-info-actions {
-      display: flex; flex-direction: column; gap: 6px; width: 100%;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      width: 100%;
       margin-left: 0;
     }
-    .base-info-actions button { width: 100%; text-align: center; min-height: 40px; }
+    .base-info-actions button {
+      width: 100%;
+      text-align: center;
+      min-height: 40px;
+      font-size: 12px;
+      padding: 8px 6px;
+      margin: 0;
+    }
+    /* «Пересобрать tinytuya.json» — на 2 колонки */
+    .base-info-actions #rebuild-btn {
+      grid-column: 1 / -1;
+    }
+    /* base-update-result — на всю ширину, по центру */
+    .base-info-actions #base-update-result {
+      grid-column: 1 / -1;
+      text-align: center;
+      font-size: 11px;
+    }
 
     /* v1.23.3: чуть меньше padding body */
     body { padding: 12px; }
+
+    /* v1.25.1: health-деталка на мобиле — 2 колонки сохраняем,
+       но первая колонка компактнее (90px), бейджи CPU/RAM
+       в одну строку без переносов. */
+    .health-detail {
+      padding: 12px 14px;
+    }
+    .health-detail .hd-grid {
+      display: grid;
+      grid-template-columns: 90px 1fr;
+      gap: 6px 10px;
+      font-size: 12px;
+    }
+    .health-detail .hd-lbl {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: none;
+      letter-spacing: 0;
+      margin-top: 0;
+      align-self: start;
+      padding-top: 2px;
+      white-space: nowrap;
+    }
+    .health-detail .hd-val {
+      font-size: 12px;
+      line-height: 1.5;
+      word-break: normal;
+    }
+    .health-detail .hd-val .hd-badge {
+      display: inline-flex;
+      align-items: center;
+      margin: 0;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    .health-detail .hd-head {
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .health-detail .hd-section-title {
+      margin-top: 4px;
+    }
+
+    /* v1.25.1: широкие таблицы в модалках на мобиле —
+       горизонтальный скролл, а не «в столбик».
+       Правило .detail-table ниже уже ломает таблицы в одну
+       колонку (label сверху, значение снизу) — это ок для
+       info-таблиц (Status, Info), но НЕ для таблиц
+       «Сопоставление DP» / «STATUS ИЗ ОБЛАКА» / «Кэш состояния»,
+       где колонок много. */
+    /* v1.25.10 (мобиль): .wide-table — auto + фикс. ширины.
+       overflow: hidden не даёт значениям наезжать друг на друга. */
+    .detail-table.wide-table {
+      display: table !important;
+      width: auto !important;
+      min-width: 100%;
+      table-layout: auto;
+      border-collapse: collapse;
+    }
+    .detail-table.wide-table th,
+    .detail-table.wide-table td {
+      vertical-align: top;
+      overflow: hidden;
+      padding: 6px 8px !important;
+      border-bottom: 1px solid var(--border);
+    }
+    /* Узкие колонки — nowrap */
+    .detail-table.wide-table th:nth-child(1),
+    .detail-table.wide-table td:nth-child(1),
+    .detail-table.wide-table th:nth-child(2),
+    .detail-table.wide-table td:nth-child(2),
+    .detail-table.wide-table th:nth-child(3),
+    .detail-table.wide-table td:nth-child(3),
+    .detail-table.wide-table th:nth-child(4),
+    .detail-table.wide-table td:nth-child(4),
+    .detail-table.wide-table th:nth-child(7),
+    .detail-table.wide-table td:nth-child(7) {
+      white-space: nowrap;
+    }
+    /* ЗНАЧЕНИЯ — фикс. ширина 220px */
+    .detail-table.wide-table th:nth-child(5),
+    .detail-table.wide-table td:nth-child(5) {
+      width: 220px;
+      max-width: 220px;
+    }
+    /* ТЕКУЩЕЕ — фикс. ширина 200px */
+    .detail-table.wide-table th:nth-child(6),
+    .detail-table.wide-table td:nth-child(6) {
+      width: 200px;
+      max-width: 200px;
+    }
+    /* COMPONENT */
+    .detail-table.wide-table th:nth-child(7),
+    .detail-table.wide-table td:nth-child(7) { min-width: 90px; }
+    /* v1.25.8: code внутри Значения/Текущее — не рвём по буквам,
+       внутренний скролл для огромных JSON. */
+    .detail-table.wide-table td:nth-child(5) code,
+    .detail-table.wide-table td:nth-child(6) code,
+    .detail-table.wide-table td:nth-child(5) .copy-row code,
+    .detail-table.wide-table td:nth-child(6) .copy-row code {
+      display: block;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+      max-width: 100%;
+      max-height: 200px;
+      overflow-x: auto;
+      overflow-y: auto;
+    }
+    .detail-table.wide-table .copy-row code {
+      overflow: visible;
+      text-overflow: clip;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    /* «STATUS ИЗ ОБЛАКА» — 2 колонки */
+    /* v1.25.8: STATUS ИЗ ОБЛАКА — 2 колонки, значение переносится
+       только по границам токенов. */
+    .detail-table.wide-table.wide-table-2col th:nth-child(1),
+    .detail-table.wide-table.wide-table-2col td:nth-child(1) {
+      min-width: 100px;
+      max-width: 140px;
+      white-space: nowrap;
+    }
+    .detail-table.wide-table.wide-table-2col th:nth-child(2),
+    .detail-table.wide-table.wide-table-2col td:nth-child(2) {
+      min-width: 240px;
+      max-width: 340px;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    .detail-table.wide-table.wide-table-2col td:nth-child(2) code,
+    .detail-table.wide-table.wide-table-2col td:nth-child(2) .copy-row code {
+      display: block;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+      max-width: 100%;
+      max-height: 200px;
+      overflow-x: auto;
+      overflow-y: auto;
+    }
+    /* Обёртка для горизонтального скролла */
+    .wide-table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 0 -14px;
+      padding: 0 14px;
+    }
+
+    /* «Кэш состояния» — таблица из 2 колонок, на мобиле
+       оставляем как есть (label сверху не нужен — там и так
+       DP + значение). Но не даём .detail-table ломать её. */
+    .cache-details .detail-table,
+    .cache-details .detail-table tbody,
+    .cache-details .detail-table tr,
+    .cache-details .detail-table td {
+      display: table;
+      width: auto;
+    }
+    .cache-details .detail-table {
+      display: table !important;
+      width: 100% !important;
+      border-collapse: collapse;
+    }
+    .cache-details .detail-table tbody {
+      display: table-row-group;
+    }
+    .cache-details .detail-table tr {
+      display: table-row;
+    }
+    .cache-details .detail-table td {
+      display: table-cell;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--border);
+      width: auto;
+    }
+    .cache-details .detail-table td:first-child {
+      width: 55%;
+      color: var(--fg);
+      font-size: 12px;
+      text-transform: none;
+      margin-bottom: 0;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    .cache-details .detail-table td:last-child {
+      width: 45%;
+      font-size: 12px;
+      word-break: break-all;
+      overflow-wrap: break-word;
+    }
   }
 </style>
 </head>
@@ -3375,9 +4559,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span id="base-tuya-local-info" class="muted">—</span>
       </div>
       <div class="base-info-actions">
-        <button onclick="loadBaseInfo()">🔄 Обновить</button>
-        <button onclick="updateTuyaLocalDb()" id="tuya-local-update-btn">⬇ Обновить tuya-local</button>
-        <button onclick="rebuildTinytuyaJson()" id="rebuild-btn">🔄 Пересобрать tinytuya.json</button>
+        <button onclick="loadBaseInfo(this)" id="base-refresh-btn"
+                title="Обновить счётчики: количество устройств в tinytuya_devices.json и шаблонов tuya-local">🔄 Обновить</button>
+        <button onclick="updateTuyaLocalDb()" id="tuya-local-update-btn"
+                title="Скачать ~50 МБ из GitHub (make-all/tuya-local). Займёт до 2 минут.">⬇ Обновить tuya-local</button>
+        <button onclick="rebuildTinytuyaJson()" id="rebuild-btn"
+                title="Пробовать каждое устройство через tinytuya, сопоставить DP. Несколько минут.">🔄 Пересобрать tinytuya.json</button>
         <span id="base-update-result" class="muted" style="font-size:11px;"></span>
       </div>
     </div>
@@ -3699,10 +4886,33 @@ function _logUiSave() {
 }
 const _LOG_UI = _logUiLoad();
 let LOG_RANGE_SECONDS = (typeof _LOG_UI.range === "number") ? _LOG_UI.range : 3600;
-let logPaused = !!_LOG_UI.paused, lastSeq = 0;
+let logPaused = !!_LOG_UI.paused;
+// v1.25.12: lastSeq — per-source в sessionStorage. Раньше был общий:
+// при переключении bridge↔webui SSE шёл с «чужим» seq и не получал
+// старые записи нового источника.
+const _LOG_SEQ_KEY = "tuya_webui_log_seq";
+let LOG_SEQ_BY_SOURCE = (function () {
+  try {
+    const raw = sessionStorage.getItem(_LOG_SEQ_KEY);
+    const o = raw ? JSON.parse(raw) : {};
+    return {
+      bridge: typeof o.bridge === "number" ? o.bridge : 0,
+      webui: typeof o.webui === "number" ? o.webui : 0,
+    };
+  } catch (e) { return { bridge: 0, webui: 0 }; }
+})();
+function _saveLogSeq() {
+  try { sessionStorage.setItem(_LOG_SEQ_KEY, JSON.stringify(LOG_SEQ_BY_SOURCE)); } catch (e) {}
+}
+function _getLastSeq() { return LOG_SEQ_BY_SOURCE[LOG_SOURCE] || 0; }
+function _setLastSeq(v) { LOG_SEQ_BY_SOURCE[LOG_SOURCE] = v; _saveLogSeq(); }
 let userScrolledUp = !!_LOG_UI.scrolledUp;
 let LAST_DEVICES = [];
 let CURRENT_MODAL_IDX = -1;
+// v1.25.13: имя устройства, открытого в модалке. Нужно,
+// чтобы closeModal() чистил кэш даже если CURRENT_MODAL_IDX
+// уже сброшен (повторный вызов, закрытие по Escape).
+let CURRENT_MODAL_NAME = null;
 let LOG_LEVEL_FILTER = "INFO";
 let LOG_SOURCE = (function(){ try { return localStorage.getItem("tuya_webui_log_source") || "bridge"; } catch(e){ return "bridge"; } })();  // v1.22.0
 let LOG_SOURCE_TOKEN = 0;  // P2 1.22.0: токен для race
@@ -3722,13 +4932,29 @@ let REVEALED_KEYS = {};
 let CLOUD_DETAILS_OPEN = {};
 let CLOUD_DEVICES = [], CLOUD_SELECTED = {};
 let DEVICE_HISTORY_CACHE = {}, DEVICE_LATENCY_CACHE = {}, DEVICE_AVG_LATENCY_CACHE = {};
-let SORT_KEY = "name", SORT_DIR = 1;
+// v1.25.0 (task #A): сортировка выживает при F5 (localStorage).
+function _loadSort(prefix, defKey, defDir) {
+  try {
+    const raw = localStorage.getItem("tuya_webui_sort_" + prefix);
+    if (!raw) return { key: defKey, dir: defDir };
+    const o = JSON.parse(raw);
+    if (o && typeof o.key === "string" && (o.dir === 1 || o.dir === -1)) return o;
+  } catch (e) {}
+  return { key: defKey, dir: defDir };
+}
+function _saveSort(prefix, key, dir) {
+  try { localStorage.setItem("tuya_webui_sort_" + prefix, JSON.stringify({ key, dir })); } catch (e) {}
+}
+const _SORT_DEV = _loadSort("devices", "name", 1);
+let SORT_KEY = _SORT_DEV.key, SORT_DIR = _SORT_DEV.dir;
 
 let LATENCY_PERIOD = 3600;      // v1.18.6: по умолчанию 1 час
 let LATENCY_DATA = [];
-let LATENCY_SORT_KEY = "avg", LATENCY_SORT_DIR = 1;
+const _SORT_LAT = _loadSort("latency", "avg", 1);
+let LATENCY_SORT_KEY = _SORT_LAT.key, LATENCY_SORT_DIR = _SORT_LAT.dir;
 let FLAPPER_DATA = [];
-let FLAPPER_SORT_KEY = "flaps", FLAPPER_SORT_DIR = -1;
+const _SORT_FLAP = _loadSort("flappers", "flaps", -1);
+let FLAPPER_SORT_KEY = _SORT_FLAP.key, FLAPPER_SORT_DIR = _SORT_FLAP.dir;
 
 let SCAN_RESULTS = [];
 let SCAN_SUBNET = "";
@@ -3874,6 +5100,195 @@ function closeUiAlert(evt) {
   if (r) r();
 }
 
+// ==================== CHART TOOLTIP (v1.24.6) ====================
+// Единый tooltip для SVG-графиков.
+//   ПК: mousemove → tooltip следует за курсором.
+//   Мобиль: быстрый тап → 10 сек; long-press (1 сек) → фиксация
+//           + touchmove для смены точки. Скролл (>8px) отменяет.
+// Позиция: сначала контент, потом двойной rAF, потом position —
+//           чтобы tooltip не «прыгал».
+const _chartTooltip = (function() {
+  let el = null;
+  let visible = false;
+  let hideTimer = null;
+  let activeSvg = null;
+  let activeHandler = null;
+  let pendingRaf = null;
+
+  function ensureEl() {
+    if (el) return el;
+    el = document.createElement("div");
+    el.className = "chart-tooltip";
+    el.style.display = "none";
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function position(x, y, opts) {
+    if (!el) return;
+    const pad = 12;
+    const rect = el.getBoundingClientRect();
+    const w = rect.width || el.offsetWidth || 200;
+    const h = rect.height || el.offsetHeight || 60;
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+    let left = x + pad;
+    let top = y + pad;
+    if (opts && opts.centerAbove) {
+      left = x - w / 2;
+      top = y - h - 16;
+      if (top < 8) top = y + pad;
+    }
+    if (left + w > vw - 8) left = vw - w - 8;
+    if (left < 8) left = 8;
+    if (top + h > vh - 8) top = vh - h - 8;
+    if (top < 8) top = 8;
+    el.style.left = Math.round(left) + "px";
+    el.style.top = Math.round(top) + "px";
+  }
+
+  function show(html, x, y, opts) {
+    ensureEl();
+    el.innerHTML = html;
+    el.style.display = "block";
+    el.style.visibility = "hidden";
+    el.style.left = "-9999px";
+    el.style.top = "0px";
+    visible = true;
+    if (pendingRaf) cancelAnimationFrame(pendingRaf);
+    pendingRaf = requestAnimationFrame(() => {
+      position(x, y, opts);
+      el.style.visibility = "visible";
+      pendingRaf = requestAnimationFrame(() => {
+        position(x, y, opts);
+        pendingRaf = null;
+      });
+    });
+  }
+
+  function hide() {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    if (pendingRaf) { cancelAnimationFrame(pendingRaf); pendingRaf = null; }
+    visible = false;
+    if (el) el.style.display = "none";
+    if (activeSvg && activeHandler && activeHandler.onLeave) {
+      activeHandler.onLeave(activeSvg);
+    }
+    activeSvg = null;
+    activeHandler = null;
+  }
+
+  function bindDesktop(svg, handler) {
+    if (!svg) return;
+    // v1.25.14: AbortController — явно снимаем старых слушателей.
+    // Раньше `delete svg.dataset.ttBound` в renderActivity/
+    // renderFlapsChart приводил к тому, что bind снова навешивал
+    // mousemove/mouseleave на тот же SVG (id chart-activity не
+    // меняется), слушатели копились каждые 30 сек автообновления.
+    if (svg._ttAbortDesktop) {
+      try { svg._ttAbortDesktop.abort(); } catch (e) {}
+    }
+    svg._ttAbortDesktop = new AbortController();
+    // v1.26.0: возвращаем флаг — guard в renderActivity/
+    // renderFlapsChart проверяет svg.dataset.ttBound === "1".
+    svg.dataset.ttBound = "1";
+    const sig = svg._ttAbortDesktop.signal;
+    svg.addEventListener("mousemove", (e) => {
+      const hit = handler.hitTest(svg, e);
+      if (!hit) { hide(); return; }
+      activeSvg = svg;
+      activeHandler = handler;
+      handler.onHover(svg, hit);
+      show(handler.render(hit), e.clientX, e.clientY, {});
+    }, { signal: sig });
+    svg.addEventListener("mouseleave", () => { hide(); }, { signal: sig });
+  }
+
+  // Мобиль: только быстрый тап. Long-press убран.
+  function bindMobile(svg, handler) {
+    if (!svg) return;
+    // v1.25.14: AbortController — как в bindDesktop.
+    if (svg._ttAbortMobile) {
+      try { svg._ttAbortMobile.abort(); } catch (e) {}
+    }
+    svg._ttAbortMobile = new AbortController();
+    // v1.26.0: возвращаем флаг (см. bindDesktop).
+    svg.dataset.ttMobileBound = "1";
+    const sig = svg._ttAbortMobile.signal;
+    let touchStartX = 0, touchStartY = 0;
+    let moved = false;
+
+    svg.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      touchStartX = t.clientX;
+      touchStartY = t.clientY;
+      moved = false;
+    }, { passive: true, signal: sig });
+
+    svg.addEventListener("touchmove", (e) => {
+      const t = e.touches[0];
+      const dist = Math.hypot(t.clientX - touchStartX, t.clientY - touchStartY);
+      if (dist > 8) moved = true;
+    }, { passive: true, signal: sig });
+
+    svg.addEventListener("touchend", (e) => {
+      if (moved) return;
+      const t = (e.changedTouches && e.changedTouches[0]) || null;
+      if (!t) return;
+      const hit = handler.hitTest(svg, t);
+      if (!hit) return;
+      activeSvg = svg;
+      activeHandler = handler;
+      handler.onHover(svg, hit);
+      show(handler.render(hit), t.clientX, t.clientY, { centerAbove: true });
+      hideTimer = setTimeout(() => { hide(); }, 10000);
+    }, { signal: sig });
+    svg.addEventListener("touchcancel", () => { hide(); }, { signal: sig });
+  }
+
+  function bind(svg, handler) {
+    bindDesktop(svg, handler);
+    bindMobile(svg, handler);
+  }
+
+  return {
+    bind,
+    hide,
+    isOpen: () => visible,
+  };
+})();
+
+// v1.25.0 (fix #6): при уходе с вкладки (blur / visibilitychange)
+// закрываем tooltip — иначе _chartTooltip.isOpen() навсегда true,
+// и renderActivity/renderFlapsChart не перерисовываются из-за guard.
+(function bindTooltipAutoClose() {
+  function closeAll() {
+    try { _chartTooltip.hide(); } catch (e) {}
+  }
+  window.addEventListener("blur", closeAll);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) closeAll();
+  });
+})();
+
+// SVG-координаты из client-координат.
+function svgClientToLocal(svg, clientX, clientY) {
+  const rect = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  const scaleX = vb.width / rect.width;
+  const scaleY = vb.height / rect.height;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY,
+  };
+}
+
+function ttEscape(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
 // ==================== JSON HIGHLIGHT (v1.18.6) ====================
 function highlightJsonInto(el) {
   if (!el) return;
@@ -4010,6 +5425,271 @@ function escapeHtml(s) {
 function escapeAttr(s) {
   return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
+// v1.25.0 (task #C): зеркало backend-словарей для Cloud-таблицы
+// и «Кэш состояния». Используются только для тултипов — колонка
+// «Имя» показывает code (английское).
+const DP_CODE_NAMES_RU_FRONT = {
+    "switch_led": "Свет",
+    "switch_led_1": "Свет 1",
+    "switch": "Реле",
+    "switch_1": "Реле 1",
+    "switch_2": "Реле 2",
+    "switch_3": "Реле 3",
+    "switch_4": "Реле 4",
+    "bright_value": "Яркость",
+    "bright_value_1": "Яркость 1",
+    "temp_value": "Цветовая температура",
+    "temp_value_1": "Цветовая температура",
+    "colour_data": "Цвет (RGB)",
+    "colour_data_v2": "Цвет (RGB v2)",
+    "work_mode": "Режим работы",
+    "scene_data": "Сцены",
+    "flash_scene_1": "Сцена 1",
+    "flash_scene_2": "Сцена 2",
+    "music_data": "Музыкальный режим",
+    "control_data": "Управление",
+    "countdown": "Таймер",
+    "countdown_1": "Таймер 1",
+    "countdown_2": "Таймер 2",
+    "countdown_3": "Таймер 3",
+    "countdown_4": "Таймер 4",
+    "va_temperature": "Текущая температура",
+    "temp_current": "Текущая температура",
+    "temp_set": "Уставка температуры",
+    "temp_current_f": "Текущая темп. (°F)",
+    "va_humidity": "Влажность",
+    "humidity": "Влажность",
+    "battery_percentage": "Батарея (%)",
+    "battery_state": "Состояние батареи",
+    "battery_value": "Уровень батареи",
+    "cur_voltage": "Напряжение",
+    "cur_current": "Ток",
+    "cur_power": "Мощность",
+    "add_ele": "Накопленная энергия",
+    "forward_energy_total": "Энергия (всего)",
+    "reverse_energy_total": "Энергия (обратно)",
+    "phase_a": "Фаза A",
+    "phase_b": "Фаза B",
+    "phase_c": "Фаза C",
+    "fault": "Ошибка",
+    "leakage_current": "Ток утечки",
+    "supply_frequency": "Частота сети",
+    "power_factor": "Коэффициент мощности",
+    "electric_total": "Электроэнергия",
+    "total_forward_energy": "Общая прямая энергия",
+    "output_voltage": "Напряжение",
+    "output_current": "Ток",
+    "output_power": "Активная мощность",
+    "relay_status": "Состояние при включении",
+    "switch_backlight": "Подсветка",
+    "switch_prepayment": "Предоплата",
+    "switch_inching": "Импульсный режим",
+    "switch_type": "Тип выключателя",
+    "cycle_time": "Циклический таймер",
+    "random_time": "Случайный таймер",
+    "inching_time": "Время импульса",
+    "test_bit": "Результат теста",
+    "overcharge_switch": "Защита от перезарядки",
+    "light_mode": "Режим индикатора",
+    "child_lock": "Блокировка от детей",
+    "doorcontact_state": "Дверь",
+    "pir": "Движение",
+    "motion_sensitivity": "Чувствительность движения",
+    "watersensor_state": "Протечка",
+    "smoke_sensor_status": "Дым",
+    "gas_sensor_status": "Газ",
+    "temp_alarm": "Тревога температуры",
+    "hum_alarm": "Тревога влажности",
+    "mode": "Режим работы",
+    "preset_mode": "Пресет",
+    "eco": "Эко",
+    "window_check": "Обнаружение окна",
+    "frost": "Защита от замерзания",
+    "valve_check": "Обнаружение клапана",
+    "temp_correction": "Коррекция температуры",
+    "upper_temp": "Верхний порог",
+    "upper_temp_f": "Верхний порог (°F)",
+    "lower_temp": "Нижний порог",
+    "maxtemp_set": "Верхний порог температуры",
+    "minitemp_set": "Нижний порог температуры",
+    "maxhum_set": "Верхний порог влажности",
+    "minihum_set": "Нижний порог влажности",
+    "temp_unit_convert": "Единицы температуры",
+    "temp_set_f": "Уставка (°F)",
+    "temp_sensitivity": "Чувствительность температуры",
+    "hum_sensitivity": "Чувствительность влажности",
+    "temp_periodic_report": "Период отчёта температуры",
+    "work_days": "Рабочие дни",
+    "holiday_days_set": "Дней в режиме отпуска",
+    "factory_reset": "Сброс к заводским",
+    "do_not_disturb": "Не беспокоить",
+    "alarm_set_1": "Настройка тревоги 1",
+    "alarm_set_2": "Настройка тревоги 2",
+    "clear_energy": "Сброс энергии",
+    "clr_all_energy": "Сброс энергии",
+    "breaker_id": "ID устройства",
+    "refresh": "Обновить",
+    "balance_energy": "Остаток энергии",
+    "charge_energy": "Пополнение энергии",
+    "leakagecurr_test": "Тест тока утечки",
+    "voltage_coe": "Калибровка напряжения",
+    "electric_coe": "Калибровка тока",
+    "power_coe": "Калибровка мощности",
+    "electricity_coe": "Калибровка энергии",
+};
+
+const DP_CN_NAMES_RU_FRONT = {
+    "开关": "Выключатель",
+    "开关1": "Выключатель 1",
+    "开关2": "Выключатель 2",
+    "开关3": "Выключатель 3",
+    "开关4": "Выключатель 4",
+    "开关1倒计时": "Таймер выключателя 1",
+    "开关2倒计时": "Таймер выключателя 2",
+    "开关3倒计时": "Таймер выключателя 3",
+    "开关4倒计时": "Таймер выключателя 4",
+    "上电状态": "Состояние при включении",
+    "上电状态设置": "Настройка состояния при включении",
+    "背光开关": "Подсветка",
+    "循环定时": "Циклический таймер",
+    "随机定时": "Случайный таймер",
+    "点动开关": "Импульсный режим",
+    "开关类型": "Тип выключателя",
+    "产测结果位": "Результат теста",
+    "故障告警": "Аварийная сигнализация",
+    "过充保护": "Защита от перезарядки",
+    "模式": "Режим работы",
+    "亮度值": "Яркость",
+    "冷暖值": "Цветовая температура",
+    "场景": "Сцены",
+    "倒计时1": "Таймер",
+    "倒计时剩余时间": "Остаток таймера",
+    "彩光": "RGB-цвет",
+    "音乐灯": "Музыкальный режим",
+    "调节": "Управление",
+    "勿扰模式": "Не беспокоить",
+    "温标切换": "Единицы температуры",
+    "温标切换设置": "Настройка единиц температуры",
+    "温度上限设置": "Верхний порог температуры",
+    "温度下限设置": "Нижний порог температуры",
+    "湿度上限设置": "Верхний порог влажности",
+    "湿度下限设置": "Нижний порог влажности",
+    "温度报警": "Тревога температуры",
+    "湿度报警": "Тревога влажности",
+    "温度灵敏度": "Чувствительность температуры",
+    "湿度灵敏度": "Чувствительность влажности",
+    "温度周期上报": "Период отчёта температуры",
+    "当前温度": "Текущая температура",
+    "湿度数值": "Влажность",
+    "电池电量": "Батарея",
+    "电池电量百分比": "Батарея (%)",
+    "电池电量状态": "Состояние батареи",
+    "门磁状态": "Дверь",
+    "人体感应状态": "Датчик движения",
+    "水浸检测状态": "Датчик протечки",
+    "工作模式": "Режим работы",
+    "温度设置": "Уставка температуры",
+    "目标温度_F": "Уставка (°F)",
+    "设置温度上限": "Верхний порог",
+    "设置温度上限_F": "Верхний порог (°F)",
+    "当前温度_F": "Текущая темп. (°F)",
+    "开窗检测": "Обнаружение окна",
+    "防霜冻功能": "Защита от замерзания",
+    "阀门检测": "Обнаружение клапана",
+    "工作日设置": "Рабочие дни",
+    "假日模式天数设置": "Дней в режиме отпуска",
+    "恢复出厂设置": "Сброс к заводским",
+    "童锁": "Блокировка от детей",
+    "当前电压": "Текущее напряжение",
+    "当前电流": "Текущий ток",
+    "当前功率": "Текущая мощность",
+    "电压校准系数": "Калибровка напряжения",
+    "电流校准系数": "Калибровка тока",
+    "功率校准系数": "Калибровка мощности",
+    "电量校准系数": "Калибровка энергии",
+    "增加电量": "Накопленная энергия",
+    "指示灯状态设置": "Режим индикатора",
+    "童锁开关": "Блокировка от детей",
+    "正向总有功电量": "Общая прямая энергия",
+    "剩余可用电量清零": "Сбросить остаток",
+    "剩余可用电量显示": "Остаток энергии",
+    "电量充值": "Пополнение энергии",
+    "剩余电流显示": "Ток утечки",
+    "剩余电流测试": "Тест тока утечки",
+    "预付费功能开关": "Предоплата",
+    "断路器开关": "Главный выключатель",
+    "告警设置1": "Настройка тревоги 1",
+    "告警设置2": "Настройка тревоги 2",
+    "设备号显示": "ID устройства",
+    "功率因素": "Коэффициент мощности",
+    "供电频率": "Частота сети",
+    "有功功率": "Активная мощность",
+    "清电量": "Сброс энергии",
+    "刷新上报": "Обновить",
+    "A相电压，电流及功率": "Фаза A (U/I/P)",
+    "Voltage": "Напряжение",
+    "Current": "Ток",
+};
+
+// v1.25.0 (task #C): единый резолвер отображения DP.
+// Возвращает:
+//   display  — то, что показываем в колонке «Имя» (code, английское)
+//   tooltip  — «все остальные варианты» для title
+//   badge    — 📖 / 🈶 / ☁ / ''
+function resolveDpDisplay(code, cloudName, cfgName) {
+  const cjk = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/;
+  const cd = (code || '').trim();
+  const cn = (cloudName || '').trim();
+  const cfg = (cfgName || '').trim();
+
+  const display = cd || cn || cfg || '?';
+  const tt = [];
+  let badge = '';
+  let src = '';
+
+  // 1. Русский перевод: сначала по code, потом по cn
+  let ru = '';
+  if (cd && DP_CODE_NAMES_RU_FRONT[cd]) {
+    ru = DP_CODE_NAMES_RU_FRONT[cd];
+    badge = '📖';
+    src = 'code-словарь';
+  } else if (cn && DP_CN_NAMES_RU_FRONT[cn]) {
+    ru = DP_CN_NAMES_RU_FRONT[cn];
+    badge = '🈶';
+    src = 'cn-словарь';
+  } else if (cfg && DP_CN_NAMES_RU_FRONT[cfg]) {
+    ru = DP_CN_NAMES_RU_FRONT[cfg];
+    badge = '🈶';
+    src = 'cn-словарь';
+  }
+  if (ru && ru !== display) tt.push('RU: ' + ru);
+
+  // 2. Оригинал (китайский) — если был и ≠ display
+  const origs = [cn, cfg].filter(x => x && cjk.test(x) && x !== display);
+  for (const o of origs) {
+    if (!tt.some(s => s.includes(o))) tt.push('Оригинал: ' + o);
+  }
+
+  // 3. Облачное имя (латиница ≠ display)
+  if (cn && !cjk.test(cn) && cn !== display) tt.push('Облачное имя: ' + cn);
+
+  // 4. Config-имя (латиница ≠ display и ≠ cloud)
+  if (cfg && !cjk.test(cfg) && cfg !== display && cfg !== cn) tt.push('Config: ' + cfg);
+
+  // 5. EN (если display — не code)
+  if (cd && cd !== display) tt.push('EN: ' + cd);
+
+  // 6. Источник
+  if (src) tt.push('Источник: ' + src);
+
+  return {
+    display: display,
+    tooltip: tt.join(' · '),
+    badge: badge,
+    ru: ru,
+  };
+}
+
 function jsStr(s) {
   // P3 1.22.0 fix1: одинарные кавычки + экранирование \\ и '
   // Возвращает строку ВИДА 'name' (с кавычками), пригодную для
@@ -4026,6 +5706,35 @@ function copyCode(text, extraStyle) {
 function copyCodePlain(text, extraStyle) {
   const st = extraStyle ? ` style="${extraStyle}"` : "";
   return `<code data-copy="${escapeAttr(text)}"${st}>${escapeHtml(text)}</code>`;
+}
+
+// v1.25.9: короткое (≤ SHORT_LIMIT символов) — как есть,
+// без переноса. Длинное — 2 строки + …, полное в title.
+// Работает для «Значения» / «Текущее» / «Значение».
+// v1.25.12: title обрезаем до 500 символов — нативный tooltip
+// всё равно не показывает длинные значения, а DOM не раздувается.
+// data-copy оставляем полным — для копирования.
+const _TRUNC_TITLE_LIMIT = 500;
+function _truncCell(text, shortLimit) {
+  const LIMIT = (typeof shortLimit === "number") ? shortLimit : 50;
+  const raw = (text == null) ? "" : String(text);
+  const titleSafe = raw.length > _TRUNC_TITLE_LIMIT ? raw.slice(0, _TRUNC_TITLE_LIMIT) : raw;
+  if (raw.length <= LIMIT) {
+    // короткое — показываем целиком, не переносим
+    return `<code class="nowrap-short" data-copy="${escapeAttr(raw)}">${escapeHtml(raw)}</code>`;
+  }
+  // длинное — 2 строки + ellipsis, полное — в data-copy, обрезанное — в title
+  return `<code class="trunc-2" data-copy="${escapeAttr(raw)}" title="${escapeAttr(titleSafe)}">${escapeHtml(raw)}</code>`;
+}
+
+// v1.25.12: пустое значение — не <code>, а <span class="muted">—</span>.
+// Семантически корректнее и не даёт «недорисованных полос» с фоном.
+function _cellValue(text, shortLimit) {
+  const raw = (text == null) ? "" : String(text);
+  if (raw === "" || raw === "—" || raw === "null" || raw === "{}") {
+    return '<span class="muted">—</span>';
+  }
+  return _truncCell(raw, shortLimit);
 }
 
 function latencyClass(ms) {
@@ -4185,6 +5894,7 @@ document.addEventListener("click", (e) => {
 function sortDevices(key) {
   if (SORT_KEY === key) SORT_DIR = -SORT_DIR;
   else { SORT_KEY = key; SORT_DIR = 1; }
+  _saveSort("devices", SORT_KEY, SORT_DIR);
   renderDeviceTable(LAST_DEVICES);
   updateSortIndicators();
 }
@@ -4274,6 +5984,33 @@ function typeBadge(t) {
   const cls = ["light","switch","climate","sensor","binary_sensor"].includes(t) ? t : "";
   return `<span class="type-badge ${cls}">${escapeHtml(t)}</span>`;
 }
+// v1.25.0 (fix3): цветной бейдж для component DP.
+function componentBadge(c) {
+  if (!c || c === "—") return `<span class="component-badge">—</span>`;
+  const allowed = ["switch","sensor","binary_sensor","select","number",
+                   "preset","light","climate","button","time","lock","phase_a"];
+  const cls = allowed.includes(c) ? c : "";
+  return `<span class="component-badge ${cls}">${escapeHtml(c)}</span>`;
+}
+// v1.25.0 (fix3): статус кнопок баз DP (loading/ok/err/idle).
+function setButtonState(btn, state, text) {
+  if (!btn) return;
+  btn.classList.remove("btn-success", "btn-error");
+  if (state === "loading") {
+    btn.innerHTML = '<span class="spin"></span> ' + (text || "Загрузка…");
+  } else if (state === "ok") {
+    btn.classList.add("btn-success");
+    btn.innerHTML = "✅ " + (text || "Готово");
+  } else if (state === "err") {
+    btn.classList.add("btn-error");
+    btn.innerHTML = "❌ " + (text || "Ошибка");
+  } else {
+    btn.innerHTML = text || "—";
+  }
+}
+function restoreButtonAfter(btn, delayMs, idleHtml) {
+  setTimeout(() => setButtonState(btn, "idle", idleHtml), delayMs || 2500);
+}
 
 let _firstStatusLoad = true;
 async function fetchStatus() {
@@ -4348,11 +6085,17 @@ let _lastProblemsSig = "";
 function _problemsSig(problems) {
   return problems.map(p => {
     const reasonsKey = p.reasons.map(r => {
-      // "offline 5м 30с" → "offline 5м"
+      // v1.25.14: два уточнённых regex.
+      //   1. "5м 30с" → "5м" (было)
+      //   2. "Nс" → "0с" — покрывает и "offline 30с",
+      //      и "последняя активность 5с назад".
+      //      Раньше второй regex ловил только с префиксом
+      //      "последняя активность ", а offline Nс (без м)
+      //      продолжал дрожать. Плюс "$10" был хрупким
+      //      (мог трактоваться как $10 = группа 10).
       return r
         .replace(/(\d+м)\s+\d+с/g, "$1")
-        // "5с назад" / "10с назад" → "0с назад" (убираем шум в первые 60 сек)
-        .replace(/^\d+с назад$/, "0с назад");
+        .replace(/(\d+)с(?!\d)/g, "0с");
     }).join("·");
     return p.dev.name + "|" + reasonsKey;
   }).join(";");
@@ -4449,15 +6192,70 @@ function sparklineSvgWithLabels(history, width, height) {
   }
   if (cur !== null) segments.push({start: curStart, end: now, status: cur});
   let rects = "";
-  for (const seg of segments) {
+  const svgId = "spark-" + Math.random().toString(36).slice(2, 10);
+  const hitData = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
     const x1 = ((seg.start - startTs) / total) * width;
     const x2 = ((seg.end - startTs) / total) * width;
     const w = Math.max(1, x2 - x1);
     const color = seg.status === "online" ? "var(--green)" : "var(--red)";
-    rects += `<rect x="${x1.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${height}" fill="${color}" opacity="0.7"/>`;
+    hitData.push({
+      idx: i, x1: x1, x2: x2, w: w,
+      start: seg.start, end: seg.end, status: seg.status,
+    });
+    rects += `<rect class="seg-hover hoverable" data-hit="${i}" x="${x1.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${height}" fill="${color}" opacity="0.7"/>`;
   }
-  const svg = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${rects}</svg>`;
+  const svg = `<svg id="${svgId}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" data-hits='${JSON.stringify(hitData).replace(/'/g, "&#39;")}'>${rects}</svg>`;
   const labels = `<div class="sparkline-labels"><span>${fmtDateTime(startTs)}</span><span>${fmtDateTime(now)}</span></div>`;
+
+  setTimeout(() => {
+    const el = document.getElementById(svgId);
+    if (!el) return;
+    const hits = JSON.parse(el.dataset.hits || "[]");
+    _chartTooltip.bind(el, {
+      hitTest: (svgEl, ev) => {
+        const { x } = svgClientToLocal(svgEl, ev.clientX, ev.clientY);
+        for (const h of hits) {
+          if (x >= h.x1 && x <= h.x2) return { data: h };
+        }
+        return null;
+      },
+      onHover: (svgEl, hit) => {
+        svgEl.querySelectorAll("rect.seg-hover").forEach(r => {
+          if (parseInt(r.dataset.hit) === hit.data.idx) r.classList.add("hover");
+          else r.classList.remove("hover");
+        });
+      },
+      onLeave: (svgEl) => {
+        svgEl.querySelectorAll("rect.seg-hover").forEach(r => r.classList.remove("hover"));
+      },
+      render: (hit) => {
+        const h = hit.data;
+        const d1 = new Date(h.start * 1000);
+        const d2 = new Date(h.end * 1000);
+        const fmt = (d) => {
+          const dd = String(d.getDate()).padStart(2, "0");
+          const mm = String(d.getMonth() + 1).padStart(2, "0");
+          const hh = String(d.getHours()).padStart(2, "0");
+          const mi = String(d.getMinutes()).padStart(2, "0");
+          return `${dd}.${mm} ${hh}:${mi}`;
+        };
+        const dur = h.end - h.start;
+        const hh = Math.floor(dur / 3600);
+        const mi = Math.floor((dur % 3600) / 60);
+        let durStr = "";
+        if (hh > 0) durStr = `${hh}ч ${mi}м`;
+        else if (mi > 0) durStr = `${mi}м`;
+        else durStr = `${dur}с`;
+        const badgeCls = h.status === "online" ? "online" : "offline";
+        return `<div class="tt-head">${fmt(d1)} — ${fmt(d2)} (${durStr})</div>
+          <div class="tt-row"><span class="tt-name">статус</span>
+            <span class="tt-badge ${badgeCls}">${h.status}</span></div>`;
+      },
+    });
+  }, 0);
+
   return svg + labels;
 }
 
@@ -4480,33 +6278,263 @@ function latencySparklineSvg(points, width, height) {
     return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       <text x="${width/2}" y="${height/2+4}" text-anchor="middle" fill="currentColor" font-size="11" opacity="0.6">все замеры timeout</text></svg>`;
   }
-  const tsStart = points[0].ts; const tsEnd = points[points.length-1].ts;
-  const tsSpan = (tsEnd - tsStart) || 1;
+  // v1.24.11: ось X привязана к реальному 24-часовому окну
+  // [now-24ч, now], а не к первой/последней точке. Иначе
+  // после quiet-разрывов линия уезжает в сторону, а правый
+  // край пустует.
+  const now = Math.floor(Date.now() / 1000);
+  const tsEnd = now;
+  const tsStart = now - 24 * 3600;
+  const tsSpan = 24 * 3600;
   const msValues = valid.map(p => p.ms);
   const msMin = Math.min(...msValues); const msMax = Math.max(...msValues);
   const msSpan = (msMax - msMin) || 1;
   const PAD = {top:12, bottom:12, left:4, right:4};
   const W = width - PAD.left - PAD.right; const H = height - PAD.top - PAD.bottom;
-  let pathD = ""; let pen = false;
-  for (const p of points) {
+
+  // Собираем координаты всех точек (включая timeout с ms=null).
+  const allPts = points.map(p => {
     const x = PAD.left + ((p.ts - tsStart) / tsSpan) * W;
-    if (p.ms === null || p.ms === undefined) { pen = false; continue; }
-    const y = PAD.top + H - ((p.ms - msMin) / msSpan) * H;
-    pathD += (pen ? "L" : "M") + ` ${x.toFixed(1)} ${y.toFixed(1)} `; pen = true;
-  }
-  let timeouts = "";
-  for (const p of points) {
     if (p.ms === null || p.ms === undefined) {
-      const x = PAD.left + ((p.ts - tsStart) / tsSpan) * W;
-      timeouts += `<circle cx="${x.toFixed(1)}" cy="${height-2}" r="1.5" fill="var(--red)" opacity="0.7"/>`;
+      return { x: x, y: null, ts: p.ts, ms: null };
+    }
+    const y = PAD.top + H - ((p.ms - msMin) / msSpan) * H;
+    return { x: x, y: y, ts: p.ts, ms: p.ms };
+  });
+
+  // Основная линия (только валидные точки).
+  // v1.24.10: разрываем линию, если между соседними точками прошло
+  // больше GAP_THRESHOLD_SEC (30 мин) — иначе жёлтая линия идёт
+  // прямо через серый quiet-разрыв и перекрывает пунктир.
+  const PATH_GAP_SEC = 1800;
+  let pathD = ""; let pen = false; let prevTs = null;
+  for (const p of allPts) {
+    if (p.ms === null || p.ms === undefined) { pen = false; prevTs = null; continue; }
+    if (pen && prevTs !== null && (p.ts - prevTs) > PATH_GAP_SEC) {
+      pen = false;  // разрыв по времени — начинаем новую линию
+    }
+    pathD += (pen ? "L" : "M") + ` ${p.x.toFixed(1)} ${p.y.toFixed(1)} `;
+    pen = true;
+    prevTs = p.ts;
+  }
+
+  // v1.24.8: разрывы — красный пунктир между точкой до и точкой после.
+  // Ищем consecutive-группы timeout-точек между двумя валидными.
+  let gapD = "";
+  const gapHits = [];
+  let i = 0;
+  while (i < allPts.length) {
+    if (allPts[i].ms !== null && allPts[i].ms !== undefined) { i++; continue; }
+    // Начало группы timeout'ов.
+    let j = i;
+    while (j < allPts.length && (allPts[j].ms === null || allPts[j].ms === undefined)) j++;
+    // allPts[i..j-1] — timeout'ы. Нужны точки до (i-1) и после (j).
+    if (i > 0 && j < allPts.length) {
+      const prev = allPts[i-1];
+      const next = allPts[j];
+      if (prev.y !== null && next.y !== null) {
+        const x1 = prev.x;
+        const x2 = next.x;
+        const yMid = (prev.y + next.y) / 2;
+        gapD += `M ${x1.toFixed(1)} ${prev.y.toFixed(1)} L ${x2.toFixed(1)} ${next.y.toFixed(1)} `;
+        gapHits.push({
+          x1: x1, x2: x2, y: yMid,
+          tsFrom: prev.ts, tsTo: next.ts,
+          count: (j - i),
+        });
+      }
+    }
+    i = j;
+  }
+
+  // v1.24.9: серые разрывы — между соседними точками прошло
+  // больше GAP_THRESHOLD_SEC (30 мин) — значит замеров вообще
+  // не было (quiet-hours, рестарт bridge, ручной пропуск).
+  let gapTimeD = "";
+  const gapTimeHits = [];
+  const GAP_THRESHOLD_SEC = 1800;
+  for (let k = 1; k < allPts.length; k++) {
+    const a = allPts[k - 1];
+    const b = allPts[k];
+    if (b.ts - a.ts <= GAP_THRESHOLD_SEC) continue;
+    const yA = (a.y === null) ? height - 2 : a.y;
+    const yB = (b.y === null) ? height - 2 : b.y;
+    // Проверяем, что между ними нет валидной точки (иначе это не разрыв).
+    gapTimeD += `M ${a.x.toFixed(1)} ${yA.toFixed(1)} L ${b.x.toFixed(1)} ${yB.toFixed(1)} `;
+    gapTimeHits.push({
+      x1: a.x, x2: b.x, y: (yA + yB) / 2,
+      tsFrom: a.ts, tsTo: b.ts,
+    });
+  }
+
+  // Красные маркеры timeout-точек внизу.
+  let timeouts = "";
+  for (const p of allPts) {
+    if (p.ms === null || p.ms === undefined) {
+      timeouts += `<circle cx="${p.x.toFixed(1)}" cy="${height-2}" r="1.5" fill="var(--red)" opacity="0.7"/>`;
     }
   }
   const avg = msValues.reduce((a, b) => a+b, 0) / msValues.length;
   const strokeColor = avg < 20 ? "var(--green)" : (avg < 100 ? "var(--yellow)" : "var(--red)");
-  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="color:var(--muted);">
-    <path d="${pathD}" fill="none" stroke="${strokeColor}" stroke-width="1.5"/>${timeouts}
+
+  const svgId = "lat-" + Math.random().toString(36).slice(2, 10);
+  // Точки для tooltip — все (валидные с координатой y, timeout — с y=height-2).
+  const pts = allPts.map(p => ({
+    x: p.x,
+    y: (p.ms === null || p.ms === undefined) ? height - 2 : p.y,
+    ts: p.ts, ms: p.ms,
+  }));
+  const ptsJson = JSON.stringify(pts).replace(/'/g, "&#39;");
+  const gapJson = JSON.stringify(gapHits).replace(/'/g, "&#39;");
+  const gapTimeJson = JSON.stringify(gapTimeHits).replace(/'/g, "&#39;");
+
+  const svgHtml = `<svg id="${svgId}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="color:var(--muted);" data-hits='${ptsJson}' data-gaps='${gapJson}' data-gaps-time='${gapTimeJson}'>
+    <path d="${pathD}" fill="none" stroke="${strokeColor}" stroke-width="1.5"/>
+    ${gapTimeD ? `<path d="${gapTimeD}" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="3,4" opacity="0.7"/>` : ""}
+    ${gapD ? `<path d="${gapD}" fill="none" stroke="var(--red)" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.9"/>` : ""}
+    ${timeouts}
     <text x="${PAD.left+2}" y="10" fill="currentColor" font-size="9">${msMax} мс</text>
     <text x="${PAD.left+2}" y="${height-4}" fill="currentColor" font-size="9">${msMin} мс</text></svg>`;
+
+  setTimeout(() => {
+    const el = document.getElementById(svgId);
+    if (!el) return;
+    const hits = JSON.parse(el.dataset.hits || "[]");
+    const gaps = JSON.parse(el.dataset.gaps || "[]");
+    const gapsTime = JSON.parse(el.dataset.gapsTime || "[]");
+    _chartTooltip.bind(el, {
+      hitTest: (svgEl, ev) => {
+        const { x, y } = svgClientToLocal(svgEl, ev.clientX, ev.clientY);
+        // 1. Ближайшая точка в радиусе 12 SVG-единиц — приоритет.
+        let best = null, bestD = 144;
+        for (const h of hits) {
+          const dx = h.x - x, dy = h.y - y;
+          const d2 = dx*dx + dy*dy;
+          if (d2 < bestD) { bestD = d2; best = h; }
+        }
+        if (best && bestD < 144) return { data: best, isGap: false, isTimeGap: false };
+        // 2. Красный разрыв (timeout).
+        for (const g of gaps) {
+          if (x >= g.x1 && x <= g.x2) {
+            return { data: g, isGap: true, isTimeGap: false };
+          }
+        }
+        // 3. Серый разрыв (нет замеров > 30 мин).
+        for (const g of gapsTime) {
+          if (x >= g.x1 && x <= g.x2) {
+            return { data: g, isGap: false, isTimeGap: true };
+          }
+        }
+        return null;
+      },
+      onHover: (svgEl, hit) => {
+        svgEl.querySelectorAll("circle.pt-hover").forEach(c => c.remove());
+        const ns = "http://www.w3.org/2000/svg";
+
+        // v1.24.14: маркер для серого разрыва — как синяя, только серая.
+        if (hit.isTimeGap) {
+          const g = hit.data;
+          const c = document.createElementNS(ns, "circle");
+          c.setAttribute("class", "pt-hover");
+          c.setAttribute("cx", (g.x1 + g.x2) / 2);
+          c.setAttribute("cy", (typeof g.y === "number") ? g.y : (height / 2));
+          c.setAttribute("r", 5);
+          c.setAttribute("fill", "#b0b8c0");
+          c.setAttribute("stroke", "var(--fg)");
+          c.setAttribute("stroke-width", "1.5");
+          svgEl.appendChild(c);
+          return;
+        }
+
+        // v1.24.14: маркер для красного разрыва — как синяя, только красная.
+        if (hit.isGap) {
+          const g = hit.data;
+          const c = document.createElementNS(ns, "circle");
+          c.setAttribute("class", "pt-hover");
+          c.setAttribute("cx", (g.x1 + g.x2) / 2);
+          c.setAttribute("cy", (typeof g.y === "number") ? g.y : (height / 2));
+          c.setAttribute("r", 5);
+          c.setAttribute("fill", "var(--red)");
+          c.setAttribute("stroke", "var(--fg)");
+          c.setAttribute("stroke-width", "1.5");
+          svgEl.appendChild(c);
+          return;
+        }
+
+        // Обычная точка — цвет маркера совпадает с цветом бейджа.
+        const h = hit.data;
+        let dotColor = "var(--accent)";
+        if (h.ms === null || h.ms === undefined) {
+          dotColor = "var(--red)";
+        } else if (h.ms >= 100) {
+          dotColor = "var(--red)";
+        } else if (h.ms >= 20) {
+          dotColor = "var(--yellow)";
+        } else {
+          dotColor = "var(--green)";
+        }
+        const c = document.createElementNS(ns, "circle");
+        c.setAttribute("class", "pt-hover hover");
+        c.setAttribute("cx", h.x);
+        c.setAttribute("cy", h.y);
+        c.setAttribute("r", 5);
+        c.setAttribute("fill", dotColor);
+        c.setAttribute("stroke", "var(--fg)");
+        c.setAttribute("stroke-width", "1.5");
+        svgEl.appendChild(c);
+      },
+      onLeave: (svgEl) => {
+        svgEl.querySelectorAll("circle.pt-hover").forEach(c => c.remove());
+      },
+      render: (hit) => {
+        const h = hit.data;
+        const fmtD = (ts) => {
+          const d = new Date(ts * 1000);
+          const dd = String(d.getDate()).padStart(2, "0");
+          const mm = String(d.getMonth() + 1).padStart(2, "0");
+          const hh = String(d.getHours()).padStart(2, "0");
+          const mi = String(d.getMinutes()).padStart(2, "0");
+          return `${dd}.${mm} ${hh}:${mi}`;
+        };
+        if (hit.isGap) {
+          // Красный разрыв — интервал + количество timeout'ов.
+          const from = fmtD(h.tsFrom);
+          const to = fmtD(h.tsTo);
+          return `<div class="tt-head">${from} — ${to}</div>
+            <div class="tt-row"><span class="tt-name">Задержка:</span>
+              <span class="tt-badge bad">timeout × ${h.count}</span></div>`;
+        }
+        if (hit.isTimeGap) {
+          // Серый разрыв — нет замеров вообще (quiet/рестарт/пропуск).
+          const from = fmtD(h.tsFrom);
+          const to = fmtD(h.tsTo);
+          const dur = h.tsTo - h.tsFrom;
+          const hh = Math.floor(dur / 3600);
+          const mi = Math.floor((dur % 3600) / 60);
+          let durStr = "";
+          if (hh > 0) durStr = `${hh}ч ${mi}м`;
+          else durStr = `${mi}м`;
+          return `<div class="tt-head">${from} — ${to}</div>
+            <div class="tt-row"><span class="tt-name">Нет замеров:</span>
+              <span class="tt-badge" style="background:rgba(139,148,158,0.18);color:var(--muted);">${durStr}</span></div>`;
+        }
+        const head = fmtD(h.ts);
+        if (h.ms === null || h.ms === undefined) {
+          return `<div class="tt-head">${head}</div>
+            <div class="tt-row"><span class="tt-name">Задержка:</span>
+              <span class="tt-badge bad">timeout</span></div>`;
+        }
+        let cls = "good";
+        if (h.ms >= 100) cls = "bad";
+        else if (h.ms >= 20) cls = "mid";
+        return `<div class="tt-head">${head}</div>
+          <div class="tt-row"><span class="tt-name">Задержка:</span>
+            <span class="tt-badge ${cls}">${h.ms} мс</span></div>`;
+      },
+    });
+  }, 0);
+
+  return svgHtml;
 }
 
 // v1.23.0: точечное обновление модалки.
@@ -4611,6 +6639,24 @@ function _renderLatencyHtml(d) {
   return html;
 }
 
+// v1.25.12: идемпотентная инициализация _CACHE_OPEN_STATE.
+// Сохраняем ручное раскрытие пользователя при росте набора DP:
+// - если хэш не менялся → ничего не трогаем
+// - если менялся, но ключ уже был → сохраняем прежний open/close
+// - если ключа нет → ставим по умолчанию (<= threshold открыт)
+function _ensureCacheOpenState(cacheKey, cacheHashKey, newHash, dpCount, threshold) {
+  const hadBefore = Object.prototype.hasOwnProperty.call(_CACHE_OPEN_STATE, cacheKey);
+  if (!hadBefore) {
+    _CACHE_OPEN_STATE[cacheHashKey] = newHash;
+    _CACHE_OPEN_STATE[cacheKey] = dpCount <= threshold;
+    return;
+  }
+  if (_CACHE_OPEN_STATE[cacheHashKey] !== newHash) {
+    _CACHE_OPEN_STATE[cacheHashKey] = newHash;
+    // Состояние open/close не трогаем — пользователь уже выбрал.
+  }
+}
+
 function _renderCacheHtml(d) {
   const cache = d.cache || {}; const dps_map = d.dps_map || {};
   const keys = Object.keys(cache);
@@ -4621,28 +6667,109 @@ function _renderCacheHtml(d) {
   // чтобы пользователь мог спокойно раскрыть большой список.
   const SMART_THRESHOLD = 8;
   const cacheKey = "_cacheOpen_" + (d.name || "");
-  if (typeof _CACHE_OPEN_STATE[cacheKey] === "undefined") {
-    _CACHE_OPEN_STATE[cacheKey] = keys.length <= SMART_THRESHOLD;
-  }
+  const cacheHashKey = "_cacheHash_" + (d.name || "");
+  // v1.25.0 (fix #3): хэш набора DP считаем из `keys` — `sorted` объявлен
+  // НИЖЕ, и обращение к нему здесь давало TDZ ReferenceError.
+  const dpSetHash = keys.slice().sort().join(",");
+  // v1.25.12: инициализация _CACHE_OPEN_STATE вынесена
+  // в _ensureCacheOpenState() — она не сбрасывает ручное
+  // раскрытие при росте набора DP.
+  _ensureCacheOpenState(cacheKey, cacheHashKey, dpSetHash, keys.length, SMART_THRESHOLD);
   const isOpen = _CACHE_OPEN_STATE[cacheKey] ? "open" : "";
 
   let rows = "";
-  const sorted = keys.sort((a, b) => {
+  const sorted = keys.slice().sort((a, b) => {
     const ai = parseInt(a), bi = parseInt(b);
     if (!isNaN(ai) && !isNaN(bi)) return ai - bi;
     return a.localeCompare(b);
   });
   for (const dp of sorted) {
-    const info = dps_map[dp] || {}; const name = info.name || "?";
+    const info = dps_map[dp] || {};
+    // v1.25.0 (fix #cache_en): в колонке — АНГЛИЙСКОЕ (code),
+    // русский перевод / оригинал / облачное — только в тултипе.
+    // Бейдж источника: ☁ cloud / 📖 code-словарь / 🈶 cn-словарь /
+    // config — без бейджа / ? — без бейджа.
+    const cjk = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/;
+    const rawName = (info.name || "").trim();
+    const code = (info.code || "").trim();
+    const origCn = (info._name_original || "").trim();
+    const src = info._name_source || "";
+    const fromCache = !!info._from_cache;
+
+    // v1.25.0 (fix2): display = code || name(если не CJK) || "?".
+    // Раньше было display = code || "?" — теряло DP из config
+    // (у них есть только name, без code).
+    let display = "";
+    if (code) {
+      display = code;
+    } else if (rawName && !cjk.test(rawName)) {
+      display = rawName;
+    } else {
+      display = "?";
+    }
+
+    // Собираем тултип
+    const tt = [];
+
+    // 1. RU-перевод: сначала по code, потом по rawName
+    let ru = "";
+    if (code && DP_CODE_NAMES_RU_FRONT[code]) {
+      ru = DP_CODE_NAMES_RU_FRONT[code];
+    } else if (rawName && !cjk.test(rawName) && DP_CODE_NAMES_RU_FRONT[rawName]) {
+      ru = DP_CODE_NAMES_RU_FRONT[rawName];
+    } else if (rawName && DP_CN_NAMES_RU_FRONT[rawName]) {
+      ru = DP_CN_NAMES_RU_FRONT[rawName];
+    } else if (origCn && DP_CN_NAMES_RU_FRONT[origCn]) {
+      ru = DP_CN_NAMES_RU_FRONT[origCn];
+    }
+    if (ru && ru !== display) tt.push("RU: " + ru);
+
+    // 2. Оригинал (китайский), если был
+    if (origCn && origCn !== display) tt.push("Оригинал: " + origCn);
+
+    // 3. rawName, если != display и не CJK
+    if (rawName && rawName !== display && !cjk.test(rawName)) {
+      tt.push("Config: " + rawName);
+    }
+
+    // 4. Источник
+    let srcLabel = "";
+    if (fromCache || src === "cloud") srcLabel = "cloud";
+    else if (src === "dict") srcLabel = "code-словарь";
+    else if (src === "cn") srcLabel = "cn-словарь";
+    else if (src === "config") srcLabel = "config";
+    if (srcLabel) tt.push("Источник: " + srcLabel);
+
+    // Бейдж истинного источника
+    let badge = "";
+    if (display === "?") {
+      // без бейджа; если ничего нет в тултипе — добавим пояснение
+      if (!tt.length) tt.push("Имя DP неизвестно");
+    } else if (fromCache || src === "cloud") {
+      badge = "☁";
+    } else if (src === "dict") {
+      badge = "📖";
+    } else if (src === "cn") {
+      badge = "🈶";
+    }
+    // src === "config" → без бейджа
+
+    const badgeHtml = badge
+      ? ` <span style="font-size:10px; opacity:0.75;">${badge}</span>`
+      : '';
+    const titleAttr = tt.length
+      ? ` title="${escapeAttr(tt.join(" · "))}"`
+      : '';
     const val = JSON.stringify(cache[dp]);
-    rows += `<tr><td>${escapeHtml(dp)} <span class="muted">(${escapeHtml(name)})</span></td>
-      <td>${copyCode(val)}</td></tr>`;
+    // v1.25.12: обёртка .cache-dp-name — чтобы ☁ не съезжал на новую строку
+    rows += `<tr><td${titleAttr}><span class="cache-dp-name">${escapeHtml(dp)} <span class="muted">(${escapeHtml(display)})</span>${badgeHtml}</span></td>
+      <td>${_cellValue(val, 80)}</td></tr>`;
   }
 
   return `<details class="cache-details" ${isOpen}
       ontoggle="_onCacheToggle('${escapeAttr(d.name || "")}', this.open)">
     <summary><h3 style="display:inline; margin:0;">Кэш состояния (${keys.length})</h3>
-      <span class="muted" style="font-size:11px; margin-left:6px;">${keys.length > SMART_THRESHOLD ? "клик — раскрыть" : ""}</span>
+      <span class="muted" style="font-size:11px; margin-left:6px;">${_CACHE_OPEN_STATE[cacheKey] ? "" : "клик — раскрыть"}</span>
     </summary>
     <table class="detail-table" style="margin-top:6px;">${rows}</table>
   </details>`;
@@ -4685,8 +6812,19 @@ function renderModalVolatile(d) {
 
   _updateZone("mv-info",      _renderInfoHtml(d));
   _updateZone("mv-climate",   _renderClimateHtml(d));
-  _updateZone("mv-sparkline", _renderSparklineHtml(d));
-  _updateZone("mv-latency",   _renderLatencyHtml(d));
+  // v1.24.6: sparkline и latency не трогаем при открытом tooltip —
+  // иначе слетают hover и marker точек.
+  // v1.25.0 (fix #21): при открытом tooltip спарклайна пропускаем
+  // только mv-sparkline. mv-latency не конфликтует с ним — обновляем.
+  const _ttOpen = (typeof _chartTooltip !== "undefined") && _chartTooltip.isOpen();
+  // v1.25.12: при открытом tooltip пропускаем ОБА спарклайна
+  // (mv-sparkline = статус, mv-latency = задержка). Иначе при
+  // перерисовке mv-latency старый SVG удаляется и tooltip
+  // «отвязывается» от несуществующего элемента.
+  if (!_ttOpen) {
+    _updateZone("mv-sparkline", _renderSparklineHtml(d));
+    _updateZone("mv-latency", _renderLatencyHtml(d));
+  }
   _updateZone("mv-cache",     _renderCacheHtml(d));
   _updateZone("mv-history",   _renderHistoryHtml(d));
 }
@@ -4746,6 +6884,7 @@ async function showDevice(idx) {
   const d = LAST_DEVICES[idx];
   if (!d) return;
   CURRENT_MODAL_IDX = idx;
+  CURRENT_MODAL_NAME = d.name;  // v1.25.13
   // v1.21.1: явное открытие — сбросить старый quiet-редактор
   // (в т.ч. _dirty от прошлого устройства).
   if (typeof d.quiet_windows !== "undefined") {
@@ -4823,8 +6962,9 @@ function renderQuietSection(d) {
     <div id="quiet-rows">${rows}</div>
     <div class="quiet-actions">
       <button onclick="quietAdd()" style="padding:4px 12px; font-size:12px;">+ Добавить окно</button>
-      <button class="primary" onclick="quietSave(${jsStr(d.name)})" style="padding:4px 12px; font-size:12px;">💾 Сохранить</button>
-      <span id="quiet-dirty" class="muted" style="display:none; font-size:11px; color:var(--yellow);">● не сохранено</span>
+      <button class="primary" id="quiet-save-btn" onclick="quietSave(${jsStr(d.name)})" style="padding:4px 12px; font-size:12px; ${QUIET_EDIT && QUIET_EDIT._dirty ? "" : "display:none;"}">💾 Сохранить</button>
+      <button id="quiet-cancel-btn" onclick="quietCancel()" style="padding:4px 12px; font-size:12px; ${QUIET_EDIT && QUIET_EDIT._dirty ? "" : "display:none;"}">↶ Отмена</button>
+      <span id="quiet-dirty" class="muted" style="display:${QUIET_EDIT && QUIET_EDIT._dirty ? "inline" : "none"}; font-size:11px; color:var(--yellow);">● не сохранено</span>
       <span id="quiet-save-status" class="muted" style="font-size:11px;"></span>
     </div>`;
 }
@@ -4835,23 +6975,43 @@ function quietInitEdit(d, force) {
   if (!force && QUIET_EDIT && QUIET_EDIT._name === d.name && QUIET_EDIT._dirty) {
     return;
   }
+  const orig = JSON.parse(JSON.stringify(d.quiet_windows || []));
   QUIET_EDIT = {
     _name: d.name,
     _dirty: false,
-    windows: JSON.parse(JSON.stringify(d.quiet_windows || []))
+    _original: JSON.parse(JSON.stringify(orig)),
+    windows: JSON.parse(JSON.stringify(orig))
   };
 }
+
+// v1.25.0 (task #D): _dirty = есть ли реальные отличия от _original.
+function quietRecalcDirty() {
+  if (!QUIET_EDIT) return;
+  const a = JSON.stringify(QUIET_EDIT.windows || []);
+  const b = JSON.stringify(QUIET_EDIT._original || []);
+  QUIET_EDIT._dirty = (a !== b);
+  _quietUpdateUi();
+}
+
+// v1.25.0 (task #D): показать/скрыть кнопки и индикатор по _dirty.
+function _quietUpdateUi() {
+  const dirty = !!(QUIET_EDIT && QUIET_EDIT._dirty);
+  const btnSave = document.getElementById("quiet-save-btn");
+  const btnCancel = document.getElementById("quiet-cancel-btn");
+  const dirtyEl = document.getElementById("quiet-dirty");
+  if (btnSave) btnSave.style.display = dirty ? "inline-block" : "none";
+  if (btnCancel) btnCancel.style.display = dirty ? "inline-block" : "none";
+  if (dirtyEl) dirtyEl.style.display = dirty ? "inline" : "none";
+}
 function quietMarkDirty() {
-  if (QUIET_EDIT) {
-    QUIET_EDIT._dirty = true;
-    const el = document.getElementById("quiet-dirty");
-    if (el) el.style.display = "inline";
-  }
+  quietRecalcDirty();
 }
 function quietClearDirty() {
-  if (QUIET_EDIT) QUIET_EDIT._dirty = false;
-  const el = document.getElementById("quiet-dirty");
-  if (el) el.style.display = "none";
+  if (QUIET_EDIT) {
+    QUIET_EDIT._dirty = false;
+    QUIET_EDIT._original = JSON.parse(JSON.stringify(QUIET_EDIT.windows || []));
+  }
+  _quietUpdateUi();
 }
 function quietAddRowToDom(w, i) {
   const wrap = document.getElementById("quiet-rows");
@@ -4914,6 +7074,21 @@ function quietRemove(i) {
   }
   quietMarkDirty();
 }
+// v1.25.0 (task #D): отмена — восстановить _original, перерисовать секцию.
+function quietCancel() {
+  if (!QUIET_EDIT || !QUIET_EDIT._original) return;
+  QUIET_EDIT.windows = JSON.parse(JSON.stringify(QUIET_EDIT._original));
+  QUIET_EDIT._dirty = false;
+  if (CURRENT_MODAL_IDX >= 0) {
+    const d = LAST_DEVICES[CURRENT_MODAL_IDX];
+    if (d) {
+      const zone = document.getElementById("modal-quiet-zone");
+      if (zone) zone.innerHTML = renderQuietSection(d);
+    }
+  }
+  _quietUpdateUi();
+}
+
 async function quietSave(name) {
   const statusEl = document.getElementById("quiet-save-status");
   if (statusEl) statusEl.innerHTML = '<span class="spin"></span> сохранение…';
@@ -4929,6 +7104,8 @@ async function quietSave(name) {
       if (d) d.quiet_windows = data.windows || [];
       // v1.21.1: сбрасываем dirty и обновляем ТОЛЬКО данные, без перерисовки модалки
       quietClearDirty();
+      // v1.25.0 (task #D): _original уже обновлён в quietClearDirty —
+      // кнопки «Сохранить»/«Отмена» прячутся автоматически.
       // тихо подтянем свежий /api/status, но модалку не трогаем
       fetchStatus();
       setTimeout(() => { if (statusEl) statusEl.textContent = ""; }, 2000);
@@ -4942,13 +7119,25 @@ async function quietSave(name) {
 
 function closeModal(evt) {
   if (evt && evt.target && evt.target.id !== "modal-overlay") return;
-  const d = LAST_DEVICES[CURRENT_MODAL_IDX];
-  if (d) {
-    delete DEVICE_HISTORY_CACHE[d.name];
-    delete DEVICE_LATENCY_CACHE[d.name];
-    delete DEVICE_AVG_LATENCY_CACHE[d.name];
+  // v1.25.13: чистим по имени, а не по индексу — индекс мог
+  // стать -1 при повторном вызове или закрытии по Escape.
+  if (CURRENT_MODAL_NAME) {
+    delete DEVICE_HISTORY_CACHE[CURRENT_MODAL_NAME];
+    delete DEVICE_LATENCY_CACHE[CURRENT_MODAL_NAME];
+    delete DEVICE_AVG_LATENCY_CACHE[CURRENT_MODAL_NAME];
+    try {
+      delete _CACHE_OPEN_STATE["_cacheOpen_" + CURRENT_MODAL_NAME];
+      delete _CACHE_OPEN_STATE["_cacheHash_" + CURRENT_MODAL_NAME];
+    } catch (e) {}
+    CURRENT_MODAL_NAME = null;
   }
   CURRENT_MODAL_IDX = -1;
+  // v1.25.0 (fix #2): явно чистим хэши зон модалки — иначе
+  // _updateZone может не перерисовать зону, если HTML случайно
+  // совпал с прошлым (при открытии другого устройства).
+  try {
+    Object.keys(_modalZoneHashes).forEach(k => delete _modalZoneHashes[k]);
+  } catch (e) {}
   document.getElementById("modal-overlay").classList.remove("open");
 }
 
@@ -5278,8 +7467,9 @@ function renderLogsFromBuffer() {
   if (!logPaused && !userScrolledUp) logsEl.scrollTop = logsEl.scrollHeight;
 }
 function appendLog(item) {
-  if (item.seq <= lastSeq) return;
-  lastSeq = item.seq;
+  // v1.25.12: seq per-source. Сравниваем с seq текущего источника.
+  if (item.seq <= _getLastSeq()) return;
+  if (item.source === LOG_SOURCE) _setLastSeq(item.seq);
   LOG_BUFFER.push(item);
   if (LOG_BUFFER.length > LOG_BUFFER_MAX) LOG_BUFFER.shift();
   if (logSourcePass(item) && logLevelPass(item.level, item.source) && logTimePass(item) && logMatchesSearch(item.msg)) {
@@ -5380,9 +7570,8 @@ function switchLogSource(src) {
   // затем переподключим SSE с текущим глобальным lastSeq.
   loadLogHistory().then((maxSeq) => {
     if (myToken !== LOG_SOURCE_TOKEN) return;
-    if (maxSeq > lastSeq) lastSeq = maxSeq;
-    // v1.22.1: защита от backlog при пустом буфере
-    if (lastSeq <= 0) lastSeq = 1;
+    // v1.25.12: seq per-source.
+    _setLastSeq(maxSeq > 0 ? maxSeq : 1);
     connectSSE();
   });
 }
@@ -5489,7 +7678,7 @@ function connectSSE() {
     try { LOG_SSE_ES.close(); } catch (e) {}
     LOG_SSE_ES = null;
   }
-  const es = new EventSource(`/api/logs/stream?since=${lastSeq}&v=${Date.now()}`);
+  const es = new EventSource(`/api/logs/stream?since=${_getLastSeq()}&v=${Date.now()}`);
   LOG_SSE_ES = es;
   es.onmessage = (e) => { try { const item = JSON.parse(e.data); if (item?.seq) appendLog(item); } catch {} };
   es.onerror = () => {
@@ -5672,7 +7861,8 @@ async function doTimelineCleanup() {
 }
 
 // ===== Base Info =====
-async function loadBaseInfo() {
+async function loadBaseInfo(btn) {
+  if (btn) setButtonState(btn, "loading", "Обновление…");
   try {
     const r = await fetch("/api/base/info");
     const data = await r.json();
@@ -5682,25 +7872,42 @@ async function loadBaseInfo() {
     const uEl = document.getElementById("base-tuya-local-info");
     if (tEl) tEl.textContent = t.exists ? `${t.count} устройств · ${fmtAgo(t.modified)}` : "не создана";
     if (uEl) uEl.textContent = u.exists ? `${u.count} шаблонов · обновлена ${fmtAgo(u.modified)}` : "не найдена";
-  } catch (e) { console.error("loadBaseInfo", e); }
+    if (btn) {
+      setButtonState(btn, "ok", "Обновлено");
+      restoreButtonAfter(btn, 2000, "🔄 Обновить");
+    }
+  } catch (e) {
+    console.error("loadBaseInfo", e);
+    if (btn) {
+      setButtonState(btn, "err", "Ошибка");
+      restoreButtonAfter(btn, 3000, "🔄 Обновить");
+    }
+  }
 }
 async function updateTuyaLocalDb() {
   const btn = document.getElementById("tuya-local-update-btn");
   const res = document.getElementById("base-update-result");
   const ok = await uiConfirm("Обновить tuya-local?", "Скачать/обновить базу tuya-local? (~50 МБ, займёт до 2 мин)", {okText:"Скачать"});
   if (!ok) return;
-  btn.disabled = true; res.innerHTML = '<span class="spin"></span> скачивание…';
+  setButtonState(btn, "loading", "Скачивание…");
+  btn.disabled = true; res.innerHTML = "";
   try {
     const r = await fetch("/api/base/tuya-local/update", { method: "POST" });
     const data = await r.json();
     if (data.ok) {
+      setButtonState(btn, "ok", "Обновлено");
       res.textContent = "✅ " + (data.message || "обновлено");
       loadBaseInfo();
     } else {
+      setButtonState(btn, "err", "Ошибка");
       res.textContent = "❌ " + (data.error || "ошибка") + " (эвристика остаётся)";
     }
-  } catch (e) { res.textContent = "❌ " + e.message; }
+  } catch (e) {
+    setButtonState(btn, "err", "Ошибка");
+    res.textContent = "❌ " + e.message;
+  }
   btn.disabled = false;
+  restoreButtonAfter(btn, 3000, "⬇ Обновить tuya-local");
   setTimeout(() => res.textContent = "", 20000);
 }
 
@@ -5717,6 +7924,7 @@ async function rebuildTinytuyaJson() {
   if (!ok) return;
 
   btn.disabled = true;
+  setButtonState(btn, "loading", "Сборка…");
   progressWrap.style.display = "block";
   progressText.innerHTML = '<span class="spin"></span> запуск…';
   progressFill.style.width = "0%";
@@ -5726,6 +7934,8 @@ async function rebuildTinytuyaJson() {
     const data = await r.json();
     if (!data.ok) {
       progressText.textContent = "❌ " + (data.error || "ошибка");
+      setButtonState(btn, "err", "Ошибка");
+      restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya.json");
       btn.disabled = false;
       return;
     }
@@ -5733,6 +7943,8 @@ async function rebuildTinytuyaJson() {
     pollRebuildProgress();
   } catch (e) {
     progressText.textContent = "❌ " + e.message;
+    setButtonState(btn, "err", "Ошибка");
+    restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya.json");
     btn.disabled = false;
   }
 }
@@ -5758,6 +7970,12 @@ function pollRebuildProgress() {
         let msg = s.ok ? `✅ Готово: ${s.current}/${s.total}` : `⚠️ Завершено с ошибками (${s.errors?.length || 0})`;
         if (s.errors?.length) msg += " · " + s.errors.slice(0,3).map(escapeHtml).join("; ");
         progressText.textContent = msg;
+        if (s.ok) {
+          setButtonState(btn, "ok", "Готово");
+        } else {
+          setButtonState(btn, "err", "Ошибка");
+        }
+        restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya.json");
         btn.disabled = false;
         loadBaseInfo();
         setTimeout(() => { progressWrap.style.display = "none"; }, 6000);
@@ -5928,9 +8146,9 @@ function renderCloudDevices() {
     : `${CLOUD_DEVICES.length} устройств`;
   // v1.18.12: сохраняем scrollTop внутреннего скроллера — иначе при
   // перерисовке (Выбрать все / Снять всё) список "улетает" вверх.
-  const oldScroller = c.querySelector('div[style*="overflow-y"]');
+  const oldScroller = c.querySelector('.cloud-scroll');
   const savedScrollTop = oldScroller ? oldScroller.scrollTop : 0;
-  let html = `<div style="max-height:500px; overflow-y:auto;"><table>
+  let html = `<div class="cloud-scroll" style="max-height:500px; overflow-y:auto;"><table>
     <thead><tr><th style="width:40px;"></th><th>Имя</th><th>Тип</th><th>Продукт</th><th>Local key</th><th>DP</th><th>Online</th></tr></thead><tbody>`;
   for (const d of filtered) {
     const i = CLOUD_DEVICES.indexOf(d);
@@ -5957,7 +8175,7 @@ function renderCloudDevices() {
   html += "</tbody></table></div>";
   c.innerHTML = html;
   // v1.18.12: восстанавливаем scrollTop после перерисовки.
-  const newScroller = c.querySelector('div[style*="overflow-y"]');
+  const newScroller = c.querySelector('.cloud-scroll');
   if (newScroller && savedScrollTop) newScroller.scrollTop = savedScrollTop;
   actions.style.display = "flex";
   updateSelectedCount();
@@ -5971,8 +8189,16 @@ function toggleCloudSelect(idx, checked) {
   updateSelectedCount();
 }
 function selectAllCloud(v) {
+  // v1.25.13: симметрично учитываем активный поиск —
+  // «Выбрать все» / «Снять всё» работают только с видимыми.
+  const visible = CLOUD_SEARCH ? CLOUD_DEVICES.filter(cloudSearchPass) : CLOUD_DEVICES;
   CLOUD_SELECTED = {};
-  if (v) for (let i = 0; i < CLOUD_DEVICES.length; i++) CLOUD_SELECTED[i] = true;
+  if (v) {
+    for (const d of visible) {
+      const i = CLOUD_DEVICES.indexOf(d);
+      if (i >= 0) CLOUD_SELECTED[i] = true;
+    }
+  }
   renderCloudDevices();
 }
 function updateSelectedCount() { document.getElementById("selected-count").textContent = `Выбрано: ${Object.keys(CLOUD_SELECTED).length}`; }
@@ -5997,7 +8223,7 @@ function showCloudDevice(idx) {
   html += row("Имя", d.name);
   html += row("ID", d.id, true);
   html += `<tr><td>Category (raw)</td><td><span class="type-badge">${escapeHtml(d.category || '?')}</span> <span class="muted" style="font-size:11px;">(код Tuya)</span></td></tr>`;
-  html += `<tr><td>Тип устройства</td><td><span class="type-badge primary">${escapeHtml(d.type_guess || 'switch')}</span></td></tr>`;
+  html += `<tr><td>Тип устройства</td><td>${typeBadge(d.type_guess || 'switch')}</td></tr>`;
   html += row("Продукт", d.product_name);
   html += row("Product ID", d.product_id, true);
   html += row("Модель", d.model);
@@ -6012,12 +8238,15 @@ function showCloudDevice(idx) {
   const cloudStatus = d.cloud_status || {};
   if (Object.keys(cloudStatus).length > 0) {
     html += `<h3>Status из облака (${Object.keys(cloudStatus).length} значений)</h3>`;
-    html += `<table class="detail-table"><thead><tr><th>Код</th><th>Значение</th></tr></thead><tbody>`;
+    html += `<div class="wide-table-wrap"><table class="detail-table wide-table wide-table-2col"><colgroup>
+      <col class="col-code"><col class="col-current">
+    </colgroup><thead><tr><th>Код</th><th>Значение</th></tr></thead><tbody>`;
     for (const k of Object.keys(cloudStatus).sort()) {
       const v = cloudStatus[k];
-      html += `<tr><td>${copyCodePlain(k)}</td><td>${copyCode(displayValue(v))}</td></tr>`;
+      // v1.25.12: пустое значение → span.muted, не code.
+      html += `<tr><td class="cell col-code"><div class="cell-inner">${copyCodePlain(k)}</div></td><td class="cell col-current"><div class="cell-inner cell-trunc">${_cellValue(displayValue(v), 80)}</div></td></tr>`;
     }
-    html += `</tbody></table>`;
+    html += `</tbody></table></div>`;
   } else {
     html += `<h3>Status из облака</h3><div class="muted">Облако не вернуло status для этого устройства.</div>`;
   }
@@ -6043,13 +8272,28 @@ function showCloudDevice(idx) {
 
   if (Object.keys(mapping).length > 0) {
     html += `<h3>Сопоставление DP (${Object.keys(mapping).length} DP)</h3>`;
-    html += `<table class="detail-table"><thead><tr>
+    html += `<div class="wide-table-wrap"><table class="detail-table wide-table"><colgroup>
+      <col class="col-dp"><col class="col-code"><col class="col-name">
+      <col class="col-type"><col class="col-values"><col class="col-current">
+      <col class="col-component">
+    </colgroup><thead><tr>
       <th>DP</th><th>Code</th><th>Имя</th><th>Тип</th><th>Значения</th><th>Текущее</th><th>Component</th>
     </tr></thead><tbody>`;
     const sorted = Object.entries(mapping).sort(([a],[b]) => parseInt(a) - parseInt(b));
     for (const [dp, m] of sorted) {
       const code = m.code || "";
-      const name = codeToName[code] || m.name || "";
+      // v1.25.0 (task #C): колонка «Имя» = code (английское),
+      // русский/оригинал/облачное — в тултипе.
+      const _cfgName = m.name || "";
+      const _cloudName = codeToName[code] || "";
+      const _resolved = resolveDpDisplay(code, _cloudName, _cfgName);
+      const name = _resolved.display;
+      const _nameBadge = _resolved.badge
+        ? ` <span style="font-size:10px; opacity:0.75;">${_resolved.badge}</span>`
+        : '';
+      const _nameTitle = _resolved.tooltip
+        ? ` title="${escapeAttr(_resolved.tooltip)}"`
+        : "";
       const dtype = m.type || "?";
       const vals = m.values && Object.keys(m.values).length ? JSON.stringify(m.values) : '—';
       const cur = codeToValue[code];
@@ -6059,22 +8303,22 @@ function showCloudDevice(idx) {
       const isJunk = JUNK_DP_CODES.has(code);
       const rowCls = isJunk ? "junk-row" : "";
       html += `<tr class="${rowCls}">
-        <td><strong>${escapeHtml(dp)}</strong>${isJunk ? ' <span class="badge junk">мусор</span>' : ''}</td>
-        <td>${copyCodePlain(code)}</td>
-        <td class="muted" style="font-size:11px;">${escapeHtml(name)}</td>
-        <td><span class="type-badge">${escapeHtml(dtype)}</span></td>
-        <td><code style="font-size:10px;">${escapeHtml(vals)}</code></td>
-        <td>${copyCodePlain(curStr)}</td>
-        <td><span class="type-badge">${escapeHtml(comp)}</span></td>
+        <td class="cell col-dp"><div class="cell-inner"><strong>${escapeHtml(dp)}</strong>${isJunk ? ' <span class="badge junk">мусор</span>' : ''}</div></td>
+        <td class="cell col-code"><div class="cell-inner">${copyCodePlain(code)}</div></td>
+        <td class="cell col-name muted" style="font-size:11px;"${_nameTitle}><div class="cell-inner">${escapeHtml(name)}${_nameBadge}</div></td>
+        <td class="cell col-type"><div class="cell-inner"><span class="type-badge">${escapeHtml(dtype)}</span></div></td>
+        <td class="cell col-values"><div class="cell-inner cell-trunc">${_cellValue(vals)}</div></td>
+        <td class="cell col-current"><div class="cell-inner cell-trunc">${_cellValue(curStr)}</div></td>
+        <td class="cell col-component"><div class="cell-inner">${componentBadge(comp)}</div></td>
       </tr>`;
     }
-    html += `</tbody></table>`;
+    html += `</tbody></table></div>`;
   } else {
     html += `<h3>Сопоставление DP</h3><div class="muted">Облако не вернуло mapping для этого устройства.</div>`;
   }
 
   html += `<h3>Рекомендации</h3><table class="detail-table">`;
-  html += `<tr><td>Тип устройства</td><td><span class="type-badge primary">${escapeHtml(d.type_guess || 'switch')}</span></td></tr>`;
+  html += `<tr><td>Тип устройства</td><td>${typeBadge(d.type_guess || 'switch')}</td></tr>`;
   html += `<tr><td>Версия протокола (guess)</td><td>${copyCodePlain(d.version_guess || '3.3')}</td></tr>`;
   html += `</table>`;
 
@@ -6262,8 +8506,11 @@ function renderPreviewDeviceBlock(item, idx) {
   if (Object.keys(mapping).length === 0) {
     html += `<div class="cloud-warn">⚠️ Cloud не вернул mapping. Нажми «🔍 Probe» — DP будут сопоставлены по значениям из Cloud status + типам.</div>`;
   } else {
-    html += `<table class="detail-table preview-dp-table"><thead><tr>
-      <th style="width:40px;"></th><th>DP</th><th>Code</th><th>Имя</th><th>Component</th>
+    html += `<div class="wide-table-wrap"><table class="detail-table wide-table preview-dp-table"><colgroup>
+      <col class="col-check"><col class="col-dp"><col class="col-code">
+      <col class="col-name"><col class="col-component">
+    </colgroup><thead><tr>
+      <th></th><th>DP</th><th>Code</th><th>Имя</th><th>Component</th>
     </tr></thead><tbody>`;
     const sorted = Object.entries(mapping).sort(([a],[b]) => parseInt(a) - parseInt(b));
     for (const [dp, m] of sorted) {
@@ -6272,15 +8519,19 @@ function renderPreviewDeviceBlock(item, idx) {
       const isJunk = JUNK_DP_CODES.has(code);
       const checked = item.enabled_dps[dp] ? "checked" : "";
       const rowCls = isJunk ? "junk-row" : "";
+      // v1.25.0 (fix #11): колонка «Component» показывает component DP
+      // (switch/sensor/select/number/...), а не тип устройства.
+      const _dpInfo = (d.dps_map && d.dps_map[dp]) || {};
+      const _component = _dpInfo.component || '—';
       html += `<tr class="${rowCls}">
         <td><input type="checkbox" ${checked} onchange="togglePreviewDp(${idx}, '${escapeAttr(dp)}', this.checked)"></td>
         <td><strong>${escapeHtml(dp)}</strong></td>
         <td>${copyCodePlain(code)}${isJunk ? ' <span class="badge junk">мусор</span>' : ''}</td>
         <td class="muted" style="font-size:11px;">${escapeHtml(name)}</td>
-        <td><span class="type-badge">${escapeHtml(d.type || '?')}</span></td>
+        <td>${componentBadge(_component)}</td>
       </tr>`;
     }
-    html += `</tbody></table>`;
+    html += `</tbody></table></div>`;
   }
   html += `</div></div>`;
   return html;
@@ -6360,7 +8611,9 @@ function _updateProbeTitle() {
   const title = document.getElementById("preview-title");
   if (!title) return;
   const s = _probeStats;
-  title.textContent = `Probe: ✅ ${s.ok} / ⏳ ${s.pending} / ❌ ${s.fail} / всего ${s.total}`;
+  // v1.25.12: pending = сколько ещё не завершено
+  const pending = Math.max(0, s.total - s.ok - s.fail);
+  title.textContent = `Probe: ✅ ${s.ok} / ⏳ ${pending} / ❌ ${s.fail} / всего ${s.total}`;
 }
 
 function _setDeviceProbeClass(idx, cls) {
@@ -6381,7 +8634,9 @@ async function probeAllInPreview() {
   const oldTitle = title ? title.textContent : "";
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> probe…'; }
   const total = PREVIEW_DEVICES.length;
-  _probeStats = { pending: 0, ok: 0, fail: 0, total: total };
+  // v1.26.0: pending вычисляется в _updateProbeTitle() как
+  // total - ok - fail, отдельное поле не нужно.
+  _probeStats = { ok: 0, fail: 0, total: total };
   _updateProbeTitle();
   // v1.19: try/finally — иначе при синхронном исключении внутри
   // probeDeviceItem кнопка осталась бы навсегда «probe…».
@@ -6396,14 +8651,12 @@ async function probeAllInPreview() {
         if (my >= total) return;
         _setDeviceProbeStatus(my, '<span class="muted">⏳ в очереди</span>');
         _setDeviceProbeClass(my, "probing");
-        _probeStats.pending++;
         _updateProbeTitle();
         try {
           await probeDeviceItem(PREVIEW_DEVICES[my], my);
         } catch (e) {
           console.error("probe item failed", e);
         }
-        _probeStats.pending--;
         if (!PREVIEW_DEVICES[my].needs_probe) {
           _probeStats.ok++;
           _setDeviceProbeClass(my, "probe-ok");
@@ -6502,6 +8755,24 @@ async function probeDeviceItem(item, idx) {
 }
 
 async function confirmImport() {
+  // v1.25.13: предупреждаем, если есть устройства с пустым dps_map —
+  // они импортируются «молча», но не создадут MQTT-сущностей.
+  const _emptyCount = PREVIEW_DEVICES.filter(item => {
+    const d = item.device;
+    let any = false;
+    for (const k of Object.keys(item.enabled_dps || {})) {
+      if (item.enabled_dps[k] && d.dps_map && d.dps_map[k]) { any = true; break; }
+    }
+    return !any;
+  }).length;
+  if (_emptyCount > 0) {
+    const ok = await uiConfirm(
+      "Импорт с пустым dps_map",
+      `${_emptyCount} устройств(а) с пустым dps_map — у них не будет MQTT-сущностей.\n\nИмпортировать всё равно?`,
+      { danger: true, okText: "Импортировать" }
+    );
+    if (!ok) return;
+  }
   const btn = document.getElementById("preview-import-btn");
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span> импорт…';
@@ -6809,6 +9080,7 @@ function setLatencyPeriod(seconds) {
 function sortLatency(key) {
   if (LATENCY_SORT_KEY === key) LATENCY_SORT_DIR = -LATENCY_SORT_DIR;
   else { LATENCY_SORT_KEY = key; LATENCY_SORT_DIR = 1; }
+  _saveSort("latency", LATENCY_SORT_KEY, LATENCY_SORT_DIR);
   renderLatencyTable(LATENCY_DATA);
   updateLatencySortIndicators();
 }
@@ -6824,6 +9096,7 @@ function updateLatencySortIndicators() {
 function sortFlappers(key) {
   if (FLAPPER_SORT_KEY === key) FLAPPER_SORT_DIR = -FLAPPER_SORT_DIR;
   else { FLAPPER_SORT_KEY = key; FLAPPER_SORT_DIR = (key === "flaps") ? -1 : 1; }
+  _saveSort("flappers", FLAPPER_SORT_KEY, FLAPPER_SORT_DIR);
   renderFlappers(FLAPPER_DATA);
   updateFlapperSortIndicators();
 }
@@ -6850,8 +9123,9 @@ async function loadAnalytics() {
     LATENCY_DATA = data.latency || [];
     FLAPPER_DATA = data.flappers || [];
     renderLatencyTable(LATENCY_DATA);
-    // v1.23.6: ограничиваем список мерцающих первыми 50 (топ по кол-ву).
-    renderFlappers(FLAPPER_DATA.slice(0, 50));
+    // v1.25.13: slice(0,50) теперь внутри renderFlappers
+    // (иначе сортировка по клику работала только по «первым 50»).
+    renderFlappers(FLAPPER_DATA);
     renderTimeline(data.timeline || [], data.timeline_total || 0);
     const summaryEl = document.getElementById("activity-summary");
     if (summaryEl) summaryEl.textContent = "";
@@ -6916,7 +9190,7 @@ function renderFlappers(f) {
   const s = [...f].sort((a, b) => {
     if (FLAPPER_SORT_KEY === "dev") return (a.dev || "").localeCompare(b.dev || "") * FLAPPER_SORT_DIR;
     return ((a.flaps || 0) - (b.flaps || 0)) * FLAPPER_SORT_DIR;
-  });
+  }).slice(0, 50);  // v1.25.13: сортируем весь набор, показываем топ-50
   // v1.22.4: friendly_name + серое name
   tb.innerHTML = s.map(x => `<tr><td>${deviceNameCell(x.dev)}</td><td><strong>${x.flaps}</strong></td></tr>`).join("");
 }
@@ -6942,9 +9216,12 @@ function renderTimeline(t, total) {
   </div>`).join("");
 }
 
+let _ACTIVITY_HITS = [];
+
 function renderActivity(points) {
   const svg = document.getElementById("chart-activity");
   if (!svg) return;
+  if (svg.dataset.ttBound === "1" && _chartTooltip.isOpen()) return;
   const summaryEl = document.getElementById("activity-summary");
   if (!points || points.length === 0) {
     svg.innerHTML = '<text x="400" y="90" text-anchor="middle" fill="var(--muted)" font-size="13">Нет данных (нужно минимум 2 часа работы)</text>';
@@ -7011,6 +9288,69 @@ function renderActivity(points) {
     ${xLabels}
   `;
 
+  _ACTIVITY_HITS = [];
+  const hourW = iw / 24;
+  for (const p of points) {
+    const x = PAD.left + ((p.ts - tsStart) / tsSpan) * iw;
+    _ACTIVITY_HITS.push({
+      x: x, w: hourW, ts: p.ts,
+      online: p.online || 0, total: p.total || 0,
+    });
+  }
+  // v1.26.0: bind() сам управляет слушателями через AbortController
+  // (см. bindDesktop/bindMobile). dataset.ttBound ставится в bind()
+  // и используется как guard «не перерисовывать при открытом tooltip».
+  _chartTooltip.bind(svg, {
+    hitTest: (svgEl, ev) => {
+      const { x } = svgClientToLocal(svgEl, ev.clientX, ev.clientY);
+      for (const h of _ACTIVITY_HITS) {
+        if (x >= h.x && x <= h.x + h.w) return { data: h };
+      }
+      return null;
+    },
+    onHover: (svgEl, hit) => {
+      svgEl.querySelectorAll("circle.activity-marker").forEach(c => c.remove());
+      const h = hit.data;
+      const maxTotal = Math.max(..._ACTIVITY_HITS.map(x => x.total || 0), 1);
+      const yO = PAD.top + ih - (h.online / maxTotal) * ih;
+      const yT = PAD.top + ih - (h.total / maxTotal) * ih;
+      const cx = h.x + h.w / 2;
+      const ns = "http://www.w3.org/2000/svg";
+      const c1 = document.createElementNS(ns, "circle");
+      c1.setAttribute("class", "activity-marker");
+      c1.setAttribute("cx", cx);
+      c1.setAttribute("cy", yO);
+      c1.setAttribute("r", 5);
+      c1.setAttribute("fill", "var(--green)");
+      c1.setAttribute("stroke", "var(--fg)");
+      c1.setAttribute("stroke-width", "1.5");
+      svgEl.appendChild(c1);
+      const c2 = document.createElementNS(ns, "circle");
+      c2.setAttribute("class", "activity-marker");
+      c2.setAttribute("cx", cx);
+      c2.setAttribute("cy", yT);
+      c2.setAttribute("r", 4);
+      c2.setAttribute("fill", "var(--muted)");
+      c2.setAttribute("stroke", "var(--fg)");
+      c2.setAttribute("stroke-width", "1.2");
+      svgEl.appendChild(c2);
+    },
+    onLeave: (svgEl) => {
+      svgEl.querySelectorAll("circle.activity-marker").forEach(c => c.remove());
+    },
+    render: (hit) => {
+      const h = hit.data;
+      const d1 = new Date(h.ts * 1000);
+      const hm = String(d1.getHours()).padStart(2, "0") + ":00";
+      const dd = d1.toLocaleDateString("ru-RU", { day:"2-digit", month:"2-digit" });
+      const offline = Math.max(0, (h.total || 0) - (h.online || 0));
+      return `<div class="tt-head">${dd} ${hm}</div>
+        <div class="tt-row"><span class="tt-name">⚪ Всего:</span><span class="tt-val">${h.total}</span></div>
+        <div class="tt-row"><span class="tt-name">🟢 Online:</span><span class="tt-val">${h.online}</span></div>
+        <div class="tt-row"><span class="tt-name">🔴 Offline:</span><span class="tt-val">${offline}</span></div>`;
+    },
+  });
+
   if (summaryEl) {
     const last = points[points.length - 1];
     const totalDev = last.total || 0;
@@ -7019,9 +9359,12 @@ function renderActivity(points) {
   }
 }
 
+let _FLAPS_HITS = [];
+
 function renderFlapsChart(points) {
   const svg = document.getElementById("chart-flaps");
   if (!svg) return;
+  if (svg.dataset.ttBound === "1" && _chartTooltip.isOpen()) return;
   if (!points || points.length === 0) {
     svg.innerHTML = '<text x="400" y="70" text-anchor="middle" fill="var(--muted)" font-size="13">Нет переходов за 24ч</text>';
     return;
@@ -7040,8 +9383,24 @@ function renderFlapsChart(points) {
   const tsSpan = tsEnd - tsStart;
 
   const byHour = {};
+  const byHourDevices = {};
   for (const p of points) {
     byHour[p.ts] = (byHour[p.ts] || 0) + (p.flaps || 0);
+    if (Array.isArray(p.devices) && p.devices.length > 0) {
+      if (!byHourDevices[p.ts]) byHourDevices[p.ts] = [];
+      for (const d of p.devices) {
+        byHourDevices[p.ts].push(d);
+      }
+    }
+  }
+  for (const k of Object.keys(byHourDevices)) {
+    const merged = {};
+    for (const d of byHourDevices[k]) {
+      merged[d.name] = (merged[d.name] || 0) + (d.count || 0);
+    }
+    byHourDevices[k] = Object.keys(merged)
+      .map(n => ({ name: n, count: merged[n] }))
+      .sort((a, b) => (-a.count) || a.name.localeCompare(b.name));
   }
   const maxFlaps = Math.max(...Object.values(byHour), 1);
 
@@ -7053,6 +9412,7 @@ function renderFlapsChart(points) {
   let bars = "";
   let totalFlaps = 0;
   const sortedHours = Object.keys(byHour).map(k => parseInt(k, 10)).sort((a, b) => a - b);
+  _FLAPS_HITS = [];
   for (const hTs of sortedHours) {
     const v = byHour[hTs] || byHour[String(hTs)] || 0;
     totalFlaps += v;
@@ -7060,7 +9420,10 @@ function renderFlapsChart(points) {
     const x = PAD.left + ((hTs - tsStart) / tsSpan) * iw;
     const h = (v / maxFlaps) * ih;
     const y = PAD.top + ih - h;
-    bars += `<rect x="${(x + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${(barWidth - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="var(--yellow)" opacity="0.75" rx="1"/>`;
+    const hitIdx = _FLAPS_HITS.length;
+    _FLAPS_HITS.push({ x: x, y: y, w: barWidth, h: h,
+                       ts: hTs, flaps: v, devices: byHourDevices[hTs] || [] });
+    bars += `<rect class="bar-hover hoverable" data-hit="${hitIdx}" x="${(x + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${(barWidth - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="var(--yellow)" opacity="0.75" rx="1"/>`;
   }
 
   let grid = "";
@@ -7084,6 +9447,53 @@ function renderFlapsChart(points) {
     ${bars}
     ${xLabels}
   `;
+
+  // v1.25.14: bind() сам снимает старых слушателей через
+  // AbortController — delete ttBound отменён (накапливал слушателей).
+  _chartTooltip.bind(svg, {
+    hitTest: (svgEl, ev) => {
+      const { x, y } = svgClientToLocal(svgEl, ev.clientX, ev.clientY);
+      for (let i = 0; i < _FLAPS_HITS.length; i++) {
+        const h = _FLAPS_HITS[i];
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+          return { idx: i, data: h };
+        }
+      }
+      return null;
+    },
+    onHover: (svgEl, hit) => {
+      svgEl.querySelectorAll("rect.bar-hover").forEach(el => {
+        if (parseInt(el.dataset.hit) === hit.idx) el.classList.add("hover");
+        else el.classList.remove("hover");
+      });
+    },
+    onLeave: (svgEl) => {
+      svgEl.querySelectorAll("rect.bar-hover").forEach(el => el.classList.remove("hover"));
+    },
+    render: (hit) => {
+      const h = hit.data;
+      const d1 = new Date(h.ts * 1000);
+      const hm = String(d1.getHours()).padStart(2, "0") + ":00";
+      const dd = d1.toLocaleDateString("ru-RU", { day:"2-digit", month:"2-digit" });
+      const head = `${dd} ${hm}`;
+      const parts = [`<div class="tt-head">${head}</div>`];
+      parts.push(`<div class="tt-row"><span class="tt-name">⚡ Мерцания:</span><span class="tt-val">${h.flaps}</span></div>`);
+      const devs = h.devices || [];
+      if (devs.length > 0) {
+        parts.push(`<div style="height:6px;"></div>`);
+        const LIMIT = 5;
+        for (let i = 0; i < Math.min(LIMIT, devs.length); i++) {
+          const d = devs[i];
+          const disp = resolveDeviceDisplayName(d.name);
+          parts.push(`<div class="tt-row"><span class="tt-name">${ttEscape(disp.friendly)}</span><span class="tt-val">${d.count}</span></div>`);
+        }
+        if (devs.length > LIMIT) {
+          parts.push(`<div class="tt-more">+${devs.length - LIMIT} ещё</div>`);
+        }
+      }
+      return parts.join("");
+    },
+  });
 
   const summaryEl = document.getElementById("activity-summary");
   if (summaryEl) {
@@ -7156,10 +9566,26 @@ async function refreshHealthWidget(force) {
   }
 }
 
+// v1.25.0 (task #B): health-карточка — на русском.
+// Прогресс-бар убран. Строка «Снапшоты» показывается только
+// если state_history > 0 (иначе она бессмысленна).
+function _hdCpuBadge(pct) {
+  if (pct === null || pct === undefined) return '<span class="hd-badge muted">—</span>';
+  let cls = "ok";
+  if (pct >= 80) cls = "err";
+  else if (pct >= 50) cls = "warn";
+  return `<span class="hd-badge ${cls}">${pct}%</span>`;
+}
+function _hdRamBadge(mb) {
+  if (mb === null || mb === undefined) return '<span class="hd-badge muted">—</span>';
+  let cls = "ok";
+  if (mb >= 300) cls = "err";
+  else if (mb >= 150) cls = "warn";
+  return `<span class="hd-badge ${cls}">${mb} МБ</span>`;
+}
 function renderHealthDetail(h) {
   const el = document.getElementById("health-detail");
   if (!el) return;
-  // v1.22.1: не сбиваем выделение, если пользователь копирует текст.
   try {
     const sel = window.getSelection();
     if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
@@ -7168,16 +9594,55 @@ function renderHealthDetail(h) {
     }
   } catch (e) { /* ignore */ }
   const w = h.webui || {}; const b = h.bridge || {}; const db = h.db || {};
-  const fmt = (v, suf) => (v === null || v === undefined) ? "\u2014" : (v + (suf || ""));
+  const fmt = (v, suf) => (v === null || v === undefined) ? "—" : (v + (suf || ""));
+  const okB = b.status === "online";
+  const dotB = okB ? "g" : "r";
+  const uptime = fmtUptimeShort(b.uptime);
+  const dbMb = fmt(db.size_mb, " МБ");
+  const online = h.devices?.online || 0;
+  const total = h.devices?.total || 0;
+  const qTotal = h.quiet?.total || 0;
+  const qNow = h.quiet?.now || 0;
+  const snaps = db.state_history;
+  const hasSnaps = (snaps !== null && snaps !== undefined && snaps > 0);
+  const snapTitle = 'Таблица state_history: сюда писались снапшоты DP каждые 60 сек, но UI её никогда не читал (мёртвая фича). Запись отключена в v1.24.2, данные остались с прошлых версий. Можно очистить через «Очистить БД».';
   el.innerHTML = `
-    <div class="hd-row"><span class="hd-key">WebUI:</span>
-      <span>v${fmt(w.version)} \u00b7 CPU ${fmt(w.cpu_pct, "%")} \u00b7 RAM ${fmt(w.rss_mb, " \u041c\u0411")} \u00b7 threads ${fmt(w.threads)}</span></div>
-    <div class="hd-row"><span class="hd-key">Bridge:</span>
-      <span>v${fmt(b.version)} \u00b7 ${fmt(b.status)} \u00b7 uptime ${fmtUptimeShort(b.uptime)}</span></div>
-    <div class="hd-row"><span class="hd-key">Devices:</span>
-      <span>${h.devices?.online || 0}/${h.devices?.total || 0} online \u00b7 quiet: ${h.quiet?.total || 0} (\u0441\u0435\u0439\u0447\u0430\u0441 ${h.quiet?.now || 0})</span></div>
-    <div class="hd-row"><span class="hd-key">SQLite:</span>
-      <span>analytics.db ${fmt(db.size_mb, " \u041c\u0411")} \u00b7 status_events ${fmt(db.status_events)} \u00b7 latency ${fmt(db.latency_history)} \u00b7 state ${fmt(db.state_history)}</span></div>
+    <div class="hd-head">
+      <span class="hd-head-title">⚙ Состояние системы</span>
+      <button class="hd-close" onclick="toggleHealthDetail()">Закрыть ✕</button>
+    </div>
+    <div class="hd-grid">
+      <span class="hd-lbl">WebUI:</span>
+      <span class="hd-val">v${fmt(w.version)} · потоков ${fmt(w.threads)}</span>
+
+      <span class="hd-lbl">CPU / RAM:</span>
+      <span class="hd-val"><span class="hd-badge">CPU</span> ${_hdCpuBadge(w.cpu_pct)} <span class="hd-badge">RAM</span> ${_hdRamBadge(w.rss_mb)}</span>
+
+      <span class="hd-lbl">Bridge:</span>
+      <span class="hd-val">v${fmt(b.version)} · <span class="hd-dot ${dotB}"></span>${okB ? "online" : "offline"} · аптайм ${uptime}</span>
+
+      <span class="hd-lbl">Устройства:</span>
+      <span class="hd-val">${online}/${total} онлайн${
+          qTotal ? ` <span class="hd-badge warn">🔇 тишина: ${qTotal} (сейчас ${qNow})</span>` : ''
+        }</span>
+    </div>
+
+    <div class="hd-section">
+      <div class="hd-section-title">🗄 База данных SQLite</div>
+      <div class="hd-grid">
+        <span class="hd-lbl">Размер:</span>
+        <span class="hd-val">${dbMb}</span>
+        <span class="hd-lbl">Статусы:</span>
+        <span class="hd-val">${fmt(db.status_events)} записей</span>
+        <span class="hd-lbl">Задержки:</span>
+        <span class="hd-val">${fmt(db.latency_history)} замеров</span>${
+          hasSnaps ? `
+        <span class="hd-lbl">Снапшоты:</span>
+        <span class="hd-val">${fmt(snaps)} записей
+          <span class="hd-badge muted" title="${snapTitle}">не читается UI</span></span>` : ''
+        }
+      </div>
+    </div>
   `;
 }
 
@@ -7335,9 +9800,9 @@ fetchStatus();
   }
 })();
 loadLogHistory().then((maxSeq) => {
-  if (maxSeq > lastSeq) lastSeq = maxSeq;
-  // v1.22.1: защита от backlog при пустом буфере
-  if (lastSeq <= 0) lastSeq = 1;
+  // v1.25.12: lastSeq = maxSeq (а не max(lastSeq, maxSeq)) —
+  // для текущего источника это правильнее.
+  _setLastSeq(maxSeq > 0 ? maxSeq : 1);
   setLogRange(LOG_RANGE_SECONDS);
   connectSSE();
 });
@@ -7414,15 +9879,24 @@ def audit_log(op, device=None, changes=None, ok=True, error=None, extra=None):
             try:
                 if (os.path.exists(CONFIG_AUDIT_FILE)
                         and os.path.getsize(CONFIG_AUDIT_FILE) > AUDIT_MAX_BYTES):
-                    for i in range(AUDIT_BACKUPS, 0, -1):
-                        src = f"{CONFIG_AUDIT_FILE}.{i}" if i > 1 else CONFIG_AUDIT_FILE
-                        dst = f"{CONFIG_AUDIT_FILE}.{i}"
-                        if i == AUDIT_BACKUPS and os.path.exists(dst):
-                            os.unlink(dst)
+                    # v1.26.0: классическая схема ротации.
+                    # 1. удаляем самый старый бэкап (audit.log.N);
+                    # 2. сдвигаем audit.log.N-1 → audit.log.N,
+                    #    ..., audit.log.1 → audit.log.2;
+                    # 3. audit.log → audit.log.1.
+                    # ВАЖНО: внутри цикла src всегда = f"{CONFIG_AUDIT_FILE}.{i}",
+                    # НЕ подменяем его на CONFIG_AUDIT_FILE для i == 1 —
+                    # иначе финальный os.replace(base, base.1) упадёт
+                    # на уже перемещённый файл (регресс 1.25.14).
+                    oldest = f"{CONFIG_AUDIT_FILE}.{AUDIT_BACKUPS}"
+                    if os.path.exists(oldest):
+                        os.unlink(oldest)
+                    for i in range(AUDIT_BACKUPS - 1, 0, -1):
+                        src = f"{CONFIG_AUDIT_FILE}.{i}"
+                        dst = f"{CONFIG_AUDIT_FILE}.{i + 1}"
                         if os.path.exists(src):
-                            if os.path.exists(dst):
-                                os.unlink(dst)
                             os.replace(src, dst)
+                    os.replace(CONFIG_AUDIT_FILE, f"{CONFIG_AUDIT_FILE}.1")
             except Exception as e:
                 # v1.22.6: если ротация упала — НЕ пишем в исходный файл,
                 # иначе он растёт без ограничений. Логируем и выходим.
@@ -7714,6 +10188,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 }
                 for name, info in STATE["devices"].items():
                     m = meta_snap.get(name, {})
+                    # v1.25.0 (fix #cloud_dps): дополняем dps_map из Cloud-mapping
+                    # теми DP, что bridge прислал в cache, но их нет в config.
+                    _dps_map_full = _enrich_dps_map_from_cache(
+                        m.get("dps_map", {}),
+                        info.get("cache", {}),
+                        m.get("tuya_id", ""),
+                        m.get("friendly_name", name),
+                    )
                     status["devices"].append({
                         "name": name, "friendly_name": m.get("friendly_name", name),
                         "type": m.get("type", "unknown"), "model": m.get("model", ""),
@@ -7721,7 +10203,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         "battery_powered": m.get("battery_powered", False),
                         "tuya_id": m.get("tuya_id", ""),
                         "local_key_present": bool(m.get("local_key")),
-                        "dps_map": m.get("dps_map", {}),
+                        "dps_map": _dps_map_full,
                         "presets": m.get("presets", []), "preset_map": m.get("preset_map", {}),
                         "min_temp": m.get("min_temp"), "max_temp": m.get("max_temp"), "temp_step": m.get("temp_step"),
                         "status": info.get("status", "unknown"),
@@ -8206,6 +10688,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 with _last_snapshot_lock:
                     for k in [k for k in _last_snapshot if k[0] == dev]:
                         _last_snapshot.pop(k, None)
+                # v1.25.0 (release): обновляем Cloud-индексы после удаления.
+                _load_cloud_mappings()
                 try:
                     audit_log("delete", device=dev, ok=True)
                 except Exception:
@@ -8281,6 +10765,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 d["version_guess"] = "3.3"
                 enriched.append(d)
             save_cloud_cache(enriched, access_id=aid, region=region)
+            # v1.25.0 (fix #cloud_dps): Cloud-кэш обновился —
+            # перечитываем mapping-индексы для обогащения dps_map.
+            _load_cloud_mappings()
             self._send_json(200, {"ok": True, "devices": enriched})
             return
 
@@ -8297,6 +10784,10 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                    timeout=IMPORT_TIMEOUT_WAIT + 5)
             if result.get("ok"):
                 load_device_meta()
+                # v1.25.0 (release): обновляем Cloud-индексы —
+                # иначе обогащение dps_map работает на старых данных
+                # до рестарта или следующего /api/cloud/fetch.
+                _load_cloud_mappings()
                 try:
                     names_imported = [d.get("name") for d in devices if isinstance(d, dict) and d.get("name")]
                     audit_log("import", ok=True, extra={
@@ -8382,6 +10873,7 @@ def main():
     if not HAS_YAML: log.warning("[tuya-local] pyyaml не установлен — YAML-обогащение отключено")
     db_init()
     load_device_meta()
+    _load_cloud_mappings()
     quiet_load()
     _check_tz_for_quiet()
     audit_init()

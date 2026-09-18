@@ -3,7 +3,7 @@
 Локальный мост Tuya-устройств в Home Assistant через MQTT. Работает **без Tuya Cloud** — всё общение с устройствами идёт по локальной сети через `tinytuya`. Автоматически создаёт сущности в HA через MQTT Discovery.
 
 ![version](https://img.shields.io/badge/bridge-1.8.4-blue)
-![webui](https://img.shields.io/badge/webui-1.24.5-blue)
+![webui](https://img.shields.io/badge/webui-1.26.0-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -294,7 +294,7 @@ HA автоматически подхватит Discovery-топики и со�
 | `SCAN_TIMEOUT` | `0.3` | Таймаут TCP-connect на 6668 |
 | `LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 
-### Настройки в `webui.py` (WebUI v1.24.5)
+### Настройки в `webui.py` (WebUI v1.26.0)
 
 | Параметр | Default | Описание |
 |---|---|---|
@@ -312,7 +312,7 @@ HA автоматически подхватит Discovery-топики и со�
 | `LATENCY_RETRY_WORKERS` | `10` | Параллельных retry (ThreadPoolExecutor) |
 | `CLOUD_FETCH_TIMEOUT` | `60` | Таймаут Cloud-запросов (v1.22.6+) |
 | `AUDIT_MAX_BYTES` | `5*1024*1024` | Размер `config_audit.log` (v1.22.0+) |
-| `AUDIT_BACKUPS` | `3` | Бэкапов аудита (v1.22.0+) |
+| `AUDIT_BACKUPS` | `3` | Бэкапов аудита (v1.22.0+); ротация корректна с v1.26.0 |
 | `LOG_FILE_MAX_BYTES_WEBUI` | `5*1024*1024` | Размер `logs/webui.log` (v1.21.3+) |
 | `LOG_FILE_BACKUPS_WEBUI` | `2` | Бэкапов webui-лога (v1.21.3+) |
 | `RETENTION_DAYS` | `3` | Хранение истории в SQLite |
@@ -341,7 +341,7 @@ DEBUG_MQTT_CMD = 0         # логировать входящие команд�
 
 ## Возможности фронта
 
-### Общее (v1.24.5)
+### Общее (v1.26.0)
 
 **UI (ПК):**
 - Кнопка темы (☀️/🌙) прижата вправо в шапке (v1.23.8)
@@ -360,7 +360,7 @@ DEBUG_MQTT_CMD = 0         # логировать входящие команд�
 - `.detail-table` в модалке — одна колонка (label сверху серым, значение под ним) (v1.23.10)
 - Лог-тулбар — grid order через `data-role`, обёртки `display:contents` (v1.23.7)
 
-**Fix (1.23.x/1.24.x):**
+**Fix (1.23.x / 1.24.x / 1.25.x / 1.26.0):**
 - `body.modal-open{overflow:hidden}` + `overscroll-behavior:contain` — скролл модалки не дёргает фон (v1.24.0)
 - Клик по health-баджу всегда заполняет деталку (`refreshHealthWidget(true)`) (v1.23.8)
 - Состояние лог-панели (пауза/диапазон/поиск/скролл) в `sessionStorage` — выживает при переключении вкладок (v1.23.8)
@@ -368,10 +368,33 @@ DEBUG_MQTT_CMD = 0         # логировать входящие команд�
 - `renderTools` при `TOOLS_VIEW === 'audit'` не сбрасывает вид (v1.23.7)
 - `db_insert_snapshot` отключён — `state_history` была мёртвой фичей (v1.24.2)
 - Убран мёртвый `resize`-listener у `applyMobileLogsLayout` (v1.24.2)
+- `_chartTooltip` — `AbortController` (снятие слушателей) **и**
+  `svg.dataset.ttBound = "1"` (guard от перерисовки при открытом tooltip) (v1.26.0)
+- `_problemsSig` — два regex, sig стабилен, «Проблемные» не перерисовываются зря (v1.25.13 / v1.25.14)
+- `closeModal` чистит `DEVICE_*_CACHE` по имени устройства (`CURRENT_MODAL_NAME`), а не по индексу (v1.25.13)
+- `selectAllCloud` учитывает активный фильтр (v1.25.13)
+- `sortFlappers` — `slice(0,50)` **после** сортировки (v1.25.13)
+- `audit_log` — корректная ротация: цикл сдвигает `.N-1 → .N`, финальный `base → .1` **после** цикла (v1.26.0; в 1.25.14 была сломана на `i=1`)
 
-**«Кэш состояния» (v1.23.10):**
+**«Кэш состояния» (v1.23.10 + v1.25.12):**
 - `<details>` с умным порогом: ≤ 8 DP — раскрыт, > 8 — свёрнут
 - Состояние раскрытия в `_CACHE_OPEN_STATE[name]`, выживает между автообновлениями
+- `_ensureCacheOpenState()` — идемпотентная инициализация, ручное раскрытие не сбрасывается при росте DP (v1.25.12)
+- Колонка = английское (code), RU-перевод / оригинал / облачное — в тултипе. Бейдж источника ☁/📖/🈶 (v1.25.12)
+
+**Wide-table в модалках (v1.25.12):**
+- `<colgroup>` + `td.cell` + `.cell-inner` — колонки фиксируются, значения
+  не наезжают. Работает для «Сопоставление DP», «STATUS из облака»,
+  «Превью импорта».
+- `_cellValue()` — пустое значение (`""`, `"—"`, `"null"`, `"{}"`) → просто
+  `<span class="muted">—</span>`, без серой плашки. Убирает «недорисованные
+  полосы» для DP без данных (например `cycle_time`).
+- `_truncCell()` — короткое (≤ 50) `nowrap`, длинное — 2 строки + `…`,
+  полное значение — в `title` (обрезан до 500), `data-copy` — полный.
+
+**Диалоги (v1.25.14):**
+- `.ui-confirm-text { white-space: pre-wrap; }` — `uiConfirm` / `uiAlert`
+  рендерят `\n`, многострочные сообщения не склеиваются в одну строку.
 
 **PWA (v1.24.5):**
 - `/manifest.json` и `/favicon.svg` отдаются из Python-строк
@@ -433,6 +456,7 @@ DEBUG_MQTT_CMD = 0         # логировать входящие команд�
 - **SSE переподключается при смене источника** (v1.21.4+)
 - **`LOG_SOURCE` сохраняется в `localStorage`** (v1.22.0+)
 - **Состояние панели (пауза / диапазон / поиск / скролл) в `sessionStorage`** — выживает при переключении вкладок (v1.23.8)
+- **`lastSeq` per-source в `sessionStorage`** (`tuya_webui_log_seq`) — при переключении Bridge↔WebUI старые логи не теряются (v1.25.12)
 
 > **v1.18.14:** логи перенесены из раздела «Дашборд» в самый низ раздела «Аналитика».
 
@@ -481,6 +505,8 @@ SQLite-хранилище `webui_state/analytics.db`:
   * **Статус probe** в шапке карточки (`.preview-probe-status`), не пропадает после перерисовки (v1.18.14)
   * **Таймаут probe 15 сек** через `AbortController` (v1.18.11)
   * **Параллельный probe** — по 5 одновременно (v1.22.1)
+  * **Предупреждение о пустом `dps_map`** перед импортом — у таких
+    устройств не будет MQTT-сущностей (v1.25.13)
 - Импорт отправляется в backend через MQTT
 
 ### Network scan
@@ -549,6 +575,8 @@ SQLite-хранилище `webui_state/analytics.db`:
 - **`uiAlert(title, message, type)`** — модалка оповещения (info/warning/success/error)
 - **`uiPrompt(title, message, opts)`** — модалка ввода с валидацией (v1.18.9+)
 - Никаких браузерных `confirm()` / `alert()` / `prompt()`
+- **v1.25.14:** `.ui-confirm-text { white-space: pre-wrap; }` —
+  многострочные сообщения рендерят `\n`
 
 ### PWA (v1.24.5)
 
@@ -796,6 +824,39 @@ Tuya-модули имеют конденсатор, который держит
 
 **Важно:** записи в `status_events`, сделанные **до** настройки окна тишины, остаются в БД.
 
+### `audit_log` падает при ротации
+
+**Симптом:** в логах `FileNotFoundError: .../config_audit.log.1`.
+
+**Причина:** регресс 1.25.14 — внутри цикла ротации `src` подменялся
+на `CONFIG_AUDIT_FILE` для `i=1`, и финальный `os.replace(base, base.1)`
+падал на уже перемещённый файл.
+
+**Фикс:** v1.26.0. Проверка:
+
+```bash
+grep -c "# v1.26.0: классическая схема ротации" webui/webui.py
+# Ожидаемо: 1
+```
+
+### Tooltip отвязывается от графика при автообновлении
+
+**Симптом:** навёл на точку в `/analytics` — tooltip открылся. Через 30 сек
+(автообновление) tooltip исчезает или «прыгает».
+
+**Причина:** регресс 1.25.14 — в `bindDesktop` / `bindMobile` не ставился
+`svg.dataset.ttBound = "1"`, из-за чего guard в `renderActivity` /
+`renderFlapsChart` не срабатывал, и SVG перерисовывался.
+
+**Фикс:** v1.26.0. Проверка:
+
+```bash
+grep -c 'svg\.dataset\.ttBound = "1";' webui/webui.py
+# Ожидаемо: 1
+grep -c 'svg\.dataset\.ttMobileBound = "1";' webui/webui.py
+# Ожидаемо: 1
+```
+
 
 ## Известные особенности
 
@@ -834,7 +895,26 @@ HA не любит, когда в `color_mode: color_temp` публикуетс�
 
 ### Файл `config_audit.log`
 
-Монтируется **папкой** (`webui_state/`). Создаётся автоматически. Ротация 5 МБ × 3 бэкапа. При провале ротации запись прерывается (v1.22.6+).
+Монтируется **папкой** (`webui_state/`). Создаётся автоматически. Ротация 5 МБ × 3 бэкапа. При провале ротации запись прерывается (v1.22.6+). Схема ротации корректна с v1.26.0.
+
+### `AbortController` и `dataset.ttBound` — независимые механизмы
+
+В `_chartTooltip.bindDesktop/bindMobile` **оба** механизма работают
+одновременно:
+
+- **`AbortController`** (`svg._ttAbortDesktop` / `svg._ttAbortMobile`) —
+  снимает предыдущих слушателей при повторной привязке. Без него
+  `mousemove` / `mouseleave` накапливаются на SVG с фиксированным id
+  (`chart-activity` / `chart-flaps`) каждые 30 сек автообновления.
+- **`svg.dataset.ttBound = "1"`** — guard: `renderActivity` /
+  `renderFlapsChart` пропускают перерисовку, пока tooltip открыт
+  (`_chartTooltip.isOpen()`).
+
+Нельзя убрать ни один: без `AbortController` — накопление слушателей,
+без `dataset.ttBound` — tooltip отваливается от удалённого SVG.
+
+*(Регресс 1.25.14: убрали `dataset.ttBound` при переходе на
+`AbortController`. Фикс — 1.26.0.)*
 
 ### Два TCP-соединения к Tuya — не работают
 
@@ -902,7 +982,7 @@ Tuya может обновить прошивку и сменить DP-раск�
 ## Версии
 
 - **Bridge**: v1.8.4
-- **WebUI**: v1.24.5
+- **WebUI**: v1.26.0
 
 # Благодарности
 
