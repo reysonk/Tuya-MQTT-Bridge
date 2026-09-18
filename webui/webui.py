@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Tuya Bridge WebUI — отдельный контейнер.
-Версия: 1.20.1
+Версия: 1.24.5
 """
-
 
 import json
 import os
@@ -17,12 +16,11 @@ import threading
 import logging
 import uuid
 import copy
+from collections import deque
 import shutil
 import socket as _socket
 import queue as _queue
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -42,8 +40,6 @@ except ImportError:
 
 
 # ==================== SETTINGS ====================
-load_dotenv()
-
 MQTT_BROKER = os.getenv("MQTT_BROKER")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
@@ -51,13 +47,21 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX", "tuya")
 WEBUI_PORT = int(os.getenv("WEBUI_PORT", 5386))
 WEBUI_HOST = os.getenv("WEBUI_HOST", "0.0.0.0")
-WEBUI_VERSION = os.getenv("WEBUI_VERSION", "1.20.1")
 
+WEBUI_VERSION = "1.24.5"
 CONFIG_FILE = "devices_config.json"
 LOG_FILE = "logs/bridge.log"
+LOG_FILE_WEBUI = "logs/webui.log"
+LOG_FILE_MAX_BYTES_WEBUI = 5 * 1024 * 1024
+LOG_FILE_BACKUPS_WEBUI = 2
 DB_FILE = "webui_state/analytics.db"
 TINYTUYA_DEVICES_FILE = "webui_state/tinytuya_devices.json"
 TUYA_CLOUD_CACHE_FILE = "webui_state/tuya_cloud_cache.json"
+CONFIG_AUDIT_FILE = "webui_state/config_audit.log"
+QUIET_HOURS_FILE = "webui_state/quiet_hours.json"
+QUIET_GRACE_SEC = 120
+AUDIT_MAX_BYTES = 5 * 1024 * 1024  # 5 МБ (v1.22.0)
+AUDIT_BACKUPS = 3
 TUYA_LOCAL_DB_DIR = "webui_state/tuya-local-db"
 TUYA_LOCAL_YAML_DIR = "webui_state/tuya-local-db/custom_components/tuya_local/devices"
 TUYA_LOCAL_DB_OLD_DIR = "/app/tuya-local-db"
@@ -94,7 +98,7 @@ PROBE_TIMEOUT_PER_VERSION = 1.5
 PROBE_VERSIONS = ("3.3", "3.4", "3.5", "3.1")
 
 SSE_MAX_SUBSCRIBERS = 50
-SSE_IDLE_TIMEOUT = 60
+SSE_IDLE_TIMEOUT = 180   # v1.22.1: 60 → 180 (реже reconnect)
 SSE_BACKLOG = 100
 
 SAFE_PORTS = [
@@ -137,6 +141,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("tuya-webui")
 
+# v1.21.3: собственный файловый лог WebUI (logs/webui.log).
+# Ротация как у Bridge: 5 МБ × 2 бэкапа.
+try:
+    import logging.handlers as _lh
+    _webui_log_dir = os.path.dirname(LOG_FILE_WEBUI)
+    if _webui_log_dir:
+        os.makedirs(_webui_log_dir, exist_ok=True)
+    _webui_file_handler = _lh.RotatingFileHandler(
+        LOG_FILE_WEBUI,
+        maxBytes=LOG_FILE_MAX_BYTES_WEBUI,
+        backupCount=LOG_FILE_BACKUPS_WEBUI,
+        encoding="utf-8",
+    )
+    _webui_file_handler.setLevel(logging.DEBUG)
+    _webui_file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.getLogger().addHandler(_webui_file_handler)
+except Exception as _e:
+    log.warning(f"[Log] Не удалось открыть {LOG_FILE_WEBUI}: {_e}")
+
+
 LOG_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})")
 
 
@@ -176,6 +203,175 @@ LATENCY_REFRESH_STATE = {
     "started_at": 0, "finished_at": 0, "ok": None,
 }
 LATENCY_REFRESH_STATE_LOCK = threading.Lock()
+
+
+QUIET_LOCK = threading.Lock()
+QUIET_CONFIG = {}  # {name: {"windows": [{"from": "HH:MM", "to": "HH:MM"}, ...]}}
+
+
+
+
+def _check_tz_for_quiet():
+    """P2 1.22.0: quiet hours привязаны к локальному времени контейнера."""
+    try:
+        import datetime as _dt
+        tzname = _dt.datetime.now().astimezone().tzname() or "?"
+        offset = _dt.datetime.now().astimezone().utcoffset()
+        off_h = int(offset.total_seconds() // 3600) if offset else 0
+        log.info(f"[Quiet] TZ контейнера: {tzname} (UTC{off_h:+d})")
+        if off_h == 0 and tzname.upper() in ("UTC", "GMT"):
+            log.warning("[Quiet] TZ=UTC — проверь docker-compose (TZ=Asia/Novosibirsk)")
+    except Exception as e:
+        log.warning(f"[Quiet] TZ check: {e}")
+
+def _quiet_parse_hm(s):
+    """'HH:MM' → минуты от полуночи, иначе None."""
+    if not isinstance(s, str):
+        return None
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s.strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    return h * 60 + mi
+
+
+def _quiet_window_contains(win, now_minutes):
+    f_ = _quiet_parse_hm(win.get("from"))
+    t_ = _quiet_parse_hm(win.get("to"))
+    if f_ is None or t_ is None or f_ == t_:
+        return False
+    if f_ < t_:
+        return f_ <= now_minutes < t_
+    return now_minutes >= f_ or now_minutes < t_
+
+
+def _quiet_now_minutes():
+    import datetime as _dt
+    now = _dt.datetime.now()
+    return now.hour * 60 + now.minute
+
+
+def is_quiet_now(name):
+    """True, если устройство сейчас в окне тишины."""
+    with QUIET_LOCK:
+        cfg = QUIET_CONFIG.get(name)
+    if not cfg:
+        return False
+    wins = cfg.get("windows") or []
+    if not wins:
+        return False
+    nm = _quiet_now_minutes()
+    return any(_quiet_window_contains(w, nm) for w in wins)
+
+
+def quiet_until_ts(name):
+    """Если сейчас quiet — unix ts окончания текущего окна.
+    Если только что вышли (в пределах QUIET_GRACE_SEC) — ts окончания + grace.
+    Иначе 0.
+    """
+    with QUIET_LOCK:
+        cfg = QUIET_CONFIG.get(name)
+    if not cfg:
+        return 0
+    wins = cfg.get("windows") or []
+    if not wins:
+        return 0
+    nm = _quiet_now_minutes()
+    now = time.time()
+    for w in wins:
+        if _quiet_window_contains(w, nm):
+            t_ = _quiet_parse_hm(w.get("to"))
+            if t_ is None:
+                continue
+            delta_min = (t_ - nm) % (24 * 60)
+            return int(now + delta_min * 60)
+    grace_min = max(1, QUIET_GRACE_SEC // 60)
+    for w in wins:
+        t_ = _quiet_parse_hm(w.get("to"))
+        if t_ is None:
+            continue
+        diff = (nm - t_) % (24 * 60)
+        if 0 <= diff <= grace_min:
+            return int(now - diff * 60 + grace_min * 60)
+    return 0
+
+
+def is_quiet_or_grace_now(name):
+    """v1.22.6: True, если сейчас quiet ИЛИ только что вышли
+    из окна (< QUIET_GRACE_SEC назад). Нужно для db_insert_status,
+    чтобы не писать «фантомные» переходы сразу после окна."""
+    if is_quiet_now(name):
+        return True
+    ts_end = quiet_until_ts(name)
+    if ts_end == 0:
+        return False
+    grace_min = max(1, QUIET_GRACE_SEC // 60)
+    end_window = ts_end - grace_min * 60
+    now = time.time()
+    return 0 <= (now - end_window) < QUIET_GRACE_SEC
+
+
+def quiet_load():
+    """Загрузить webui_state/quiet_hours.json. Создать пустой, если нет."""
+    global QUIET_CONFIG
+    try:
+        os.makedirs(os.path.dirname(QUIET_HOURS_FILE) or ".", exist_ok=True)
+        if not os.path.exists(QUIET_HOURS_FILE):
+            with open(QUIET_HOURS_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f, ensure_ascii=False, indent=2)
+            log.info(f"[Quiet] Создан пустой {QUIET_HOURS_FILE}")
+            with QUIET_LOCK:
+                QUIET_CONFIG = {}
+            return
+        with open(QUIET_HOURS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            log.warning("[Quiet] Файл не dict — игнорируем")
+            data = {}
+        clean = {}
+        for name, cfg in data.items():
+            if not isinstance(cfg, dict):
+                continue
+            wins = cfg.get("windows")
+            if not isinstance(wins, list):
+                continue
+            parsed = []
+            for w in wins:
+                if not isinstance(w, dict):
+                    continue
+                f_, t_ = w.get("from"), w.get("to")
+                if _quiet_parse_hm(f_) is None or _quiet_parse_hm(t_) is None:
+                    continue
+                if f_ == t_:
+                    continue
+                parsed.append({"from": f_, "to": t_})
+            if parsed:
+                clean[name] = {"windows": parsed}
+        with QUIET_LOCK:
+            QUIET_CONFIG = clean
+        log.info(f"[Quiet] Загружено {len(clean)} устройств из {QUIET_HOURS_FILE}")
+    except Exception as e:
+        log.warning(f"[Quiet] load: {e}")
+        with QUIET_LOCK:
+            QUIET_CONFIG = {}
+
+
+def quiet_save(new_config):
+    global QUIET_CONFIG
+    try:
+        os.makedirs(os.path.dirname(QUIET_HOURS_FILE) or ".", exist_ok=True)
+        tmp = QUIET_HOURS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(new_config, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, QUIET_HOURS_FILE)
+        with QUIET_LOCK:
+            QUIET_CONFIG = dict(new_config)
+        log.info(f"[Quiet] Сохранено {len(new_config)} устройств")
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 def load_device_meta():
@@ -489,6 +685,24 @@ def db_query_flaps_hourly(period_hours=24):
         except: return []
 
 
+def _db_query_flaps_hourly_excluding(period_hours, exclude_devs):
+    """v1.22.3: переходы по часам, исключая указанные устройства (quiet-hours)."""
+    if not ANALYTICS_ENABLED or not exclude_devs:
+        return db_query_flaps_hourly(period_hours)
+    cutoff = int(time.time()) - period_hours * 3600
+    placeholders = ",".join("?" * len(exclude_devs))
+    with _db_lock:
+        try:
+            cur = _db_conn.execute(
+                f"SELECT (ts/3600)*3600 AS hour_ts, COUNT(*) "
+                f"FROM status_events WHERE ts>=? AND dev NOT IN ({placeholders}) "
+                f"GROUP BY hour_ts ORDER BY hour_ts",
+                (cutoff, *exclude_devs)
+            )
+            return [{"ts": r[0], "flaps": r[1]} for r in cur.fetchall()]
+        except: return []
+
+
 def db_query_dev_history(dev, period_hours=24, limit=100):
     if not STATUS_HISTORY_ENABLED: return []
     cutoff = int(time.time()) - period_hours * 3600
@@ -641,6 +855,8 @@ def measure_latency(ip):
 def _do_latency_round():
     with STATE_LOCK:
         devices = list(STATE["devices"].keys())
+    # v1.21.0: quiet hours
+    devices = [d for d in devices if not is_quiet_now(d)]
     meta_snap = snapshot_device_meta()
     if not devices:
         return
@@ -724,6 +940,10 @@ def _do_latency_round():
         LATENCY_REFRESH_STATE["current"] = len(devices)
 
 
+
+_LATENCY_REFRESH_LOCK = threading.Lock()
+_LATENCY_REFRESH_RUNNING = [False]
+
 def latency_worker():
     if _PING_MODE[0] is None:
         _detect_ping_mode()
@@ -735,16 +955,26 @@ def latency_worker():
              f"retry: {LATENCY_RETRY_COUNT}×{LATENCY_RETRY_DELAY}с)")
     if STOP_EVENT.wait(LATENCY_INITIAL_DELAY): return
     while not STOP_EVENT.is_set():
+        # v1.22.6: worker сам ставит _LATENCY_REFRESH_RUNNING
+        # на время раунда — иначе ручной refresh во время планового
+        # запускал ВТОРОЙ раунд параллельно (гонка в STATE и
+        # двойные записи в latency_history).
+        with _LATENCY_REFRESH_LOCK:
+            if _LATENCY_REFRESH_RUNNING[0]:
+                if STOP_EVENT.wait(LATENCY_INTERVAL): break
+                continue
+            _LATENCY_REFRESH_RUNNING[0] = True
         try:
             _do_latency_round()
         except Exception as e:
             log.warning(f"[Latency] error: {e}")
+        finally:
+            with _LATENCY_REFRESH_LOCK:
+                _LATENCY_REFRESH_RUNNING[0] = False
         if STOP_EVENT.wait(LATENCY_INTERVAL): break
     log.info("[Latency] Воркер остановлен")
 
 
-_LATENCY_REFRESH_LOCK = threading.Lock()
-_LATENCY_REFRESH_RUNNING = [False]
 
 
 def trigger_latency_refresh():
@@ -1060,28 +1290,33 @@ LOG_BUFFER_MAX = 5000
 
 def _read_initial_log():
     global _log_seq
-    if not os.path.exists(LOG_FILE): return
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        for line in lines[-LOG_HISTORY_LINES:]:
-            _append_log_line(line.rstrip("\n"))
-    except Exception as e:
-        log.warning(f"[Log] init: {e}")
+    for path, src in ((LOG_FILE, "bridge"), (LOG_FILE_WEBUI, "webui")):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            for line in lines[-LOG_HISTORY_LINES:]:
+                _append_log_line(line.rstrip("\n"), source=src)
+        except Exception as e:
+            log.warning(f"[Log] init {path}: {e}")
 
 
-def _append_log_line(line):
+def _append_log_line(line, source="bridge"):
     global _log_seq
     if not line: return
     with _log_seq_lock:
         _log_seq += 1; seq = _log_seq
     level = "INFO"
+    # v1.22.1: уровень ищем только в шапке (первые 40 символов),
+    # чтобы "[INFO]" в тексте сообщения не путал парсер.
+    _head = line[:40]
     for lvl in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
-        if f"[{lvl}]" in line:
+        if f"[{lvl}]" in _head:
             level = lvl; break
     line_ts = parse_log_line_timestamp(line)
     item = {"seq": seq, "ts": line_ts if line_ts else int(time.time()),
-            "level": level, "msg": line}
+            "level": level, "msg": line, "source": source}
     with _log_buffer_lock:
         _log_buffer.append(item)
         if len(_log_buffer) > LOG_BUFFER_MAX:
@@ -1097,21 +1332,32 @@ def _append_log_line(line):
             _sse_subscribers[:] = [(q, la) for (q, la) in _sse_subscribers if q not in dead]
 
 
-def _log_tailer():
+def _log_tailer(file_path=None, source="bridge"):
+    # v1.21.3: читает один файл (bridge.log или webui.log),
+    # помечает все строки source="bridge"|"webui". Запускается
+    # двумя threads в main().
+    if file_path is None:
+        file_path = LOG_FILE
     f = None; current_inode = None
     try:
         while not STOP_EVENT.is_set():
             try:
                 if f is None:
-                    if not os.path.exists(LOG_FILE):
+                    if not os.path.exists(file_path):
                         if STOP_EVENT.wait(LOG_POLL_INTERVAL): break
                         continue
-                    f = open(LOG_FILE, "r", encoding="utf-8", errors="replace")
+                    f = open(file_path, "r", encoding="utf-8", errors="replace")
                     try: current_inode = os.fstat(f.fileno()).st_ino
                     except OSError: current_inode = None
                     f.seek(0, 2)
+                    # v1.22.6: tailer start — видно, с какого inode/offset начали.
+                    try:
+                        log.info(f"[Log] tailer start {file_path} (src={source}, "
+                                 f"inode={current_inode}, offset={f.tell()})")
+                    except Exception:
+                        pass
                 try:
-                    st = os.stat(LOG_FILE)
+                    st = os.stat(file_path)
                     if current_inode is not None and st.st_ino != current_inode:
                         f.close(); f = None; current_inode = None; continue
                     if st.st_size < f.tell():
@@ -1119,11 +1365,11 @@ def _log_tailer():
                 except OSError:
                     f.close(); f = None; current_inode = None; continue
                 line = f.readline()
-                if line: _append_log_line(line.rstrip("\n"))
+                if line: _append_log_line(line.rstrip("\n"), source=source)
                 else:
                     if STOP_EVENT.wait(LOG_POLL_INTERVAL): break
             except Exception as e:
-                log.warning(f"[Log] tailer: {e}")
+                log.warning(f"[Log] tailer {file_path}: {e}")
                 if f:
                     try: f.close()
                     except: pass
@@ -1250,10 +1496,15 @@ def _on_message(client, userdata, msg):
                 old = STATE["devices"][dev].get("status")
                 STATE["devices"][dev]["status"] = payload
                 if old != payload:
-                    # v1.18.9: в первые BRIDGE_STARTUP_GRACE_SEC после старта bridge —
-                    # не пишем в status_events (чтобы старт bridge не выглядел мерцанием)
+                    # v1.18.9: grace после старта bridge
                     started = STATE.get("bridge_started_at", 0)
-                    if started == 0 or (time.time() - started) >= BRIDGE_STARTUP_GRACE_SEC:
+                    grace_ok = (started == 0 or (time.time() - started) >= BRIDGE_STARTUP_GRACE_SEC)
+                    # v1.21.0: quiet hours
+                    # v1.22.6: учитываем grace-period (первые 2 мин
+                    # после окна тоже не пишем — иначе «фантомные»
+                    # переходы в мерцаниях сразу после окна тишины).
+                    quiet_ok = not is_quiet_or_grace_now(dev)
+                    if grace_ok and quiet_ok:
                         db_insert_status(int(time.time()), dev, payload)
             elif key == "last_seen":
                 try: STATE["devices"][dev]["last_seen"] = int(payload)
@@ -1263,7 +1514,10 @@ def _on_message(client, userdata, msg):
                     cd = json.loads(payload)
                     if isinstance(cd, dict):
                         STATE["devices"][dev]["cache"] = cd
-                        db_insert_snapshot(dev, cd)
+                        # v1.24.2: db_insert_snapshot отключён — state_history
+                        # была мёртвой фичей (данные копились, но UI их
+                        # не показывал). Функция оставлена в коде на будущее.
+                        # db_insert_snapshot(dev, cd)
                 except: pass
 
 
@@ -1376,6 +1630,32 @@ def _fetch_mappings_for_devices(cloud, device_ids, retries=1):
         except Exception as e:
             log.warning(f"[Cloud] mapping-запрос attempt {attempt+1}: {e}")
     return result
+
+
+CLOUD_FETCH_TIMEOUT = 60   # v1.22.6: глобальный таймаут Cloud-запросов
+
+
+def _cloud_fetch_with_timeout(access_id, access_secret, region,
+                              fetch_mappings=True, timeout=CLOUD_FETCH_TIMEOUT):
+    """v1.22.6: обёртка tuya_cloud_fetch в отдельный поток с join(timeout).
+    Защищает воркер ThreadingHTTPServer от вечного зависания, если
+    Tuya Cloud недоступен или tinytuya.requests висит без таймаута."""
+    result_box = {"result": None}
+
+    def _runner():
+        try:
+            result_box["result"] = tuya_cloud_fetch(access_id, access_secret, region,
+                                                     fetch_mappings=fetch_mappings)
+        except Exception as e:
+            result_box["result"] = {"ok": False, "error": f"cloud fetch exception: {e}"}
+
+    t = threading.Thread(target=_runner, daemon=True, name="cloud-fetch")
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        log.warning(f"[Cloud] fetch timeout {timeout}s — возвращаем ошибку")
+        return {"ok": False, "error": f"timeout {timeout}s (Tuya Cloud недоступен)"}
+    return result_box["result"] or {"ok": False, "error": "empty result"}
 
 
 def tuya_cloud_fetch(access_id, access_secret, region, fetch_mappings=True):
@@ -1979,8 +2259,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tuya Bridge</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8C%89%3C/text%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Tuya Bridge">
+<link rel="apple-touch-icon" href="/favicon.svg">
+<meta name="mobile-web-app-capable" content="yes">
 <script>
   // v1.20.1: применяем тему ДО рендера, чтобы не мигало белым
   // при переключении вкладок.
@@ -2007,9 +2295,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   * { box-sizing: border-box; }
   body { margin:0; padding:16px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; background:var(--bg); color:var(--fg); font-size:14px; }
   code, pre { font-family:"JetBrains Mono",ui-monospace,monospace; }
-  header { display:flex; align-items:center; gap:16px; margin-bottom:16px; flex-wrap:wrap; }
+  /* v1.23.8: шапка — 3 строки (ПК).
+     row1: h1 + theme (прижат вправо)
+     row2: nav (вкладки) — под заголовком, слева
+     row3: health-widget + toolbar (вправо) */
+  header { display:flex; flex-direction:column; gap:8px; margin-bottom:16px; }
+  .header-row1 { display:flex; align-items:center; gap:16px; }
+  .header-row1 h1 { margin:0; font-size:20px; }
+  .header-row1 #theme-btn { margin-left:auto; }
   header h1 { margin:0; font-size:20px; }
   nav { display:flex; gap:4px; }
+  nav#main-nav { flex-wrap:wrap; }
+  .header-row3 { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .header-row3 .toolbar {
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+    margin-left:auto;
+  }
   nav a { color:var(--fg); text-decoration:none; padding:6px 14px; border-radius:6px; font-size:13px; border:1px solid var(--border); }
   nav a.active { background:var(--accent); color:white; border-color:var(--accent); }
   .badge { padding:2px 8px; border-radius:12px; font-size:12px; background:var(--border); color:var(--muted); }
@@ -2017,7 +2318,53 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .badge.offline { background:var(--red); color:white; }
   .badge.battery { background:rgba(176,136,0,0.2); color:var(--yellow); }
   .badge.junk { background:rgba(215,58,73,0.15); color:var(--red); font-size:10px; }
+  .badge.quiet { background:rgba(163,113,247,0.18); color:#a371f7; border:1px solid rgba(163,113,247,0.25); }
+  .health-widget { display:inline-flex; align-items:center; gap:6px; padding:2px 10px;
+    border-radius:12px; font-size:12px; background:rgba(56,120,200,0.12); color:var(--fg);
+    border:1px solid rgba(56,120,200,0.2); cursor:pointer; user-select:none; }
+  .health-widget:hover { border-color:var(--accent); }
+  .health-widget .hw-sep { color:var(--muted); opacity:0.5; }
+  .health-widget .hw-dim { color:var(--muted); }
+  .health-widget .hw-quiet { color:#a371f7; }
+  .health-widget .hw-err { color:var(--red); font-weight:600; }
+  /* v1.23.7: фикс ширины, чтобы health-widget не дёргался при обновлении. */
+  .health-widget #hw-rest { min-width: 180px; display:inline-block; }
+  /* v1.23.9: на ПК health-бадж длинный, как было до 1.23.8.
+     Короткий вид (.hw-opt { display:none }) — только на мобиле,
+     см. @media (max-width:700px). */
+  .health-widget.hw-expanded { flex-wrap: wrap; }
+  .health-widget.hw-expanded #hw-rest { min-width: 0; }
+  .health-detail { padding:12px 16px; background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; font-size:12px;
+    font-family:ui-monospace,monospace; line-height:1.6;
+    /* v1.23.1: внутри header — на ПК переносим на новую строку. */
+    flex-basis: 100%; width: 100%; order: 999; margin-top: 0; }
+  .health-detail .hd-row { display:flex; gap:16px; }
+  .health-detail .hd-key { color:var(--muted); min-width:90px; }
+  .modal-header .refresh-btn { background:none; border:1px solid var(--border);
+    padding:2px 10px; font-size:14px; line-height:1.4; cursor:pointer; border-radius:6px;
+    color:var(--fg); margin-right:6px; }
+  .modal-header .refresh-btn:hover { border-color:var(--accent); }
+  .modal-header .refresh-btn.spinning { animation: spin 0.8s linear infinite; }
+  .audit-table { width:100%; border-collapse:collapse; font-size:12px; }
+  .audit-table th { padding:6px 10px; text-align:left; color:var(--muted);
+    font-size:11px; text-transform:uppercase; letter-spacing:0.5px;
+    border-bottom:1px solid var(--border); }
+  .audit-table td { padding:6px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .audit-table tr.fail td { background:rgba(215,58,73,0.06); }
+  .audit-table tr:hover td { background:var(--bg); cursor:pointer; }
+  .audit-op { display:inline-block; padding:1px 6px; border-radius:4px; font-size:10px;
+    font-weight:600; text-transform:uppercase; }
+  .audit-op.edit { background:rgba(56,139,253,0.18); color:#388bfd; }
+  .audit-op.delete { background:rgba(215,58,73,0.18); color:var(--red); }
+  .audit-op.import { background:rgba(46,160,67,0.18); color:var(--green); }
+  .audit-detail { background:var(--bg); padding:10px; border-radius:4px;
+    font-family:ui-monospace,monospace; font-size:11px; white-space:pre-wrap;
+    word-break:break-all; margin-top:6px; }
+  .audit-empty { padding:24px; text-align:center; color:var(--muted); }
   .muted { color:var(--muted); }
+  /* v1.23.4: универсальный класс скрытия (без !important-конфликтов) */
+  .hidden { display: none !important; }
   button { padding:6px 14px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; font-size:13px; }
   button:hover { border-color:var(--accent); }
   button:disabled { opacity:0.5; cursor:not-allowed; }
@@ -2052,14 +2399,63 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .problems { background:var(--card); border:1px solid var(--yellow); border-radius:8px; margin-bottom:16px; overflow:hidden; }
   .problems-header { padding:10px 16px; background:rgba(176,136,0,0.12); font-size:13px; color:var(--yellow); font-weight:600; border-bottom:1px solid var(--border); }
   .problem-item { padding:8px 16px; border-bottom:1px solid var(--border); font-size:13px; display:flex; justify-content:space-between; gap:16px; cursor:pointer; }
-  .logs-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px 16px; border-bottom:1px solid var(--border); background:var(--card); }
+  .logs-toolbar {
+    display:flex; flex-direction:column; gap:6px;
+    padding:8px 16px; border-bottom:1px solid var(--border);
+    background:var(--card);
+  }
   .logs-toolbar button { padding:4px 10px; font-size:12px; }
   .logs-toolbar input { width:auto; padding:4px 10px; font-size:12px; }
   .time-btn-group { display:flex; gap:0; }
   .time-btn-group button { border-radius:0; border-right-width:0; padding:4px 10px; font-size:11px; }
   .time-btn-group button:first-child { border-radius:6px 0 0 6px; }
   .time-btn-group button:last-child { border-radius:0 6px 6px 0; border-right-width:1px; }
-  .logs-toolbar .time-btn-group { margin-left:auto; }
+
+  /* v1.23.7: две строки тулбара логов.
+     row1 — слева всё подряд; row2 — слева Пауза+Поиск, справа диапазоны. */
+  .logs-toolbar-row1 {
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    justify-content:flex-start;
+  }
+  .logs-toolbar-row2 {
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    justify-content:space-between;
+  }
+  .logs-toolbar-row2-left {
+    display:flex; align-items:center; gap:8px; flex:0 1 auto;
+  }
+  .logs-toolbar-row2-right {
+    display:flex; align-items:center; gap:8px; flex:0 0 auto;
+    margin-left:auto;
+  }
+  /* v1.23.9: «⬇ Скачать» — к правому краю первой строки. */
+  .logs-toolbar-row1 .logs-download { margin-left: auto; }
+  /* v1.23.7: input + × + ▲ + ▼ в одной строке. Поиск чуть шире. */
+  .logs-tb-search {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 1 auto;
+  }
+  .logs-tb-search #log-search {
+    min-width: 220px;
+    max-width: 280px;
+  }
+  .logs-tb-search #find-next-btn,
+  .logs-tb-search #find-prev-btn,
+  .logs-tb-search #find-clear-btn {
+    min-width: 30px;
+    padding: 4px 8px;
+  }
+  .logs-tb-search #find-clear-btn {
+    color: var(--muted);
+    font-size: 16px;
+    line-height: 1;
+  }
+  .logs-tb-search #find-clear-btn:hover {
+    color: var(--red);
+    border-color: var(--red);
+  }
   .logs-paused-banner { background:var(--yellow); color:white; padding:6px 12px; font-size:12px; text-align:center; font-weight:600; }
   .logs { background:#0a0e14; color:#d1d5da; font-family:"JetBrains Mono",ui-monospace,monospace; font-size:12px; line-height:1.5; max-height:420px; min-height:420px; overflow-y:auto; padding:12px; position:relative; }
   .logs .line { white-space:pre-wrap; word-break:break-all; }
@@ -2071,7 +2467,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .scroll-down-btn.visible { display:block; }
   .section-title { margin:0; padding:12px 16px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
   .section-title .hint { font-size:11px; text-transform:none; letter-spacing:0; color:var(--muted); font-weight:400; }
-  .toolbar { display:flex; gap:8px; align-items:center; margin-left:auto; flex-wrap:wrap; }
+  .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  /* v1.23.8: отступ вправо задаётся .header-row3 .toolbar { margin-left:auto }. */
   .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .table-toolbar { display:flex; gap:8px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--bg); flex-wrap:wrap; }
@@ -2102,24 +2499,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .type-badge.binary_sensor { background:rgba(163,113,247,0.18); color:#a371f7; }
   .state-on { color:var(--green); font-weight:600; }
   .state-off { color:var(--muted); }
-  .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.55); z-index:1000; align-items:center; justify-content:center; padding:20px; }
+  .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.55); z-index:1000; align-items:center; justify-content:center; padding:20px; overscroll-behavior: contain; }
+  /* v1.24.0: заморозка фона при открытой модалке —
+     скролл внутри модалки больше не дёргает страницу за ней. */
+  body.modal-open { overflow: hidden; }
   .modal-overlay.open { display:flex; }
   .modal-overlay.top { z-index:1100; }
-  .modal { background:var(--card); border:1px solid var(--border); border-radius:8px; max-width:750px; width:100%; max-height:85vh; display:flex; flex-direction:column; overflow:hidden; }
+  .modal { background:var(--card); border:1px solid var(--border); border-radius:8px; max-width:750px; width:100%; max-height:92vh; display:flex; flex-direction:column; overflow:hidden; }
   .modal.wide { max-width:1100px; }
   .modal.small { max-width:440px; }
   .modal-header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); }
   .modal-header h2 { margin:0; font-size:16px; }
   .modal-close { background:none; border:none; color:var(--fg); font-size:24px; cursor:pointer; padding:0 8px; line-height:1; }
-  .modal-body { padding:16px; overflow-y:auto; }
+  .modal-body { padding:12px 14px; overflow-y:auto; overscroll-behavior: contain; }
   /* v1.18.11: запрещаем браузеру "прыгать" к фокусному чекбоксу
      внутри overflow:auto контейнера (Firefox/Chrome focus-scroll). */
   .modal-body input[type="checkbox"],
   .modal-body input[type="radio"] { scroll-margin: 9999px; }
-  .modal-body h3 { margin:16px 0 8px 0; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
+  .modal-body h3 { margin:12px 0 6px 0; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
   .modal-body h3:first-child { margin-top:0; }
   .detail-table { width:100%; border-collapse:collapse; font-size:13px; }
-  .detail-table td { padding:5px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .detail-table td { padding:4px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
   .detail-table td:first-child { color:var(--muted); width:35%; white-space:nowrap; }
   .history-scroll { max-height:300px; overflow-y:auto; }
   .history-item { padding:4px 8px; font-family:ui-monospace,monospace; font-size:12px; border-bottom:1px solid var(--border); }
@@ -2133,20 +2533,119 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .copy-hint:hover { opacity:1; background:var(--border); }
   .copy-hint.copied { color:var(--green); opacity:1; }
   .secret-masked { letter-spacing:2px; color:var(--muted); }
+  /* v1.24.4: «Local key» получает верхний разделитель
+     (после блока quiet с кнопками). */
+  #modal-key-zone h3:first-child {
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+  }
+  /* Если quiet-зона пустая — key-зона не должна получать border-top. */
+  #modal-quiet-zone:empty + #modal-key-zone h3:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+  }
+  /* v1.24.0: заголовок quiet — без капса, без «(для аналитики)».
+     🔇 в тишине, 🔈 не в тишине. quiet-off — приглушён целиком. */
+  .quiet-title {
+    text-transform: none !important;
+    letter-spacing: 0 !important;
+    font-size: 14px !important;
+    font-weight: 600;
+    color: var(--fg);
+    /* v1.24.4: верхний разделитель + больше воздуха. */
+    margin: 0 0 8px 0;
+    padding: 14px 0 0 0;
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  /* Первая секция в модалке — без разделителя и без верхнего паддинга. */
+  #modal-quiet-zone:first-child .quiet-title {
+    border-top: none;
+    padding-top: 0;
+  }
+  .quiet-title .quiet-emoji { font-size: 15px; line-height: 1; }
+  .quiet-title .quiet-status-inline {
+    font-size: 11px;
+    font-weight: 400;
+    color: #a371f7;
+    margin-left: 2px;
+  }
+  .quiet-title.quiet-off {
+    opacity: 0.6;
+  }
+  .quiet-title.quiet-off .quiet-emoji {
+    filter: grayscale(0.4);
+  }
+  .quiet-help {
+    font-size: 12px;
+    margin: 8px 0 12px 0;
+    line-height: 1.4;
+  }
+  /* v1.24.4: блок кнопок quiet — верхний отступ. */
+  .quiet-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  /* v1.23.10: секция «Кэш состояния» в модалке — сворачиваемая. */
+  .cache-details > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 4px 0;
+    user-select: none;
+    display: flex;
+    align-items: center;
+  }
+  .cache-details > summary::-webkit-details-marker { display: none; }
+  .cache-details > summary::before {
+    content: "▶";
+    color: var(--muted);
+    font-size: 10px;
+    margin-right: 6px;
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  .cache-details[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  .cache-details > summary:hover h3 { color: var(--accent); }
   .sparkline { background:var(--bg); border-radius:4px; padding:8px; margin-bottom:8px; }
   .sparkline svg { display:block; width:100%; height:40px; }
   .sparkline-labels { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); margin-top:2px; }
-  .analytics-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; align-items:start; }
-  @media (max-width:1000px) { .analytics-grid { grid-template-columns:1fr; } }
-  .analytics-card { margin-bottom:0; display:flex; flex-direction:column; max-height:520px; overflow:hidden; }
+  .analytics-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;
+    align-items:stretch; grid-auto-rows:minmax(280px, 520px); }
+  @media (max-width:700px) { .analytics-grid { grid-template-columns:1fr; grid-auto-rows: auto; } }
+  .analytics-card { margin-bottom:0; display:flex; flex-direction:column;
+    min-height:200px; max-height:560px; overflow:hidden; }
   .analytics-card > .analytics-card-header { flex-shrink:0; }
   .analytics-card-header { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 16px; border-bottom:1px solid var(--border); flex-wrap:wrap; }
   .analytics-card-header h2 { margin:0; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
   .analytics-card-header .analytics-toolbar { display:flex; gap:8px; align-items:center; margin-left:auto; flex-wrap:wrap; }
-  .analytics-table-scroll { flex:1 1 auto; min-height:0; max-height:420px; overflow-y:auto; }
-  .timeline-scroll { flex:1 1 auto; min-height:0; max-height:420px; overflow-y:auto; }
+  .analytics-table-scroll { flex:1 1 auto; min-height:120px; overflow-y:auto; }
+  /* v1.22.9: height:100% только для таблиц-заглушек (через :has()).
+     Иначе flappers/хронология с 1-2 строками раздуваются пустотой. */
+  .analytics-table-scroll table:has(td[colspan]) { height:100%; }
+  .analytics-table-scroll td[colspan] {
+    text-align:center; vertical-align:middle; height:100%;
+  }
+  .timeline-scroll > .muted:only-child {
+    display:flex; align-items:center; justify-content:center;
+    height:100%; margin:0;
+  }
+  .timeline-scroll { flex:1 1 auto; min-height:120px; overflow-y:auto; }
   .timeline-item { padding:6px 16px; border-bottom:1px solid var(--border); font-size:12px; display:flex; gap:12px; }
   .timeline-item .timeline-ts { color:var(--muted); flex:0 0 155px; white-space:nowrap; }
+
+  /* v1.23.7: .compact — только в мобильной вёрстке (см. @media ниже).
+     На ПК карточки «Хронология» и «Мерцающие» — широкие и растянуты
+     по высоте ряда. */
   .scan-host { padding:10px 12px; border:1px solid var(--border); border-radius:6px; margin-bottom:6px; }
   .scan-host:hover { border-color:var(--accent); }
   .scan-host.bridge-new { border-left:3px solid var(--accent); }
@@ -2166,6 +2665,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
   details summary::-webkit-details-marker { color:var(--muted); }
   .theme-btn { background:none; border:1px solid var(--border); padding:4px 10px; font-size:16px; line-height:1; cursor:pointer; border-radius:6px; }
   .theme-btn:hover { border-color:var(--accent); }
+  /* v1.24.2: убран общий .log-level-note — стили задаются
+     специфичным #log-level-note-webui в мобильном медиа.
+     Плашка «Все» показывается только на вкладке WebUI-логов. */
+
+  /* v1.24.2: #log-level-note-webui вне мобильного медиа —
+     плашка активного уровня для WebUI-логов на ПК. */
+  #log-level-note-webui {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    font-size: 12px;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-weight: 500;
+    margin-left: 8px;
+    width: auto;
+  }
+  #log-level-note-webui.hidden { display: none !important; }
+
+  /* v1.23.3: burger-кнопка для мобильной навигации */
+  #nav-toggle { display: none; background:none; border:1px solid var(--border);
+    padding:4px 10px; font-size:16px; line-height:1; cursor:pointer; border-radius:6px;
+    color:var(--fg); }
+  #nav-toggle:hover { border-color:var(--accent); }
   .tools-toolbar { display:flex; gap:8px; padding:12px 16px; border-bottom:1px solid var(--border); background:var(--bg); align-items:center; flex-wrap:wrap; }
   .tools-split { display:grid; grid-template-columns:280px 1fr; min-height:500px; }
   .tools-list { border-right:1px solid var(--border); max-height:70vh; overflow-y:auto; }
@@ -2190,6 +2715,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
   html[data-theme="light"] .hljs-punctuation { color:#57606a; }
   .base-info { padding:12px 16px; display:flex; gap:20px; align-items:center; flex-wrap:wrap; font-size:13px; }
   .base-info-item { display:flex; align-items:center; gap:6px; }
+
+  /* v1.23.7: кнопки «Локальные базы DP» — единый стиль. */
+  .base-info button,
+  .base-info-actions button {
+    padding:6px 14px;
+    font-size:13px;
+    border-radius:6px;
+    border:1px solid var(--border);
+    background:var(--card);
+    color:var(--fg);
+    cursor:pointer;
+  }
+  .base-info button:hover,
+  .base-info-actions button:hover { border-color:var(--accent); }
+  .base-info button.primary,
+  .base-info-actions button.primary {
+    background:var(--accent); color:#fff; border-color:var(--accent);
+  }
+  .base-info-actions {
+    display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    margin-left:auto;
+  }
   .junk-row { background:rgba(215,58,73,0.05); }
   .junk-row td { opacity:0.7; }
   .preview-dp-table { font-size:12px; }
@@ -2199,7 +2746,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .preview-device-header { padding:8px 12px; background:var(--bg); display:flex; justify-content:space-between; align-items:center; font-weight:600; }
   .preview-device-body { padding:8px 12px; }
   .mobile-nav { display:none; padding:8px 12px; background:var(--bg); border-bottom:1px solid var(--border); align-items:center; justify-content:space-between; }
-  @media (max-width:1000px) { .mobile-nav { display:flex; } }
+  @media (max-width:700px) { .mobile-nav { display:flex; } }
   .cloud-warn { background:rgba(176,136,0,0.12); border:1px solid var(--yellow); color:var(--yellow); padding:8px 12px; border-radius:6px; margin-bottom:12px; font-size:12px; }
   .rebuild-bar { width:100%; height:6px; background:var(--border); border-radius:3px; overflow:hidden; margin-top:6px; }
   .rebuild-bar-fill { height:100%; background:var(--accent); transition: width 0.3s; }
@@ -2221,6 +2768,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding:10px 0; border-bottom:1px solid var(--border);
   }
   .edit-row:last-of-type { border-bottom:none; }
+  .quiet-row { display:flex; gap:8px; align-items:center; padding:6px 0; }
+  .quiet-row input[type="time"] { width:auto; padding:4px 8px; font-size:12px; }
   .edit-check { padding-top:22px; cursor:pointer; }
   .edit-check input[type="checkbox"] {
     width:18px; height:18px; cursor:pointer; accent-color:var(--accent);
@@ -2248,31 +2797,391 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .legend-line.total { border-top-style:dashed; border-color:var(--muted); }
   .legend-bar { display:inline-block; width:12px; height:10px; border-radius:2px; }
   .legend-bar.flaps { background:var(--yellow); }
+
+  /* v1.23.0: probe-подсветка карточки */
+  .preview-device.probing { border-left: 3px solid var(--yellow); }
+  .preview-device.probe-ok { border-left: 3px solid var(--green); transition: border-color 0.5s; }
+  .preview-device.probe-fail { border-left: 3px solid var(--red); transition: border-color 0.5s; }
+
+  /* v1.23.0: короткие метки кнопок (по умолчанию скрыты, показываются на мобиле) */
+  .btn-label-short { display: none; }
+
+  /* v1.23.3: мобильная адаптация — burger-меню + grid. */
+  @media (max-width: 700px) {
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 8px;
+      padding: 10px 12px;
+      align-items: center;
+    }
+    header h1 { grid-column: 1; grid-row: 1; font-size: 16px; margin: 0; }
+    #nav-toggle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      grid-column: 2; grid-row: 1;
+      min-width: 44px; min-height: 44px;
+      font-size: 20px; padding: 6px;
+    }
+    #theme-btn {
+      grid-column: 3; grid-row: 1;
+      min-width: 44px; min-height: 44px;
+      font-size: 18px; padding: 6px;
+    }
+
+    /* v1.23.3: nav — выпадающее меню, скрыто по умолчанию */
+    nav#main-nav {
+      display: none;
+      grid-column: 1 / -1;
+      grid-row: 2;
+      flex-direction: column;
+      gap: 0;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px;
+      margin-top: 4px;
+    }
+    nav#main-nav.nav-open { display: flex; }
+    nav#main-nav a {
+      display: block;
+      width: 100%;
+      padding: 12px 16px;
+      font-size: 14px;
+      text-align: left;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+
+    /* v1.23.8: обёртки шапки «растворяем» — дети снова прямые в grid. */
+    .header-row1, .header-row3 { display: contents; }
+
+    #health-widget {
+      grid-column: 1 / -1; grid-row: 3;
+      justify-content: center;
+      font-size: 12px; padding: 6px 10px; gap: 4px;
+    }
+    #health-widget .hw-opt { display: none; }
+    #health-widget.hw-expanded { flex-wrap: wrap; }
+    #health-widget.hw-expanded .hw-opt { display: inline; }
+    #health-detail {
+      grid-column: 1 / -1; grid-row: 4;
+      margin: 0;
+    }
+    .toolbar {
+      grid-column: 1 / -1; grid-row: 5;
+      display: flex;
+      flex-direction: row;
+      gap: 6px;
+      width: 100%;
+      margin-left: 0;
+      flex-wrap: wrap;
+    }
+    /* v1.23.7: фиксируем flex-basis 30% — 3 кнопки в ряд, но с переносом. */
+    .toolbar > button {
+      flex: 1 1 30%;
+      min-width: 0;
+      padding: 12px 8px;
+      font-size: 12px;
+      min-height: 44px;
+    }
+    .toolbar .btn-label { display: none; }
+    .toolbar .btn-label-short { display: inline; }
+    #latency-result:empty, #cleanup-result:empty { display: none; }
+
+    button { min-height: 36px; }
+
+    /* v1.23.6: логи — mobile-only. Порядок строк через grid order.
+       Десктопные правила выше НЕ трогаем. */
+    .logs-toolbar {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      padding: 8px 10px;
+    }
+    /* Скрываем подписи «Источник:» и счётчик поиска на мобиле */
+    .logs-toolbar [data-role="source-label"],
+    .logs-toolbar [data-role="info"] { display: none; }
+
+    /* Порядок: пауза → источник → уровень/Все → диапазон → скачать → поиск */
+    .logs-toolbar [data-role="pause"]    { order: 1; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="source"]   { order: 2; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="level"]    { order: 3; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="range"]    { order: 4; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="download"] { order: 5; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="search"]   { order: 6; grid-column: 1 / -1; }
+
+    /* v1.23.7: обёртки-строки «растворяем» — дети снова в grid. */
+    .logs-toolbar-row1,
+    .logs-toolbar-row2,
+    .logs-toolbar-row2-left,
+    .logs-toolbar-row2-right { display: contents; }
+
+    .logs-toolbar #log-source-switch {
+      display: flex;
+      gap: 0;
+      width: 100%;
+    }
+    .logs-toolbar .log-source-btn {
+      flex: 1 1 0;
+      min-height: 36px;
+      padding: 8px 6px;
+      font-size: 12px;
+    }
+
+    /* Bridge: DEBUG/INFO+/WARN+/ERROR — как было */
+    #log-level-filter {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+    }
+    #log-level-filter.hidden { display: none !important; }
+    #log-level-filter button { padding: 5px 8px; font-size: 11px; }
+
+    /* WebUI: плашка «Все» — компактная, как активная кнопка уровня.
+       НЕ растягивается на всю ширину. */
+    #log-level-note-webui {
+      display: inline-flex;
+      align-items: center;
+      width: auto;
+      max-width: none;
+      margin: 0;
+      padding: 5px 10px;
+      font-size: 11px;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 500;
+    }
+    #log-level-note-webui.hidden { display: none !important; }
+
+    .logs-toolbar .time-btn-group {
+      display: flex;
+      width: 100%;
+      margin-left: 0 !important;
+    }
+    .logs-toolbar .time-btn-group button {
+      flex: 1 1 0;
+      padding: 8px 4px;
+      font-size: 12px;
+      min-height: 36px;
+    }
+
+    .logs-toolbar .logs-download {
+      width: 100%;
+      min-height: 36px;
+    }
+
+    /* Поиск: input + × + ▲ + ▼ одной строкой */
+    .logs-toolbar .logs-tb-search {
+      display: flex;
+      width: 100%;
+      gap: 4px;
+      align-items: stretch;
+      margin-left: 0;
+    }
+    .logs-tb-search #log-search {
+      flex: 1 1 auto;
+      min-width: 0;
+      max-width: none;
+      height: 36px;
+    }
+    .logs-tb-search #find-clear-btn,
+    .logs-tb-search #find-next-btn,
+    .logs-tb-search #find-prev-btn {
+      flex: 0 0 auto;
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      font-size: 14px;
+    }
+    /* v1.23.4: диапазоны (30мин/1час/Сутки/Всё) — на всю ширину, равные */
+    .logs-toolbar .time-btn-group {
+      display: flex;
+      width: 100%;
+      margin-left: 0 !important;
+    }
+    .logs-toolbar .time-btn-group button {
+      flex: 1 1 0;
+      padding: 8px 4px;
+      font-size: 12px;
+      min-height: 36px;
+    }
+
+    /* v1.23.4: import-actions — 3 строки */
+    #import-actions {
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    #import-actions > button { flex: 1 1 auto; }
+    #import-actions #selected-count {
+      flex-basis: 100%;
+      text-align: center;
+      margin: 0;
+    }
+    #import-actions .primary {
+      flex-basis: 100%;
+      margin-left: 0 !important;
+    }
+
+    /* v1.23.4: Tools — кнопки в столбик на всю ширину, счётчик по центру */
+    .tools-toolbar {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 6px;
+      padding: 10px 12px;
+    }
+    .tools-toolbar button {
+      width: 100%;
+      text-align: center;
+      margin-left: 0 !important;
+      padding: 10px 8px;
+      min-height: 40px;
+      font-size: 12px;
+    }
+    .tools-toolbar #tools-info {
+      text-align: center;
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    /* v1.23.4: tools — левая колонка уже */
+    .tools-split { grid-template-columns: 140px 1fr; }
+    .tools-list-item { padding: 8px 10px; font-size: 12px; }
+    .tools-list-item .tools-list-ip {
+      font-size: 10px;
+      word-break: break-all;
+      line-height: 1.3;
+    }
+    .tools-detail { padding: 12px; }
+
+    /* v1.23.4: hint в заголовке — под заголовком, мельче, курсив */
+    .section-title {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }
+    .section-title .hint {
+      display: block;
+      font-size: 10px;
+      font-style: italic;
+      color: var(--muted);
+      margin: 0;
+      line-height: 1.3;
+    }
+
+    /* v1.24.0 (мобиль): модалка прижимается к верху,
+       max-height от dvh, учитывается safe-area. Не уезжает под бар. */
+    .modal-overlay {
+      align-items: flex-start;
+      padding: calc(env(safe-area-inset-top, 0px) + 8px) 8px
+               calc(env(safe-area-inset-bottom, 0px) + 8px) 8px;
+      overflow: hidden;
+    }
+    .modal {
+      max-height: calc(100dvh - env(safe-area-inset-top, 0px)
+                       - env(safe-area-inset-bottom, 0px) - 16px);
+      margin: 0;
+    }
+    .modal.small { max-height: calc(100dvh - 24px); }
+
+    /* v1.23.10 (мобиль): модалка устройства — таблица в одну колонку.
+       Длинные подписи («Последняя активность», «Версия протокола»)
+       больше не выдавливают значение. */
+    .detail-table,
+    .detail-table tbody,
+    .detail-table tr,
+    .detail-table td {
+      display: block;
+      width: 100%;
+    }
+    .detail-table tr {
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-table tr:last-child { border-bottom: none; }
+    .detail-table td {
+      padding: 0;
+      border-bottom: none;
+      white-space: normal;
+      word-break: break-word;
+    }
+    .detail-table td:first-child {
+      width: 100%;
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: none;
+      margin-bottom: 2px;
+      white-space: normal;
+    }
+    .detail-table td:last-child {
+      font-size: 13px;
+      color: var(--fg);
+    }
+
+    /* v1.23.7 (мобиль): узкие карточки «Хронология» и «Мерцающие» —
+       высота по содержимому, не больше 420px. */
+    .analytics-card.compact {
+      max-height: 420px;
+      min-height: 0;
+      align-self: start;
+    }
+    .analytics-card.compact .analytics-table-scroll,
+    .analytics-card.compact .timeline-scroll {
+      min-height: 0;
+      max-height: 340px;
+    }
+
+    /* v1.23.7 (мобиль): «Локальные базы DP» — кнопки в столбик. */
+    .base-info { flex-direction: column; align-items: stretch; gap: 8px; }
+    .base-info-item { justify-content: space-between; }
+    .base-info-actions {
+      display: flex; flex-direction: column; gap: 6px; width: 100%;
+      margin-left: 0;
+    }
+    .base-info-actions button { width: 100%; text-align: center; min-height: 40px; }
+
+    /* v1.23.3: чуть меньше padding body */
+    body { padding: 12px; }
+  }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Tuya Bridge</h1>
-  <nav>
+  <div class="header-row1">
+    <h1>Tuya Bridge</h1>
+    <button id="nav-toggle" onclick="toggleNav()" title="Меню" aria-label="Меню">☰</button>
+    <button id="theme-btn" class="theme-btn" onclick="toggleTheme()" title="Переключить тему">🌙</button>
+  </div>
+  <nav id="main-nav">
     <a href="/" id="nav-dashboard">Дашборд</a>
     <a href="/analytics" id="nav-analytics">Аналитика</a>
     <a href="/import" id="nav-import">Импорт устройств</a>
     <a href="/tools" id="nav-tools">Инструменты</a>
   </nav>
-  <span id="bridge-version-badge" class="badge bridge-version" title="Версия Bridge">Bridge v?</span>
-  <span id="webui-version-badge" class="badge webui-version" title="Версия WebUI">WebUI v?</span>
-  <span id="bridge-status" class="badge">…</span>
-  <span id="bridge-uptime" class="muted"></span>
-  <span id="devices-summary" class="muted">устройства: —</span>
-  <div class="toolbar">
-    <button id="theme-btn" class="theme-btn" onclick="toggleTheme()" title="Переключить тему">🌙</button>
-    <button id="latency-btn" onclick="doLatencyRefresh()">📡 Обновить задержку</button>
-    <span id="latency-result" class="muted" style="font-size:11px;"></span>
-    <button id="db-cleanup-open" onclick="openDbCleanup()">🗑 Очистить БД</button>
-    <button id="cleanup-btn" onclick="doCleanup()">🧹 Очистить Discovery</button>
-    <span id="cleanup-result" class="muted" style="font-size:11px;"></span>
+  <div class="header-row3">
+    <span id="health-widget" class="health-widget" onclick="toggleHealthDetail()" title="Клик — детали">
+      <span id="hw-bridge">Bridge v?</span>
+      <span class="hw-sep hw-opt">·</span>
+      <span id="hw-webui" class="hw-opt">WebUI v?</span>
+      <span class="hw-sep">·</span>
+      <span id="hw-status" class="hw-dim">…</span>
+      <span id="hw-rest"></span>
+    </span>
+    <div class="toolbar">
+      <button id="latency-btn" onclick="doLatencyRefresh()">📡<span class="btn-label"> Ping</span><span class="btn-label-short"> Ping</span></button>
+      <span id="latency-result" class="muted" style="font-size:11px;"></span>
+      <button id="db-cleanup-open" onclick="openDbCleanup()">🗑<span class="btn-label"> Очистить БД</span><span class="btn-label-short"> БД</span></button>
+      <button id="cleanup-btn" onclick="doCleanup()">🧹<span class="btn-label"> Очистить Discovery</span><span class="btn-label-short"> Discovery</span></button>
+      <span id="cleanup-result" class="muted" style="font-size:11px;"></span>
+    </div>
   </div>
+  <div id="health-detail" class="health-detail" style="display:none;"></div>
 </header>
 
 <div id="view-dashboard">
@@ -2294,9 +3203,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <th data-sort="type" onclick="sortDevices('type')">Тип <span class="sort-ind"></span></th>
         <th data-sort="status" onclick="sortDevices('status')">Статус <span class="sort-ind"></span></th>
         <th data-sort="latency" onclick="sortDevices('latency')">Задержка <span class="sort-ind"></span></th>
-        <th data-sort="last_seen" onclick="sortDevices('last_seen')">Последняя активность <span class="sort-ind"></span></th>
       </tr></thead>
-      <tbody id="devices-body"><tr><td colspan="5" class="muted">Загрузка…</td></tr></tbody>
+      <tbody id="devices-body"><tr><td colspan="4" class="muted">Загрузка…</td></tr></tbody>
     </table>
   </div></div>
 
@@ -2319,15 +3227,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <table>
           <thead><tr>
             <th data-lsort="name" onclick="sortLatency('name')">Устройство <span class="sort-ind"></span></th>
-            <th data-lsort="ip" onclick="sortLatency('ip')">IP <span class="sort-ind"></span></th>
             <th data-lsort="avg" onclick="sortLatency('avg')">Средний ping <span class="sort-ind"></span></th>
             <th data-lsort="ts" onclick="sortLatency('ts')">Последняя проверка <span class="sort-ind"></span></th>
           </tr></thead>
-          <tbody id="latency-body"><tr><td colspan="4" class="muted">Загрузка…</td></tr></tbody>
+          <tbody id="latency-body"><tr><td colspan="3" class="muted">Загрузка…</td></tr></tbody>
         </table>
       </div>
     </div>
-    <div class="card analytics-card">
+    <div class="card analytics-card compact">
       <div class="analytics-card-header">
         <h2>Хронология событий</h2>
         <div class="analytics-toolbar">
@@ -2339,7 +3246,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="analytics-grid">
-    <div class="card analytics-card">
+    <div class="card analytics-card compact">
       <div class="analytics-card-header"><h2>Мерцающие устройства (24ч)</h2></div>
       <div class="analytics-table-scroll">
         <table>
@@ -2381,23 +3288,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="card">
     <h2 class="section-title">Логи (live, все уровни)</h2>
     <div class="logs-toolbar">
-      <span class="muted" style="font-size:12px;">Фильтр:</span>
-      <button data-level="DEBUG" onclick="toggleLevel('DEBUG')">DEBUG</button>
-      <button data-level="INFO" class="active" onclick="toggleLevel('INFO')">INFO+</button>
-      <button data-level="WARNING" onclick="toggleLevel('WARNING')">WARN+</button>
-      <button data-level="ERROR" onclick="toggleLevel('ERROR')">ERROR</button>
-      <button onclick="pauseLogs()" id="pause-btn" class="logs-pause">⏸ Пауза</button>
-      <input id="log-search" type="text" placeholder="Поиск..." oninput="doSearch()" style="min-width:160px; max-width:200px;">
-      <button onclick="findNext()" id="find-next-btn" disabled>▼</button>
-      <button onclick="findPrev()" id="find-prev-btn" disabled>▲</button>
-      <span id="find-info" class="muted" style="font-size:11px;"></span>
-      <div class="time-btn-group">
-        <button data-range="1800" onclick="setLogRange(1800)">30 мин</button>
-        <button data-range="3600" class="active" onclick="setLogRange(3600)">1 час</button>
-        <button data-range="86400" onclick="setLogRange(86400)">Сутки</button>
-        <button data-range="0" onclick="setLogRange(0)">Всё</button>
+      <!-- Строка 1: Источник + Bridge/WebUI + Уровень + DEBUG/INFO+/WARN+/ERROR + Скачать -->
+      <div class="logs-toolbar-row1">
+        <span class="muted" style="font-size:12px;">Источник:</span>
+        <div class="time-btn-group" id="log-source-switch">
+          <button class="log-source-btn active" data-src="bridge" onclick="switchLogSource('bridge')">Bridge</button>
+          <button class="log-source-btn" data-src="webui" onclick="switchLogSource('webui')">WebUI</button>
+        </div>
+        <span id="log-level-filter" style="display:inline-flex; align-items:center; gap:8px;">
+          <span class="muted" style="font-size:12px; margin-left:8px;">Уровень:</span>
+          <button data-level="DEBUG" onclick="toggleLevel('DEBUG')">DEBUG</button>
+          <button data-level="INFO" onclick="toggleLevel('INFO')">INFO+</button>
+          <button data-level="WARNING" onclick="toggleLevel('WARNING')">WARN+</button>
+          <button data-level="ERROR" onclick="toggleLevel('ERROR')">ERROR</button>
+        </span>
+        <span id="log-level-webui-wrap" class="hidden" style="display:inline-flex; align-items:center; gap:8px;">
+          <span class="muted" style="font-size:12px; margin-left:8px;">Уровень:</span>
+          <span id="log-level-note-webui" class="log-level-note">Все</span>
+        </span>
+        <button onclick="downloadLogs()" class="logs-download">⬇ Скачать</button>
       </div>
-      <button onclick="downloadLogs()">⬇ Скачать</button>
+
+      <!-- Строка 2: слева Пауза+Поиск, справа диапазоны -->
+      <div class="logs-toolbar-row2">
+        <div class="logs-toolbar-row2-left">
+          <button onclick="pauseLogs()" id="pause-btn" class="logs-pause">⏸ Пауза</button>
+          <div class="logs-tb-search">
+            <input id="log-search" type="text" placeholder="Поиск..." oninput="doSearch()">
+            <button onclick="clearLogSearch()" id="find-clear-btn" title="Очистить">×</button>
+            <button onclick="findPrev()" id="find-prev-btn" disabled title="Предыдущее">▲</button>
+            <button onclick="findNext()" id="find-next-btn" disabled title="Следующее">▼</button>
+          </div>
+          <span id="find-info" class="muted" style="font-size:11px;"></span>
+        </div>
+        <div class="logs-toolbar-row2-right">
+          <div class="time-btn-group">
+            <button data-range="1800" onclick="setLogRange(1800)">30 мин</button>
+            <button data-range="3600" class="active" onclick="setLogRange(3600)">1 час</button>
+            <button data-range="86400" onclick="setLogRange(86400)">Сутки</button>
+            <button data-range="0" onclick="setLogRange(0)">Всё</button>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="logs" id="logs"></div>
     <button class="scroll-down-btn" id="scroll-down-btn" onclick="scrollLogsToBottom()">↓ Вниз</button>
@@ -2442,10 +3374,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <b>tuya-local база:</b>
         <span id="base-tuya-local-info" class="muted">—</span>
       </div>
-      <button onclick="loadBaseInfo()">🔄 Обновить</button>
-      <button onclick="updateTuyaLocalDb()" id="tuya-local-update-btn">⬇ Обновить tuya-local</button>
-      <button onclick="rebuildTinytuyaJson()" id="rebuild-btn">🔄 Пересобрать tinytuya.json</button>
-      <span id="base-update-result" class="muted" style="font-size:11px;"></span>
+      <div class="base-info-actions">
+        <button onclick="loadBaseInfo()">🔄 Обновить</button>
+        <button onclick="updateTuyaLocalDb()" id="tuya-local-update-btn">⬇ Обновить tuya-local</button>
+        <button onclick="rebuildTinytuyaJson()" id="rebuild-btn">🔄 Пересобрать tinytuya.json</button>
+        <span id="base-update-result" class="muted" style="font-size:11px;"></span>
+      </div>
     </div>
     <div id="rebuild-progress" style="display:none; padding:0 16px 12px 16px;">
       <div class="muted" style="font-size:12px;" id="rebuild-progress-text"></div>
@@ -2501,6 +3435,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="tools-toolbar">
       <button id="tools-view-raw" class="active" onclick="setToolsView('raw')">📄 Raw JSON</button>
       <button id="tools-view-bydev" onclick="setToolsView('bydev')">📋 По устройствам</button>
+      <button id="tools-view-audit" onclick="setToolsView('audit')">📜 История конфига</button>
       <button onclick="loadConfig()" style="margin-left:auto;">🔄 Обновить</button>
       <button onclick="copyConfigRaw()">📋 Копировать JSON</button>
       <span id="tools-info" class="muted" style="font-size:11px;"></span>
@@ -2514,7 +3449,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="modal-overlay" class="modal-overlay" onclick="closeModal(event)">
   <div class="modal" onclick="event.stopPropagation()">
     <div class="modal-header"><h2 id="modal-title">Устройство</h2>
-      <button class="modal-close" onclick="closeModal()">×</button>
+      <div style="display:flex; align-items:center;">
+        <button class="refresh-btn" id="modal-refresh-btn" onclick="refreshModal()" title="Обновить">🔄</button>
+        <button class="modal-close" onclick="closeModal()">×</button>
+      </div>
     </div>
     <div id="modal-body" class="modal-body"></div>
   </div>
@@ -2740,13 +3678,45 @@ const STATUS_HISTORY_ENABLED = __STATUS_HISTORY_ENABLED__;
 const WEBUI_VERSION = "__WEBUI_VERSION__";
 
 const logsEl = document.getElementById("logs");
-let LOG_RANGE_SECONDS = 3600;
-let logPaused = false, lastSeq = 0;
-let userScrolledUp = false;
+// v1.23.8: состояние лог-панели выживает при переключении вкладок
+// (каждая вкладка — отдельная HTML-страница, JS-переменные сбрасываются).
+const LOG_UI_STATE_KEY = "tuya_webui_log_ui_state";
+function _logUiLoad() {
+  try {
+    const s = JSON.parse(sessionStorage.getItem(LOG_UI_STATE_KEY) || "{}");
+    return s && typeof s === "object" ? s : {};
+  } catch (e) { return {}; }
+}
+function _logUiSave() {
+  try {
+    sessionStorage.setItem(LOG_UI_STATE_KEY, JSON.stringify({
+      range: LOG_RANGE_SECONDS,
+      paused: logPaused,
+      search: SEARCH_TERM,
+      scrolledUp: userScrolledUp,
+    }));
+  } catch (e) {}
+}
+const _LOG_UI = _logUiLoad();
+let LOG_RANGE_SECONDS = (typeof _LOG_UI.range === "number") ? _LOG_UI.range : 3600;
+let logPaused = !!_LOG_UI.paused, lastSeq = 0;
+let userScrolledUp = !!_LOG_UI.scrolledUp;
 let LAST_DEVICES = [];
 let CURRENT_MODAL_IDX = -1;
 let LOG_LEVEL_FILTER = "INFO";
-let SEARCH_TERM = "", SEARCH_MATCHES = [], SEARCH_CURRENT = -1;
+let LOG_SOURCE = (function(){ try { return localStorage.getItem("tuya_webui_log_source") || "bridge"; } catch(e){ return "bridge"; } })();  // v1.22.0
+let LOG_SOURCE_TOKEN = 0;  // P2 1.22.0: токен для race
+// v1.24.2: прежний уровень Bridge хранится в localStorage,
+// чтобы не теряться при перезагрузке страницы.
+let _LAST_BRIDGE_LEVEL = (function(){
+  try {
+    const v = localStorage.getItem("tuya_webui_bridge_level");
+    if (v && ["DEBUG","INFO","WARNING","ERROR"].includes(v)) return v;
+  } catch (e) {}
+  return "INFO";
+})();
+let SEARCH_TERM = (typeof _LOG_UI.search === "string") ? _LOG_UI.search : "";
+let SEARCH_MATCHES = [], SEARCH_CURRENT = -1;
 let VIEW = "dashboard";
 let REVEALED_KEYS = {};
 let CLOUD_DETAILS_OPEN = {};
@@ -2930,7 +3900,7 @@ function highlightJsonInto(el) {
   el.innerHTML = html;
 }
 
-function isMobile() { return window.innerWidth < 1000; }
+function isMobile() { return window.innerWidth < 700; }
 
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
@@ -2942,6 +3912,28 @@ function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme") || "dark";
   applyTheme(cur === "dark" ? "light" : "dark");
 }
+
+// v1.23.3: burger-меню для мобильной навигации
+function toggleNav() {
+  const nav = document.getElementById("main-nav");
+  const btn = document.getElementById("nav-toggle");
+  if (!nav) return;
+  const isOpen = nav.classList.toggle("nav-open");
+  if (btn) btn.textContent = isOpen ? "✕" : "☰";
+}
+function _closeNavIfOpen() {
+  const nav = document.getElementById("main-nav");
+  const btn = document.getElementById("nav-toggle");
+  if (!nav || !nav.classList.contains("nav-open")) return;
+  nav.classList.remove("nav-open");
+  if (btn) btn.textContent = "☰";
+}
+document.addEventListener("click", (e) => {
+  const nav = document.getElementById("main-nav");
+  if (!nav || !nav.classList.contains("nav-open")) return;
+  if (e.target.closest("#main-nav") || e.target.closest("#nav-toggle")) return;
+  _closeNavIfOpen();
+});
 function initTheme() {
   let t = "dark";
   try { t = localStorage.getItem(THEME_KEY) || "dark"; } catch (e) {}
@@ -2949,6 +3941,30 @@ function initTheme() {
 }
 
 initTheme();
+
+// v1.24.0: держим body.modal-open, пока есть хоть одна открытая
+// модалка. MutationObserver следит за class "open" на всех
+// .modal-overlay — работает для всех 9 модалок (device, cloud,
+// preview, edit, db-cleanup, timeline-cleanup, ui-confirm,
+// ui-prompt, ui-alert) без ручных правок в каждом open/close.
+(function bindModalOpenFreeze() {
+  function syncBodyModalOpen() {
+    const anyOpen = document.querySelector(".modal-overlay.open") !== null;
+    document.body.classList.toggle("modal-open", anyOpen);
+  }
+  function bindAll() {
+    syncBodyModalOpen();
+    const obs = new MutationObserver(syncBodyModalOpen);
+    document.querySelectorAll(".modal-overlay").forEach(ov => {
+      obs.observe(ov, { attributes: true, attributeFilter: ["class"] });
+    });
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bindAll);
+  } else {
+    bindAll();
+  }
+})();
 
 if (!ANALYTICS_ENABLED) {
   const n = document.getElementById("nav-analytics");
@@ -2994,6 +4010,15 @@ function escapeHtml(s) {
 function escapeAttr(s) {
   return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
+function jsStr(s) {
+  // P3 1.22.0 fix1: одинарные кавычки + экранирование \\ и '
+  // Возвращает строку ВИДА 'name' (с кавычками), пригодную для
+  // вставки в onclick="...(...)" без обёртки.
+  try {
+    var t = String(s ?? "");
+    return "'" + t.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+  } catch (e) { return "''"; }
+}
 function copyCode(text, extraStyle) {
   const st = extraStyle ? ` style="${extraStyle}"` : "";
   return `<span class="copy-row"><code data-copy="${escapeAttr(text)}"${st}>${escapeHtml(text)}</code><span class="copy-hint" title="Клик — выделить">📋</span></span>`;
@@ -3029,6 +4054,17 @@ function fmtAgo(ts) {
   if (d < 86400) return `${Math.floor(d/3600)}ч назад`;
   return `${Math.floor(d/86400)}д назад`;
 }
+
+// v1.23.0: короткий формат для мобилы — "10с" вместо "10с назад"
+function fmtAgoShort(ts) {
+  if (!ts) return "—";
+  const d = Math.floor(Date.now()/1000) - ts;
+  if (d < 0) return "сейчас";
+  if (d < 60) return `${d}с`;
+  if (d < 3600) return `${Math.floor(d/60)}м`;
+  if (d < 86400) return `${Math.floor(d/3600)}ч`;
+  return `${Math.floor(d/86400)}д`;
+}
 function fmtDateTime(ts) {
   const d = new Date(ts * 1000);
   return d.toLocaleDateString('ru-RU') + " " + d.toLocaleTimeString('ru-RU');
@@ -3042,6 +4078,25 @@ function displayValue(v) {
   if (typeof v === "object") return JSON.stringify(v);
   return String(v);
 }
+// v1.22.4: резолвим name → {friendly, name} для показа в списках.
+function resolveDeviceDisplayName(rawName) {
+  if (!rawName) return { friendly: "?", name: "" };
+  const d = (LAST_DEVICES || []).find(x => x.name === rawName);
+  if (!d) return { friendly: rawName, name: "" };
+  const f = d.friendly_name || d.name || rawName;
+  const n = d.name || "";
+  return { friendly: f, name: (n && n !== f) ? n : "" };
+}
+
+// v1.22.4: HTML для ячейки устройства: friendly + серое name.
+function deviceNameCell(rawName, grayClass) {
+  const r = resolveDeviceDisplayName(rawName);
+  const gray = grayClass || "muted";
+  if (!r.name) return escapeHtml(r.friendly);
+  return escapeHtml(r.friendly)
+    + ' <span class="' + gray + '" style="font-size:11px;">(' + escapeHtml(r.name) + ')</span>';
+}
+
 function latencyPeriodLabel(sec) {
   if (sec === 1800) return "30 мин";
   if (sec === 3600) return "1ч";
@@ -3150,6 +4205,8 @@ let _cloudSearchTimer = null;
 
 function onDeviceSearch(v) {
   DEVICE_SEARCH = (v || "").trim();
+  // v1.22.1: сбрасываем сортировку при поиске — предсказуемо.
+  if (DEVICE_SEARCH) { SORT_KEY = "name"; SORT_DIR = 1; }
   if (_deviceSearchTimer) clearTimeout(_deviceSearchTimer);
   _deviceSearchTimer = setTimeout(() => { renderDeviceTable(LAST_DEVICES); }, 150);
 }
@@ -3226,34 +4283,42 @@ async function fetchStatus() {
   try {
     const r = await fetch("/api/status");
     const data = await r.json();
-    const bv = data.version || "?";
-    document.getElementById("bridge-version-badge").textContent = "Bridge v" + bv;
-    document.getElementById("webui-version-badge").textContent = "WebUI v" + WEBUI_VERSION;
-    const bs = document.getElementById("bridge-status");
-    bs.textContent = data.bridge_status || "unknown";
-    bs.className = "badge " + (data.bridge_status === "online" ? "online" : "offline");
-    document.getElementById("bridge-uptime").textContent = data.uptime > 0 ? "· " + fmtUptime(data.uptime) : "";
+    // v1.21.2.fix1: старые ID удалены из HTML (health-widget вместо них).
+    // Их роль выполняет refreshHealthWidget() через /api/health/full.
     const devs = data.devices || [];
     for (const d of devs) if (DEVICE_HISTORY_CACHE[d.name]) d.history = DEVICE_HISTORY_CACHE[d.name];
     LAST_DEVICES = devs;
-    const online = devs.filter(d => d.status === "online").length;
-    document.getElementById("devices-summary").textContent =
-      `устройства: ${devs.length} (${online} online, ${devs.length - online} offline)`;
+    // v1.22.0: мёртвая переменная online удалена.
     if (VIEW === "dashboard") {
       renderProblems(computeProblems(devs));
       renderDeviceTable(devs);
     }
-    _firstStatusLoad = false;
+    // v1.21.2: обновляем ТОЛЬКО volatile-зону модалки (если открыта).
+    // Sensitive-зона (quiet-редактор, local key) не трогается.
     if (CURRENT_MODAL_IDX >= 0 && CURRENT_MODAL_IDX < LAST_DEVICES.length) {
-      renderModal(LAST_DEVICES[CURRENT_MODAL_IDX]);
+      const md = LAST_DEVICES[CURRENT_MODAL_IDX];
+      if (md && document.getElementById("modal-overlay").classList.contains("open")) {
+        // v1.23.0: volatile обновляем ВСЕГДА (точечно по зонам — выделение
+        // текста сохраняется). Sensitive (quiet-редактор) — только если
+        // нет несохранённых правок.
+        renderModalVolatile(md);
+        const quietDirty = typeof QUIET_EDIT !== "undefined" && QUIET_EDIT._dirty;
+        if (!quietDirty) {
+          renderModalSensitive(md);
+        }
+      }
     }
   } catch (e) { console.error(e); }
+  finally { _firstStatusLoad = false; }  // v1.21.4: не залипаем на skeleton
 }
 
 function computeProblems(devs) {
   const now = Math.floor(Date.now()/1000);
   const out = [];
   for (const d of devs) {
+    // v1.21.0: quiet hours
+    if (d.quiet) continue;
+    if (d.quiet_until && d.quiet_until > now) continue;
     const reasons = [];
     if (d.status === "offline") {
       const hist = d.history || [];
@@ -3273,11 +4338,38 @@ function computeProblems(devs) {
   return out;
 }
 
+// v1.22.6: пропускаем перерисовку, если набор проблем не изменился.
+// v1.23.0: sig включает округлённое время (без секунд). Иначе
+// "offline 5м 30с" → "offline 5м 35с" не менял sig, DOM застревал
+// на старом значении. Теперь "5м" → "6м" триггерит перерисовку,
+// а "5м 30с" → "5м 35с" — нет.
+let _lastProblemsSig = "";
+
+function _problemsSig(problems) {
+  return problems.map(p => {
+    const reasonsKey = p.reasons.map(r => {
+      // "offline 5м 30с" → "offline 5м"
+      return r
+        .replace(/(\d+м)\s+\d+с/g, "$1")
+        // "5с назад" / "10с назад" → "0с назад" (убираем шум в первые 60 сек)
+        .replace(/^\d+с назад$/, "0с назад");
+    }).join("·");
+    return p.dev.name + "|" + reasonsKey;
+  }).join(";");
+}
+
 function renderProblems(problems) {
   const block = document.getElementById("problems-block");
   const list = document.getElementById("problems-list");
   const count = document.getElementById("problems-count");
-  if (problems.length === 0) { block.style.display = "none"; return; }
+  const sig = _problemsSig(problems);
+  if (problems.length === 0) {
+    if (block.style.display !== "none") block.style.display = "none";
+    _lastProblemsSig = "";
+    return;
+  }
+  if (sig === _lastProblemsSig) return;   // ничего не изменилось
+  _lastProblemsSig = sig;
   block.style.display = "block";
   count.textContent = `(${problems.length})`;
   list.innerHTML = problems.map(p => {
@@ -3299,7 +4391,7 @@ function renderDeviceTable(devs) {
       : (devs.length ? `${devs.length} устройств` : "");
   }
   if (filtered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="5" class="muted">${DEVICE_SEARCH ? "Ничего не найдено" : "Нет устройств"}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="4" class="muted">${DEVICE_SEARCH ? "Ничего не найдено" : "Нет устройств"}</td></tr>`;
     return;
   }
   const sorted = [...filtered].sort((a, b) => {
@@ -3320,13 +4412,26 @@ function renderDeviceTable(devs) {
     const on = d.status === "online";
     const ip = d.ip ? `<div class="device-ip">${escapeHtml(d.ip)}</div>` : "";
     const lat = `<span class="latency ${latencyClass(d.latency_ms)}">${latencyText(d.latency_ms)}</span>`;
+    const quietNow = d.quiet || (d.quiet_until && d.quiet_until > Math.floor(Date.now()/1000));
+    const quietBadge = quietNow ? ' <span class="badge quiet" title="Режим тишины">🔇</span>' : '';
+    // v1.23.5: на мобиле статус-колонка включает время активности
+    const agoFull = d.last_seen ? fmtAgo(d.last_seen) : '—';
+    const agoShort = d.last_seen ? fmtAgoShort(d.last_seen) : '—';
+    let statusCell;
+    if (isMobile()) {
+      // Точка + время активности компактно
+      statusCell = `<span class="dot ${on ? 'online' : 'offline'}"></span>` +
+                   `<span class="muted" style="font-size:12px;">${escapeHtml(agoShort)}</span>`;
+    } else {
+      statusCell = `<span class="dot ${on ? 'online' : 'offline'}"></span>
+          <span style="color:${on ? 'var(--green)' : 'var(--red)'}">${on ? 'online' : 'offline'}</span>
+          <div class="muted" style="font-size:11px; margin-top:2px;">${escapeHtml(agoFull)}</div>`;
+    }
     return `<tr class="device-row" onclick="showDevice(${realIdx})">
-      <td><div style="font-weight:500;">${escapeHtml(d.friendly_name || d.name)}</div>${ip}</td>
+      <td><div style="font-weight:500;">${escapeHtml(d.friendly_name || d.name)}${quietBadge}</div>${ip}</td>
       <td>${typeBadge(d.type)}</td>
-      <td><span class="dot ${on ? 'online' : 'offline'}"></span>
-          <span style="color:${on ? 'var(--green)' : 'var(--red)'}">${on ? 'online' : 'offline'}</span></td>
+      <td>${statusCell}</td>
       <td>${lat}</td>
-      <td class="muted" style="font-size:12px;">${d.last_seen ? fmtAgo(d.last_seen) : '—'}</td>
     </tr>`;
   }).join("");
   updateSortIndicators();
@@ -3404,23 +4509,51 @@ function latencySparklineSvg(points, width, height) {
     <text x="${PAD.left+2}" y="${height-4}" fill="currentColor" font-size="9">${msMin} мс</text></svg>`;
 }
 
+// v1.23.0: точечное обновление модалки.
+// Каждая зона — отдельный контейнер. Если HTML зоны не изменился —
+// DOM не трогаем → выделение текста сохраняется между автообновлениями.
+const _modalZoneHashes = {};
+
+// v1.23.10: состояние раскрытия секции «Кэш состояния».
+// Ключ — имя устройства. Хранит boolean для каждого устройства,
+// чтобы между автообновлениями (каждые 5 сек) выбор пользователя
+// сохранялся.
+const _CACHE_OPEN_STATE = {};
+function _onCacheToggle(deviceName, isOpen) {
+  if (deviceName) _CACHE_OPEN_STATE["_cacheOpen_" + deviceName] = !!isOpen;
+}
+
+function _updateZone(zoneId, html) {
+  const el = document.getElementById(zoneId);
+  if (!el) return;
+  const prev = _modalZoneHashes[zoneId];
+  if (prev === html) return;  // ← не трогаем DOM
+  _modalZoneHashes[zoneId] = html;
+  el.innerHTML = html;
+}
+
 async function revealSecret(name) {
   try {
     const r = await fetch(`/api/device/${encodeURIComponent(name)}/secret`);
     const data = await r.json();
     if (data.ok) {
       REVEALED_KEYS[name] = data.local_key;
-      if (CURRENT_MODAL_IDX >= 0) renderModal(LAST_DEVICES[CURRENT_MODAL_IDX]);
+      // v1.22.1: точечная перерисовка key-зоны (quiet не трогаем).
+      _rerenderModalKeyZone();
     } else uiAlert("Ошибка", "Не удалось: " + (data.error || "unknown"), "error");
   } catch (e) { console.error(e); }
 }
 function hideSecret(name) {
   delete REVEALED_KEYS[name];
-  if (CURRENT_MODAL_IDX >= 0) renderModal(LAST_DEVICES[CURRENT_MODAL_IDX]);
+  _rerenderModalKeyZone();  // v1.22.1
 }
 
-function renderModal(d) {
-  if (!d) return;
+// v1.23.0: renderModalVolatile разбит на 6 зон (_renderInfoHtml,
+// _renderClimateHtml, _renderSparklineHtml, _renderLatencyHtml,
+// _renderCacheHtml, _renderHistoryHtml). Каждая зона обновляется
+// через _updateZone — если HTML не изменился, DOM не трогается.
+function _renderInfoHtml(d) {
+  if (!d) return "";
   if (DEVICE_HISTORY_CACHE[d.name] && (!d.history || d.history.length === 0)) d.history = DEVICE_HISTORY_CACHE[d.name];
   const on = d.status === "online";
   let html = "";
@@ -3434,93 +4567,194 @@ function renderModal(d) {
   if (d.ip) html += `<tr><td>IP</td><td>${copyCode(d.ip)}</td></tr>`;
   if (d.version) html += `<tr><td>Версия протокола</td><td>${versionBadge(d.version)}</td></tr>`;
   if (d.tuya_id) html += `<tr><td>Tuya ID</td><td>${copyCode(d.tuya_id)}</td></tr>`;
-  if (d.local_key_present) {
-    const revealedKey = REVEALED_KEYS[d.name];
-    if (revealedKey) {
-      html += `<tr><td>Local key</td><td>
-        ${copyCode(revealedKey)}
-        <button onclick="hideSecret('${escapeHtml(d.name)}')" style="margin-left:4px; padding:2px 8px; font-size:11px;">Скрыть</button></td></tr>`;
-    } else {
-      html += `<tr><td>Local key</td><td><span class="secret-masked">••••••••••</span>
-        <button onclick="revealSecret('${escapeHtml(d.name)}')" style="margin-left:6px; padding:2px 8px; font-size:11px;">👁 Показать</button></td></tr>`;
-    }
+  html += `</table>`;
+  return html;
+}
+
+function _renderClimateHtml(d) {
+  if (!d || d.type !== "climate") return "";
+  if (!(d.presets?.length > 0 || d.min_temp || d.max_temp)) return "";
+  let html = `<h3>Климат</h3><table class="detail-table">`;
+  if (d.min_temp !== null && d.min_temp !== undefined && d.max_temp !== null && d.max_temp !== undefined)
+    html += `<tr><td>Диапазон</td><td>${d.min_temp}°C — ${d.max_temp}°C (шаг ${d.temp_step || "?"})</td></tr>`;
+  if (d.presets?.length > 0) {
+    const pmap = d.preset_map || {};
+    html += `<tr><td>Пресеты</td><td>${escapeHtml(d.presets.map(p => pmap[p] || p).join(", "))}</td></tr>`;
   }
   html += `</table>`;
+  return html;
+}
 
-  html += `<div style="display:flex; gap:8px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border); flex-wrap:wrap;">
-    <button onclick="editDevice('${escapeHtml(d.name)}')" style="padding:4px 12px; font-size:12px;">✏️ Изменить IP / Key / Version</button>
-    <button class="danger" onclick="deleteDevice('${escapeHtml(d.name)}')" style="padding:4px 12px; font-size:12px;">🗑 Удалить</button>
-  </div>`;
-
-  if (d.type === "climate" && (d.presets?.length > 0 || d.min_temp || d.max_temp)) {
-    html += `<h3>Климат</h3><table class="detail-table">`;
-    if (d.min_temp !== null && d.min_temp !== undefined && d.max_temp !== null && d.max_temp !== undefined)
-      html += `<tr><td>Диапазон</td><td>${d.min_temp}°C — ${d.max_temp}°C (шаг ${d.temp_step || "?"})</td></tr>`;
-    if (d.presets?.length > 0) {
-      const pmap = d.preset_map || {};
-      html += `<tr><td>Пресеты</td><td>${escapeHtml(d.presets.map(p => pmap[p] || p).join(", "))}</td></tr>`;
-    }
-    html += `</table>`;
-  }
-
+function _renderSparklineHtml(d) {
+  if (!STATUS_HISTORY_ENABLED) return "";
   const histAll = d.history || [];
-  if (STATUS_HISTORY_ENABLED && histAll.length > 0) {
-    html += `<h3>Хронология статуса</h3><div class="sparkline">${sparklineSvgWithLabels(histAll, 700, 40)}</div>`;
-  }
-  if (STATUS_HISTORY_ENABLED) {
-    const latPoints = DEVICE_LATENCY_CACHE[d.name] || [];
-    const avgData = DEVICE_AVG_LATENCY_CACHE[d.name];
-    if (latPoints.length > 0) {
-      const valid = latPoints.filter(p => p.ms !== null && p.ms !== undefined);
-      const timeouts = latPoints.length - valid.length;
-      let stats = "";
-      if (avgData && avgData.avg !== null && avgData.avg !== undefined) {
-        stats += `сред. 24ч <strong>${avgData.avg} мс</strong> (${avgData.count} замеров)`;
-      }
-      if (d.latency_ms !== null && d.latency_ms !== undefined) { if (stats) stats += " · "; stats += `сейчас <strong>${d.latency_ms} мс</strong>`; }
-      if (timeouts > 0) { if (stats) stats += " · "; stats += `<span style="color:var(--red)">timeout: ${timeouts}</span>`; }
-      const cnt = latPoints.length;
-      html += `<h3>Задержка (24ч, ${cnt}) <span class="muted" style="float:right; text-transform:none; font-weight:normal;">${stats}</span></h3>`;
-      html += `<div class="sparkline" style="height:60px;">${latencySparklineSvg(latPoints, 700, 60)}</div>`;
-    }
-  }
+  if (histAll.length === 0) return "";
+  return `<h3>Хронология статуса</h3><div class="sparkline">${sparklineSvgWithLabels(histAll, 700, 40)}</div>`;
+}
 
+function _renderLatencyHtml(d) {
+  if (!STATUS_HISTORY_ENABLED) return "";
+  const latPoints = DEVICE_LATENCY_CACHE[d.name] || [];
+  const avgData = DEVICE_AVG_LATENCY_CACHE[d.name];
+  if (latPoints.length === 0) return "";
+  const valid = latPoints.filter(p => p.ms !== null && p.ms !== undefined);
+  const timeouts = latPoints.length - valid.length;
+  let stats = "";
+  if (avgData && avgData.avg !== null && avgData.avg !== undefined) {
+    stats += `сред. 24ч <strong>${avgData.avg} мс</strong> (${avgData.count} замеров)`;
+  }
+  if (d.latency_ms !== null && d.latency_ms !== undefined) { if (stats) stats += " · "; stats += `сейчас <strong>${d.latency_ms} мс</strong>`; }
+  if (timeouts > 0) { if (stats) stats += " · "; stats += `<span style="color:var(--red)">timeout: ${timeouts}</span>`; }
+  const cnt = latPoints.length;
+  let html = `<h3>Задержка (24ч, ${cnt}) <span class="muted" style="float:right; text-transform:none; font-weight:normal;">${stats}</span></h3>`;
+  html += `<div class="sparkline" style="height:60px;">${latencySparklineSvg(latPoints, 700, 60)}</div>`;
+  return html;
+}
+
+function _renderCacheHtml(d) {
   const cache = d.cache || {}; const dps_map = d.dps_map || {};
   const keys = Object.keys(cache);
-  if (keys.length > 0) {
-    html += `<h3>Кэш состояния (${keys.length})</h3><table class="detail-table">`;
-    const sorted = keys.sort((a, b) => {
-      const ai = parseInt(a), bi = parseInt(b);
-      if (!isNaN(ai) && !isNaN(bi)) return ai - bi;
-      return a.localeCompare(b);
-    });
-    for (const dp of sorted) {
-      const info = dps_map[dp] || {}; const name = info.name || "?";
-      const val = JSON.stringify(cache[dp]);
-      html += `<tr><td>${escapeHtml(dp)} <span class="muted">(${escapeHtml(name)})</span></td>
-        <td>${copyCode(val)}</td></tr>`;
-    }
-    html += `</table>`;
+  if (keys.length === 0) return "";
+
+  // v1.23.10: умный порог — ≤ 8 DP раскрыто, иначе свёрнуто.
+  // Кэш запоминает состояние раскрытия между автообновлениями,
+  // чтобы пользователь мог спокойно раскрыть большой список.
+  const SMART_THRESHOLD = 8;
+  const cacheKey = "_cacheOpen_" + (d.name || "");
+  if (typeof _CACHE_OPEN_STATE[cacheKey] === "undefined") {
+    _CACHE_OPEN_STATE[cacheKey] = keys.length <= SMART_THRESHOLD;
+  }
+  const isOpen = _CACHE_OPEN_STATE[cacheKey] ? "open" : "";
+
+  let rows = "";
+  const sorted = keys.sort((a, b) => {
+    const ai = parseInt(a), bi = parseInt(b);
+    if (!isNaN(ai) && !isNaN(bi)) return ai - bi;
+    return a.localeCompare(b);
+  });
+  for (const dp of sorted) {
+    const info = dps_map[dp] || {}; const name = info.name || "?";
+    const val = JSON.stringify(cache[dp]);
+    rows += `<tr><td>${escapeHtml(dp)} <span class="muted">(${escapeHtml(name)})</span></td>
+      <td>${copyCode(val)}</td></tr>`;
   }
 
-  if (STATUS_HISTORY_ENABLED) {
-    const hist = histAll.slice().reverse();
-    if (hist.length > 0) {
-      html += `<h3>История статуса (последние ${hist.length})</h3><div class="history-scroll">`;
-      for (const h of hist) html += `<div class="history-item ${h.status}">${fmtDateTime(h.ts)} — ${h.status}</div>`;
-      html += `</div>`;
-    }
+  return `<details class="cache-details" ${isOpen}
+      ontoggle="_onCacheToggle('${escapeAttr(d.name || "")}', this.open)">
+    <summary><h3 style="display:inline; margin:0;">Кэш состояния (${keys.length})</h3>
+      <span class="muted" style="font-size:11px; margin-left:6px;">${keys.length > SMART_THRESHOLD ? "клик — раскрыть" : ""}</span>
+    </summary>
+    <table class="detail-table" style="margin-top:6px;">${rows}</table>
+  </details>`;
+}
+
+function _renderHistoryHtml(d) {
+  if (!STATUS_HISTORY_ENABLED) return "";
+  const histAll = d.history || [];
+  const hist = histAll.slice().reverse();
+  if (hist.length === 0) return "";
+  let html = `<h3>История статуса (последние ${hist.length})</h3><div class="history-scroll">`;
+  for (const h of hist) html += `<div class="history-item ${h.status}">${fmtDateTime(h.ts)} — ${h.status}</div>`;
+  html += `</div>`;
+  return html;
+}
+
+// v1.23.0: рендер модалки — точечное обновление по зонам.
+function renderModalVolatile(d) {
+  if (!d) return;
+
+  // Первое открытие — создаём структуру зон
+  if (!document.getElementById("modal-volatile")) {
+    document.getElementById("modal-body").innerHTML =
+      '<div id="modal-volatile">'
+      +   '<div id="mv-info"></div>'
+      +   '<div id="mv-climate"></div>'
+      +   '<div id="mv-sparkline"></div>'
+      +   '<div id="mv-latency"></div>'
+      +   '<div id="mv-cache"></div>'
+      +   '<div id="mv-history"></div>'
+      + '</div>'
+      // v1.24.1: три отдельные зоны — quiet, key, кнопки.
+      + '<div id="modal-quiet-zone"></div>'
+      + '<div id="modal-key-zone"></div>'
+      + '<div id="modal-actions-zone"></div>';
+    // Сбрасываем хэши, чтобы зоны отрисовались
+    Object.keys(_modalZoneHashes).forEach(k => delete _modalZoneHashes[k]);
+    renderModalSensitive(d);
   }
-  document.getElementById("modal-body").innerHTML = html;
+
+  _updateZone("mv-info",      _renderInfoHtml(d));
+  _updateZone("mv-climate",   _renderClimateHtml(d));
+  _updateZone("mv-sparkline", _renderSparklineHtml(d));
+  _updateZone("mv-latency",   _renderLatencyHtml(d));
+  _updateZone("mv-cache",     _renderCacheHtml(d));
+  _updateZone("mv-history",   _renderHistoryHtml(d));
+}
+
+// v1.22.1: key-часть вынесена — revealSecret/hideSecret
+// перерисовывают только её, не трогая quiet-редактор.
+function renderModalKeySection(d) {
+  if (!d || !d.local_key_present) return "";
+  const revealedKey = REVEALED_KEYS[d.name];
+  let s = '<h3>Local key</h3><table class="detail-table">';
+  if (revealedKey) {
+    s += '<tr><td>Local key</td><td>'
+      + copyCode(revealedKey)
+      + ' <button onclick="hideSecret(' + jsStr(d.name) + ')" style="margin-left:4px; padding:2px 8px; font-size:11px;">Скрыть</button></td></tr>';
+  } else {
+    s += '<tr><td>Local key</td><td><span class="secret-masked">••••••••••</span>'
+      + ' <button onclick="revealSecret(' + jsStr(d.name) + ')" style="margin-left:6px; padding:2px 8px; font-size:11px;">👁 Показать</button></td></tr>';
+  }
+  s += '</table>';
+  return s;
+}
+
+// v1.22.1: точечная перерисовка только key-зоны.
+function _rerenderModalKeyZone() {
+  if (CURRENT_MODAL_IDX < 0) return;
+  const d = LAST_DEVICES[CURRENT_MODAL_IDX];
+  if (!d || !d.local_key_present) return;
+  const el = document.getElementById("modal-key-zone");
+  if (!el) return;
+  el.innerHTML = renderModalKeySection(d);
+}
+
+function renderModalSensitive(d) {
+  if (!d) return;
+  // v1.24.1: три отдельные зоны — порядок quiet → key → кнопки.
+  const quietZone   = document.getElementById("modal-quiet-zone");
+  const keyZone     = document.getElementById("modal-key-zone");
+  const actionsZone = document.getElementById("modal-actions-zone");
+  if (quietZone) quietZone.innerHTML = renderQuietSection(d);
+  if (keyZone)   keyZone.innerHTML   = renderModalKeySection(d);
+  if (actionsZone) {
+    actionsZone.innerHTML =
+      '<div style="display:flex; gap:8px; margin-top:12px; padding-top:12px; '
+      + 'border-top:1px solid var(--border); flex-wrap:wrap;">'
+      + '<button onclick="editDevice(' + jsStr(d.name) + ')" '
+      + 'style="padding:4px 12px; font-size:12px;">✏️ Изменить IP / Key / Version</button>'
+      + '<button class="danger" onclick="deleteDevice(' + jsStr(d.name) + ')" '
+      + 'style="padding:4px 12px; font-size:12px;">🗑 Удалить</button>'
+      + '</div>';
+  }
+  // QUIET_EDIT инициализируется в showDevice() (force) при открытии
+  // модалки. Здесь его НЕ трогаем — иначе при показе local key
+  // (revealSecret) потеряются несохранённые правки quiet-окон.
 }
 
 async function showDevice(idx) {
   const d = LAST_DEVICES[idx];
   if (!d) return;
   CURRENT_MODAL_IDX = idx;
+  // v1.21.1: явное открытие — сбросить старый quiet-редактор
+  // (в т.ч. _dirty от прошлого устройства).
+  if (typeof d.quiet_windows !== "undefined") {
+    quietInitEdit(d, true);
+  }
   document.getElementById("modal-title").textContent = (d.friendly_name || d.name) + " [" + (d.type || "?") + "]";
   if (DEVICE_HISTORY_CACHE[d.name]) d.history = DEVICE_HISTORY_CACHE[d.name];
-  renderModal(d);
+  document.getElementById("modal-body").innerHTML = "";
+  renderModalVolatile(d);
   document.getElementById("modal-overlay").classList.add("open");
   if (STATUS_HISTORY_ENABLED) {
     let rerender = false;
@@ -3545,14 +4779,209 @@ async function showDevice(idx) {
         if (data.avg !== undefined) { DEVICE_AVG_LATENCY_CACHE[d.name] = data; rerender = true; }
       } catch (e) {}
     }
-    if (rerender) renderModal(d);
+    if (rerender) renderModalVolatile(d);
+  }
+}
+
+// v1.21.0: режим тишины (quiet hours)
+let QUIET_EDIT = { windows: [] };
+
+function renderQuietSection(d) {
+  const wins = d.quiet_windows || [];
+  const now = Math.floor(Date.now()/1000);
+  const inQuiet = d.quiet || (d.quiet_until && d.quiet_until > now);
+
+  // v1.24.0: разные эмодзи — 🔇 в тишине, 🔈 не в тишине.
+  // Статус «до HH:MM» — inline-суффиксом, только когда quiet-on.
+  const emoji = inQuiet ? "🔇" : "🔈";
+  const cls = inQuiet ? "quiet-title quiet-on" : "quiet-title quiet-off";
+  const statusInline = inQuiet && d.quiet_until
+    ? `<span class="quiet-status-inline">· сейчас до ${fmtTimeShort(d.quiet_until)}</span>`
+    : "";
+
+  let rows = "";
+  for (let i = 0; i < QUIET_EDIT.windows.length; i++) {
+    const w = QUIET_EDIT.windows[i] || {};
+    rows += `<div class="quiet-row" data-qidx="${i}">
+      <input type="time" value="${escapeAttr(w.from || '23:00')}" onchange="quietUpdate(${i}, 'from', this.value)">
+      <span class="muted">—</span>
+      <input type="time" value="${escapeAttr(w.to || '08:00')}" onchange="quietUpdate(${i}, 'to', this.value)">
+      <button class="danger" style="padding:2px 8px; font-size:11px;" onclick="quietRemove(${i})">×</button>
+    </div>`;
+  }
+  if (!rows) rows = '<div class="muted" style="font-size:12px;">Окон нет — устройство всегда активно.</div>';
+
+  return `<h3 class="${cls}">
+      <span class="quiet-emoji">${emoji}</span>
+      <span>Режим тишины</span>
+      ${statusInline}
+    </h3>
+    <div class="muted quiet-help">
+      В тишине устройство не попадает в мерцания, хронологию и «Проблемные».
+      <b>latency</b> не измеряется. После окна — grace 2 мин.
+    </div>
+    <div id="quiet-rows">${rows}</div>
+    <div class="quiet-actions">
+      <button onclick="quietAdd()" style="padding:4px 12px; font-size:12px;">+ Добавить окно</button>
+      <button class="primary" onclick="quietSave(${jsStr(d.name)})" style="padding:4px 12px; font-size:12px;">💾 Сохранить</button>
+      <span id="quiet-dirty" class="muted" style="display:none; font-size:11px; color:var(--yellow);">● не сохранено</span>
+      <span id="quiet-save-status" class="muted" style="font-size:11px;"></span>
+    </div>`;
+}
+
+function quietInitEdit(d, force) {
+  // v1.21.1: не сбрасываем редактор, если для этого же устройства
+  // уже есть несохранённые изменения.
+  if (!force && QUIET_EDIT && QUIET_EDIT._name === d.name && QUIET_EDIT._dirty) {
+    return;
+  }
+  QUIET_EDIT = {
+    _name: d.name,
+    _dirty: false,
+    windows: JSON.parse(JSON.stringify(d.quiet_windows || []))
+  };
+}
+function quietMarkDirty() {
+  if (QUIET_EDIT) {
+    QUIET_EDIT._dirty = true;
+    const el = document.getElementById("quiet-dirty");
+    if (el) el.style.display = "inline";
+  }
+}
+function quietClearDirty() {
+  if (QUIET_EDIT) QUIET_EDIT._dirty = false;
+  const el = document.getElementById("quiet-dirty");
+  if (el) el.style.display = "none";
+}
+function quietAddRowToDom(w, i) {
+  const wrap = document.getElementById("quiet-rows");
+  if (!wrap) return;
+  // убираем placeholder если есть
+  const ph = wrap.querySelector(".quiet-placeholder");
+  if (ph) ph.remove();
+  const div = document.createElement("div");
+  div.className = "quiet-row";
+  div.dataset.qidx = String(i);
+  div.innerHTML = `
+    <input type="time" value="${escapeAttr(w.from || '23:00')}" onchange="quietUpdate(${i}, 'from', this.value)">
+    <span class="muted">—</span>
+    <input type="time" value="${escapeAttr(w.to || '08:00')}" onchange="quietUpdate(${i}, 'to', this.value)">
+    <button class="danger" style="padding:2px 8px; font-size:11px;" onclick="quietRemove(${i})">×</button>`;
+  wrap.appendChild(div);
+}
+
+function quietAdd() {
+  // v1.21.1: точечная вставка строки — без полной перерисовки.
+  if (!QUIET_EDIT.windows) QUIET_EDIT.windows = [];
+  QUIET_EDIT.windows.push({ from: "23:00", to: "08:00" });
+  quietAddRowToDom(QUIET_EDIT.windows[QUIET_EDIT.windows.length - 1],
+                   QUIET_EDIT.windows.length - 1);
+  quietMarkDirty();
+}
+function quietUpdate(i, key, value) {
+  if (!QUIET_EDIT.windows || !QUIET_EDIT.windows[i]) return;
+  QUIET_EDIT.windows[i][key] = value;
+  quietMarkDirty();  // v1.21.1
+}
+function quietReindexRows() {
+  // после удаления переиндексируем onchange/onclick у оставшихся строк
+  const wrap = document.getElementById("quiet-rows");
+  if (!wrap) return;
+  const rows = wrap.querySelectorAll(".quiet-row");
+  rows.forEach((row, idx) => {
+    row.dataset.qidx = String(idx);
+    const inputs = row.querySelectorAll('input[type="time"]');
+    const btn = row.querySelector("button");
+    if (inputs[0]) inputs[0].setAttribute("onchange", `quietUpdate(${idx}, 'from', this.value)`);
+    if (inputs[1]) inputs[1].setAttribute("onchange", `quietUpdate(${idx}, 'to', this.value)`);
+    if (btn) btn.setAttribute("onclick", `quietRemove(${idx})`);
+  });
+}
+
+function quietRemove(i) {
+  if (!QUIET_EDIT.windows || !QUIET_EDIT.windows[i]) return;
+  // v1.21.1: точечное удаление — без полной перерисовки.
+  QUIET_EDIT.windows.splice(i, 1);
+  const wrap = document.getElementById("quiet-rows");
+  if (wrap) {
+    const row = wrap.querySelector(`.quiet-row[data-qidx="${i}"]`);
+    if (row) row.remove();
+    if (QUIET_EDIT.windows.length === 0) {
+      wrap.innerHTML = '<div class="muted quiet-placeholder" style="font-size:12px;">Окон нет — устройство всегда активно.</div>';
+    } else {
+      quietReindexRows();
+    }
+  }
+  quietMarkDirty();
+}
+async function quietSave(name) {
+  const statusEl = document.getElementById("quiet-save-status");
+  if (statusEl) statusEl.innerHTML = '<span class="spin"></span> сохранение…';
+  try {
+    const r = await fetch(`/api/device/${encodeURIComponent(name)}/quiet`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ windows: QUIET_EDIT.windows || [] })
+    });
+    const data = await r.json();
+    if (data.ok) {
+      if (statusEl) statusEl.innerHTML = '<span style="color:var(--green);">✅ сохранено</span>';
+      const d = LAST_DEVICES.find(x => x.name === name);
+      if (d) d.quiet_windows = data.windows || [];
+      // v1.21.1: сбрасываем dirty и обновляем ТОЛЬКО данные, без перерисовки модалки
+      quietClearDirty();
+      // тихо подтянем свежий /api/status, но модалку не трогаем
+      fetchStatus();
+      setTimeout(() => { if (statusEl) statusEl.textContent = ""; }, 2000);
+    } else {
+      if (statusEl) statusEl.innerHTML = '<span style="color:var(--red);">❌ ' + escapeHtml(data.error || "ошибка") + '</span>';
+    }
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--red);">❌ ' + escapeHtml(e.message) + '</span>';
   }
 }
 
 function closeModal(evt) {
   if (evt && evt.target && evt.target.id !== "modal-overlay") return;
+  const d = LAST_DEVICES[CURRENT_MODAL_IDX];
+  if (d) {
+    delete DEVICE_HISTORY_CACHE[d.name];
+    delete DEVICE_LATENCY_CACHE[d.name];
+    delete DEVICE_AVG_LATENCY_CACHE[d.name];
+  }
   CURRENT_MODAL_IDX = -1;
   document.getElementById("modal-overlay").classList.remove("open");
+}
+
+async function refreshModal() {
+  if (CURRENT_MODAL_IDX < 0) return;
+  const d = LAST_DEVICES[CURRENT_MODAL_IDX];
+  if (!d) return;
+  if (typeof QUIET_EDIT !== "undefined" && QUIET_EDIT._dirty) {
+    const ok = await uiConfirm("Обновить?",
+      "Есть несохранённые изменения в режиме тишины. Они будут потеряны.",
+      {danger: true, okText: "Обновить"});
+    if (!ok) return;
+  }
+  const btn = document.getElementById("modal-refresh-btn");
+  if (btn) btn.classList.add("spinning");
+  delete DEVICE_HISTORY_CACHE[d.name];
+  delete DEVICE_LATENCY_CACHE[d.name];
+  delete DEVICE_AVG_LATENCY_CACHE[d.name];
+  document.getElementById("modal-body").innerHTML = "";
+  renderModalVolatile(d);
+  try {
+    const r = await fetch(`/api/device/${encodeURIComponent(d.name)}/history?hours=24&limit=100`);
+    const hist = await r.json();
+    if (hist.history) { DEVICE_HISTORY_CACHE[d.name] = hist.history; d.history = hist.history; }
+    const r2 = await fetch(`/api/device/${encodeURIComponent(d.name)}/latency?hours=24&limit=2000`);
+    const lat = await r2.json();
+    if (lat.latency) { DEVICE_LATENCY_CACHE[d.name] = lat.latency; }
+    const r3 = await fetch(`/api/device/${encodeURIComponent(d.name)}/avg_latency?latency_seconds=86400`);
+    const avg = await r3.json();
+    if (avg.avg !== undefined) { DEVICE_AVG_LATENCY_CACHE[d.name] = avg; }
+  } catch (e) { console.warn("refreshModal", e); }
+  renderModalVolatile(d);
+  if (btn) btn.classList.remove("spinning");
 }
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
@@ -3779,7 +5208,16 @@ async function deleteDevice(name) {
   } catch (e) { uiAlert("Ошибка", "Ошибка сети: " + e.message, "error"); }
 }
 
-function logLevelPass(level) { return (LEVEL_ORDER[level] || 0) >= (LEVEL_ORDER[LOG_LEVEL_FILTER] || 0); }
+function logLevelPass(level, source) {
+  // v1.21.3: на вкладке WebUI уровни не применяются
+  if (source === "webui" || LOG_SOURCE === "webui") return true;
+  return (LEVEL_ORDER[level] || 0) >= (LEVEL_ORDER[LOG_LEVEL_FILTER] || 0);
+}
+function logSourcePass(item) {
+  // v1.21.3: фильтр по source
+  if (!item || !item.source) return LOG_SOURCE === "bridge";  // legacy — считаем bridge
+  return item.source === LOG_SOURCE;
+}
 function logTimePass(item) {
   if (LOG_RANGE_SECONDS === 0) return true;
   let t = parseLogTs(item.msg);
@@ -3795,10 +5233,13 @@ function logMatchesSearch(msg) {
 }
 function renderLogsFromBuffer() {
   const frag = document.createDocumentFragment();
+  let anyShown = false;
   for (const item of LOG_BUFFER) {
-    if (!logLevelPass(item.level)) continue;
+    if (!logSourcePass(item)) continue;
+    if (!logLevelPass(item.level, item.source)) continue;
     if (!logTimePass(item)) continue;
     if (!logMatchesSearch(item.msg)) continue;
+    anyShown = true;
     const div = document.createElement("div");
     div.className = "line lvl-" + item.level;
     div.dataset.level = item.level;
@@ -3815,7 +5256,16 @@ function renderLogsFromBuffer() {
     frag.appendChild(div);
   }
   logsEl.innerHTML = "";
-  logsEl.appendChild(frag);
+  // v1.21.3: placeholder для пустого WebUI-лога
+  if (!anyShown && LOG_SOURCE === "webui") {
+    const ph = document.createElement("div");
+    ph.className = "muted";
+    ph.style.cssText = "padding:16px; text-align:center; color:var(--muted);";
+    ph.textContent = "Пока нет записей WebUI";
+    logsEl.appendChild(ph);
+  } else {
+    logsEl.appendChild(frag);
+  }
   SEARCH_MATCHES = [];
   if (SEARCH_TERM) {
     logsEl.querySelectorAll(".line").forEach(line => {
@@ -3832,7 +5282,7 @@ function appendLog(item) {
   lastSeq = item.seq;
   LOG_BUFFER.push(item);
   if (LOG_BUFFER.length > LOG_BUFFER_MAX) LOG_BUFFER.shift();
-  if (logLevelPass(item.level) && logTimePass(item) && logMatchesSearch(item.msg)) {
+  if (logSourcePass(item) && logLevelPass(item.level, item.source) && logTimePass(item) && logMatchesSearch(item.msg)) {
     const div = document.createElement("div");
     div.className = "line lvl-" + item.level;
     div.dataset.level = item.level;
@@ -3852,13 +5302,98 @@ function appendLog(item) {
   }
 }
 function toggleLevel(level) {
+  // v1.21.3: на WebUI уровни не работают, но на всякий случай
   LOG_LEVEL_FILTER = level;
+  if (LOG_SOURCE === "bridge") {
+    _LAST_BRIDGE_LEVEL = level;
+    // v1.24.2: сохраняем выбор уровня Bridge в localStorage.
+    try { localStorage.setItem("tuya_webui_bridge_level", level); } catch(e) {}
+  }
   document.querySelectorAll(".logs-toolbar button[data-level]").forEach(b => b.classList.toggle("active", b.dataset.level === level));
   renderLogsFromBuffer();
 }
+// v1.21.3: переключение источника логов [Bridge] / [WebUI]
+function switchLogSource(src) {
+  if (LOG_SOURCE === src) return;
+  // v1.22.1: закрываем EventSource сразу, чтобы старый поток
+  // не наливал записи, пока идёт loadLogHistory для нового source.
+  if (LOG_SSE_ES) {
+    try { LOG_SSE_ES.close(); } catch(e){}
+    LOG_SSE_ES = null;
+  }
+  // P3 1.22.0: сохраняем в localStorage
+  try { localStorage.setItem("tuya_webui_log_source", src); } catch(e){}
+  // P2 1.22.0: токен — защита от race при быстром переключении
+  const myToken = ++LOG_SOURCE_TOKEN;
+
+  // Сохраняем прежний уровень Bridge при переходе на WebUI
+  if (LOG_SOURCE === "bridge") {
+    _LAST_BRIDGE_LEVEL = LOG_LEVEL_FILTER;
+    // v1.24.2: пишем в localStorage, чтобы выбор пережил F5.
+    try { localStorage.setItem("tuya_webui_bridge_level", LOG_LEVEL_FILTER); } catch(e) {}
+  }
+  LOG_SOURCE = src;
+
+  document.querySelectorAll(".log-source-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.src === src);
+  });
+
+  const lvlWrap = document.getElementById("log-level-filter");
+  const lvlNote = document.getElementById("log-level-note-webui");
+  // v1.23.4: класс .hidden вместо inline display — иначе !important
+  // в мобильном CSS перебивает inline style.
+  if (src === "bridge") {
+    if (lvlWrap) lvlWrap.classList.remove("hidden");
+    if (lvlNote) lvlNote.classList.add("hidden");
+  } else {
+    if (lvlWrap) lvlWrap.classList.add("hidden");
+    if (lvlNote) lvlNote.classList.remove("hidden");
+  }
+
+  if (src === "webui") {
+    LOG_LEVEL_FILTER = "DEBUG";
+    document.querySelectorAll(".logs-toolbar button[data-level]").forEach(b => {
+      b.classList.remove("active");
+    });
+  } else {
+    LOG_LEVEL_FILTER = _LAST_BRIDGE_LEVEL || "INFO";
+    document.querySelectorAll(".logs-toolbar button[data-level]").forEach(b => {
+      b.classList.toggle("active", b.dataset.level === LOG_LEVEL_FILTER);
+    });
+  }
+
+  if (logPaused) {
+    logPaused = false;
+    // v1.23.8: сохраняем сброс паузы при смене источника.
+    _logUiSave();
+    const pauseBtn = document.getElementById("pause-btn");
+    if (pauseBtn) {
+      pauseBtn.textContent = "⏸ Пауза";
+      pauseBtn.classList.remove("active");
+    }
+    const oldBanner = document.getElementById("logs-paused-banner");
+    if (oldBanner) oldBanner.remove();
+  }
+
+  // P1 1.22.0: НЕ очищаем LOG_BUFFER и НЕ сбрасываем lastSeq.
+  // loadLogHistory() дополнит буфер по дедупликации seq,
+  // затем переподключим SSE с текущим глобальным lastSeq.
+  loadLogHistory().then((maxSeq) => {
+    if (myToken !== LOG_SOURCE_TOKEN) return;
+    if (maxSeq > lastSeq) lastSeq = maxSeq;
+    // v1.22.1: защита от backlog при пустом буфере
+    if (lastSeq <= 0) lastSeq = 1;
+    connectSSE();
+  });
+}
+
 function setLogRange(seconds) {
   LOG_RANGE_SECONDS = parseInt(seconds, 10) || 0;
-  document.querySelectorAll(".logs-toolbar .time-btn-group button").forEach(b => {
+  // v1.23.8: сохраняем диапазон, чтобы он выжил при смене вкладки.
+  _logUiSave();
+  // v1.21.3.fix3: селектим ТОЛЬКО кнопки с data-range, иначе
+  // захватываем .log-source-btn (Bridge/WebUI) и подсвечиваем оба.
+  document.querySelectorAll(".logs-toolbar button[data-range]").forEach(b => {
     const r = parseInt(b.dataset.range, 10) || 0;
     b.classList.toggle("active", r === LOG_RANGE_SECONDS);
   });
@@ -3866,6 +5401,8 @@ function setLogRange(seconds) {
 }
 function pauseLogs() {
   logPaused = !logPaused;
+  // v1.23.8: сохраняем состояние, чтобы пауза выжила при смене вкладки.
+  _logUiSave();
   const btn = document.getElementById("pause-btn");
   btn.textContent = logPaused ? "▶ Продолжить" : "⏸ Пауза";
   btn.classList.toggle("active", logPaused);
@@ -3886,6 +5423,18 @@ function pauseLogs() {
 function doSearch() {
   SEARCH_TERM = document.getElementById("log-search").value.trim();
   SEARCH_CURRENT = -1;
+  // v1.23.8: сохраняем поиск.
+  _logUiSave();
+  renderLogsFromBuffer();
+}
+// v1.23.6: кнопка «×» справа от input поиска логов.
+function clearLogSearch() {
+  const el = document.getElementById("log-search");
+  if (el) el.value = "";
+  SEARCH_TERM = "";
+  SEARCH_CURRENT = -1;
+  // v1.23.8: сохраняем состояние.
+  _logUiSave();
   renderLogsFromBuffer();
 }
 function findNext() {
@@ -3908,7 +5457,7 @@ function downloadLogs() {
   const blob = new Blob([lines.join("\n")], {type: "text/plain"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a"); a.href = url;
-  a.download = `bridge-log-${new Date().toISOString().slice(0,10)}.txt`;
+  a.download = `${LOG_SOURCE || "bridge"}-log-${new Date().toISOString().slice(0,10)}.txt`;
   a.click();
   // v1.19: revokeObjectURL сразу после click() иногда не даёт
   // браузеру начать скачивание. Даём 1 секунду форы.
@@ -3916,36 +5465,61 @@ function downloadLogs() {
 }
 function scrollLogsToBottom() {
   userScrolledUp = false;
+  _logUiSave();
   logsEl.scrollTop = logsEl.scrollHeight;
   document.getElementById("scroll-down-btn").classList.remove("visible");
 }
 logsEl.addEventListener("scroll", () => {
   const atBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight < 50;
+  const prev = userScrolledUp;
   userScrolledUp = !atBottom;
+  // v1.23.8: сохраняем только при смене состояния.
+  if (prev !== userScrolledUp) _logUiSave();
   const btn = document.getElementById("scroll-down-btn");
   if (userScrolledUp) btn.classList.add("visible");
   else btn.classList.remove("visible");
 });
 
 let SSE_RECONNECT_DELAY = 3000;
+let LOG_SSE_ES = null;  // v1.21.4: текущий EventSource логов
 function connectSSE() {
+  // v1.21.4: закрываем предыдущий EventSource, чтобы не плодить
+  // соединения при переключении источника логов.
+  if (LOG_SSE_ES) {
+    try { LOG_SSE_ES.close(); } catch (e) {}
+    LOG_SSE_ES = null;
+  }
   const es = new EventSource(`/api/logs/stream?since=${lastSeq}&v=${Date.now()}`);
+  LOG_SSE_ES = es;
   es.onmessage = (e) => { try { const item = JSON.parse(e.data); if (item?.seq) appendLog(item); } catch {} };
-  es.onerror = () => { es.close(); SSE_RECONNECT_DELAY = Math.min(SSE_RECONNECT_DELAY * 2, 30000); setTimeout(connectSSE, SSE_RECONNECT_DELAY); };
+  es.onerror = () => {
+    es.close();
+    if (LOG_SSE_ES === es) LOG_SSE_ES = null;
+    SSE_RECONNECT_DELAY = Math.min(SSE_RECONNECT_DELAY * 2, 30000);
+    setTimeout(connectSSE, SSE_RECONNECT_DELAY);
+  };
   es.onopen = () => { SSE_RECONNECT_DELAY = 3000; };
 }
 async function loadLogHistory() {
   try {
-    const r = await fetch("/api/logs/history?tail=1000&v=" + Date.now());
+    const src = LOG_SOURCE || "bridge";
+    const r = await fetch(`/api/logs/history?tail=1000&source=${src}&v=${Date.now()}`);
     const data = await r.json();
+    // P1 1.22.0: дедупликация по seq, буфер не сбрасываем.
+    const existing = new Set(LOG_BUFFER.map(x => x.seq));
+    let maxSeq = 0;
     for (const item of (data.logs || [])) {
-      if (item.seq <= lastSeq) continue;
-      lastSeq = item.seq;
+      if (item.seq > maxSeq) maxSeq = item.seq;
+      if (existing.has(item.seq)) continue;
       LOG_BUFFER.push(item);
-      if (LOG_BUFFER.length > LOG_BUFFER_MAX) LOG_BUFFER.shift();
+    }
+    LOG_BUFFER.sort((a, b) => a.seq - b.seq);
+    if (LOG_BUFFER.length > LOG_BUFFER_MAX) {
+      LOG_BUFFER = LOG_BUFFER.slice(-LOG_BUFFER_MAX);
     }
     renderLogsFromBuffer();
-  } catch {}
+    return maxSeq;
+  } catch (e) { return 0; }
 }
 
 async function doCleanup() {
@@ -4779,30 +6353,76 @@ async function probeCurrentDevice() {
   }
 }
 
+// v1.23.0: прогресс probe с pending/ok/fail в заголовке + подсветка карточки
+let _probeStats = { pending: 0, ok: 0, fail: 0, total: 0 };
+
+function _updateProbeTitle() {
+  const title = document.getElementById("preview-title");
+  if (!title) return;
+  const s = _probeStats;
+  title.textContent = `Probe: ✅ ${s.ok} / ⏳ ${s.pending} / ❌ ${s.fail} / всего ${s.total}`;
+}
+
+function _setDeviceProbeClass(idx, cls) {
+  const card = document.querySelector(`.preview-device[data-idx="${idx}"]`);
+  if (!card) return;
+  card.classList.remove("probing", "probe-ok", "probe-fail");
+  if (cls) card.classList.add(cls);
+}
+
+function _setDeviceProbeStatus(idx, html) {
+  const el = document.querySelector(`.preview-probe-status[data-idx="${idx}"]`);
+  if (el) el.innerHTML = html;
+}
+
 async function probeAllInPreview() {
   const btn = document.getElementById("preview-probe-all-btn");
   const title = document.getElementById("preview-title");
   const oldTitle = title ? title.textContent : "";
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> probe…'; }
   const total = PREVIEW_DEVICES.length;
-  let okCount = 0, failCount = 0;
+  _probeStats = { pending: 0, ok: 0, fail: 0, total: total };
+  _updateProbeTitle();
   // v1.19: try/finally — иначе при синхронном исключении внутри
   // probeDeviceItem кнопка осталась бы навсегда «probe…».
+  // v1.22.1: параллельный probe — по 5 одновременно.
+  // v1.23.0: pending / ok / fail в заголовке, подсветка карточки.
   try {
-    for (let i = 0; i < total; i++) {
-      if (title) title.textContent = `Probe ${i+1}/${total}…`;
-      try {
-        await probeDeviceItem(PREVIEW_DEVICES[i], i);
-      } catch (e) {
-        console.error("probe item failed", e);
+    const CONCURRENCY = 5;
+    let idx = 0;
+    const runOne = async () => {
+      while (true) {
+        const my = idx++;
+        if (my >= total) return;
+        _setDeviceProbeStatus(my, '<span class="muted">⏳ в очереди</span>');
+        _setDeviceProbeClass(my, "probing");
+        _probeStats.pending++;
+        _updateProbeTitle();
+        try {
+          await probeDeviceItem(PREVIEW_DEVICES[my], my);
+        } catch (e) {
+          console.error("probe item failed", e);
+        }
+        _probeStats.pending--;
+        if (!PREVIEW_DEVICES[my].needs_probe) {
+          _probeStats.ok++;
+          _setDeviceProbeClass(my, "probe-ok");
+        } else {
+          _probeStats.fail++;
+          _setDeviceProbeClass(my, "probe-fail");
+        }
+        _updateProbeTitle();
+        setTimeout(() => _setDeviceProbeClass(my, ""), 2000);
       }
-      if (!PREVIEW_DEVICES[i].needs_probe) okCount++; else failCount++;
-    }
+    };
+    const workers = [];
+    for (let w = 0; w < Math.min(CONCURRENCY, total); w++) workers.push(runOne());
+    await Promise.allSettled(workers);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = "🔍 Probe все"; }
     if (!isMobile()) renderImportPreview();
     if (title) {
-      title.textContent = `Probe завершён: ✅ ${okCount} / ❌ ${failCount}`;
+      title.textContent = `Probe завершён: ✅ ${_probeStats.ok} / ❌ ${_probeStats.fail}`;
       setTimeout(() => { if (title) title.textContent = oldTitle; }, 5000);
     }
   }
@@ -5121,9 +6741,14 @@ function setToolsView(view) {
   TOOLS_VIEW = view;
   document.getElementById("tools-view-raw").classList.toggle("active", view === "raw");
   document.getElementById("tools-view-bydev").classList.toggle("active", view === "bydev");
+  document.getElementById("tools-view-audit").classList.toggle("active", view === "audit");
+  if (view === "audit") { loadAudit(); return; }
   renderTools();
 }
 function renderTools() {
+  // v1.23.7: если активна «История конфига», renderTools не должен
+  // переключать вид на «По устройствам» после loadConfig().
+  if (TOOLS_VIEW === "audit") { loadAudit(); return; }
   if (TOOLS_CONFIG === null) return;
   const container = document.getElementById("tools-container");
   if (TOOLS_VIEW === "raw") {
@@ -5225,7 +6850,8 @@ async function loadAnalytics() {
     LATENCY_DATA = data.latency || [];
     FLAPPER_DATA = data.flappers || [];
     renderLatencyTable(LATENCY_DATA);
-    renderFlappers(FLAPPER_DATA);
+    // v1.23.6: ограничиваем список мерцающих первыми 50 (топ по кол-ву).
+    renderFlappers(FLAPPER_DATA.slice(0, 50));
     renderTimeline(data.timeline || [], data.timeline_total || 0);
     const summaryEl = document.getElementById("activity-summary");
     if (summaryEl) summaryEl.textContent = "";
@@ -5240,7 +6866,7 @@ async function loadAnalytics() {
 function renderLatencyTable(devs) {
   const tb = document.getElementById("latency-body");
   if (!tb) return;
-  if (devs.length === 0) { tb.innerHTML = '<tr><td colspan="4" class="muted">Нет данных</td></tr>'; return; }
+  if (devs.length === 0) { tb.innerHTML = '<tr><td colspan="3" class="muted">Нет данных</td></tr>'; return; }
   const s = [...devs].sort((a, b) => {
     let av, bv;
     switch (LATENCY_SORT_KEY) {
@@ -5269,14 +6895,15 @@ function renderLatencyTable(devs) {
     const avg = d.avg_ms_24h;
     const cnt = d.latency_count || 0;
     const timeouts = d.latency_timeouts || 0;
+    // v1.23.6: плашка с мс сверху, счётчики — под ней.
     const avgHtml = (avg === null || avg === undefined)
       ? `<span class="latency lat-timeout">нет данных</span>`
       : `<span class="latency ${latencyClass(avg)}">${avg} ms</span>`;
+    const metaLine = `<div class="muted" style="font-size:11px; margin-top:2px;">за ${escapeHtml(periodLabel)} · ${cnt} замеров${timeouts > 0 ? ` · <span style="color:var(--red)">${timeouts} timeout</span>` : ""}</div>`;
+    const ipLine = d.ip ? `<div class="muted" style="font-size:11px; font-family:ui-monospace,monospace;">${escapeHtml(d.ip)}</div>` : "";
     return `<tr>
-      <td>${escapeHtml(d.friendly_name || d.name)}</td>
-      <td><code>${escapeHtml(d.ip || "—")}</code></td>
-      <td>${avgHtml}
-          <span class="muted" style="font-size:11px;">за ${escapeHtml(periodLabel)} (${cnt} замеров${timeouts > 0 ? `, ${timeouts} timeout` : ""})</span></td>
+      <td><div>${escapeHtml(d.friendly_name || d.name)}</div>${ipLine}</td>
+      <td>${avgHtml}${metaLine}</td>
       <td class="muted">${d.latency_ts ? fmtAgo(d.latency_ts) : "—"}</td>
     </tr>`;
   }).join("");
@@ -5290,22 +6917,27 @@ function renderFlappers(f) {
     if (FLAPPER_SORT_KEY === "dev") return (a.dev || "").localeCompare(b.dev || "") * FLAPPER_SORT_DIR;
     return ((a.flaps || 0) - (b.flaps || 0)) * FLAPPER_SORT_DIR;
   });
-  tb.innerHTML = s.map(x => `<tr><td>${escapeHtml(x.dev)}</td><td><strong>${x.flaps}</strong></td></tr>`).join("");
+  // v1.22.4: friendly_name + серое name
+  tb.innerHTML = s.map(x => `<tr><td>${deviceNameCell(x.dev)}</td><td><strong>${x.flaps}</strong></td></tr>`).join("");
 }
 
 function renderTimeline(t, total) {
   const list = document.getElementById("timeline-list");
   const counter = document.getElementById("timeline-count");
+  // v1.23.6: защита от тысяч записей — показываем максимум 50.
+  const LIMIT = 50;
+  const shown = (t || []).slice(0, LIMIT);
   if (counter) {
-    if (total && total > (t.length || 0)) counter.textContent = `показаны последние ${t.length} из ${total}`;
-    else if (t.length) counter.textContent = `всего: ${t.length}`;
+    if (total && total > shown.length) counter.textContent = `показаны ${shown.length} из ${total}`;
+    else if (shown.length) counter.textContent = `всего: ${shown.length}`;
     else counter.textContent = "";
   }
   if (!list) return;
-  if (t.length === 0) { list.innerHTML = '<div class="muted" style="padding:16px;">Нет событий</div>'; return; }
-  list.innerHTML = t.map(x => `<div class="timeline-item">
+  if (shown.length === 0) { list.innerHTML = '<div class="muted" style="padding:16px;">Нет событий</div>'; return; }
+  // v1.22.4: friendly_name + серое name
+  list.innerHTML = shown.map(x => `<div class="timeline-item">
     <span class="timeline-ts">${fmtDateTime(x.ts)}</span>
-    <span>${escapeHtml(x.dev)}</span>
+    <span>${deviceNameCell(x.dev)}</span>
     <span style="color:${x.status === "online" ? "var(--green)" : "var(--red)"};">${escapeHtml(x.status)}</span>
   </div>`).join("");
 }
@@ -5328,7 +6960,9 @@ function renderActivity(points) {
 
   const now = Math.floor(Date.now() / 1000);
   const tsEnd = now;
-  const tsStart = now - 24 * 3600;
+  // v1.22.7: округляем tsStart до целого часа, иначе первый/последний
+  // столбик/точка обрезается при now не ровно в :00 (M4 follow-up).
+  const tsStart = Math.floor((now - 24 * 3600) / 3600) * 3600;
   const tsSpan = tsEnd - tsStart;
 
   let pathOnline = "";
@@ -5400,7 +7034,9 @@ function renderFlapsChart(points) {
 
   const now = Math.floor(Date.now() / 1000);
   const tsEnd = now;
-  const tsStart = now - 24 * 3600;
+  // v1.22.7: округляем tsStart до целого часа, чтобы все hour_ts из БД
+  // (целые часы) попадали в [tsStart, tsEnd] (M4 follow-up).
+  const tsStart = Math.floor((now - 24 * 3600) / 3600) * 3600;
   const tsSpan = tsEnd - tsStart;
 
   const byHour = {};
@@ -5409,19 +7045,19 @@ function renderFlapsChart(points) {
   }
   const maxFlaps = Math.max(...Object.values(byHour), 1);
 
+  // v1.22.6: столбики рисуем по реальным ключам byHour,
+  // а не по фиксированным 24 часам. Раньше hourTs округлялся
+  // от tsStart=now-24ч, и при now не ровно в :00 столбики
+  // сдвигались/терялись.
   const barWidth = iw / 24;
   let bars = "";
   let totalFlaps = 0;
-  for (let i = 0; i < 24; i++) {
-    const hourTs = Math.floor((tsStart + i * 3600 + 1800) / 3600) * 3600;
-    let v = 0;
-    for (const k of Object.keys(byHour)) {
-      const kInt = parseInt(k, 10);
-      if (Math.abs(kInt - hourTs) < 1800) { v = byHour[k]; break; }
-    }
+  const sortedHours = Object.keys(byHour).map(k => parseInt(k, 10)).sort((a, b) => a - b);
+  for (const hTs of sortedHours) {
+    const v = byHour[hTs] || byHour[String(hTs)] || 0;
     totalFlaps += v;
     if (v === 0) continue;
-    const x = PAD.left + (i / 24) * iw;
+    const x = PAD.left + ((hTs - tsStart) / tsSpan) * iw;
     const h = (v / maxFlaps) * ih;
     const y = PAD.top + ih - h;
     bars += `<rect x="${(x + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${(barWidth - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="var(--yellow)" opacity="0.75" rx="1"/>`;
@@ -5457,6 +7093,211 @@ function renderFlapsChart(points) {
   }
 }
 
+// v1.21.2: health-widget
+let HEALTH_DETAIL_OPEN = false;
+
+function fmtUptimeShort(s) {
+  s = parseInt(s) || 0;
+  if (s <= 0) return "\u2014";
+  const d = Math.floor(s/86400); s %= 86400;
+  const h = Math.floor(s/3600);  s %= 3600;
+  const m = Math.floor(s/60);
+  if (d) return `${d}\u0434 ${h}\u0447`;
+  if (h) return `${h}\u0447 ${m}\u043c`;
+  return `${m}\u043c`;
+}
+
+async function refreshHealthWidget(force) {
+  const widget = document.getElementById("health-widget");
+  if (!widget) return;
+  try {
+    const r = await fetch("/api/health/full?_=" + Date.now());
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const h = await r.json();
+
+    document.getElementById("hw-bridge").textContent = "Bridge v" + (h.bridge?.version || "?");
+    document.getElementById("hw-webui").textContent = "WebUI v" + (h.webui?.version || "?");
+    const st = document.getElementById("hw-status");
+    const okBridge = h.bridge?.status === "online";
+    st.innerHTML = `<span class="dot ${okBridge ? "online" : "offline"}"></span>${okBridge ? "online" : "offline"}`;
+    st.className = okBridge ? "" : "hw-err";
+
+    const up = fmtUptimeShort(h.bridge?.uptime || 0);
+    const total = h.devices?.total || 0;
+    const online = h.devices?.online || 0;
+    const quietNow = h.quiet?.now || 0;
+    const cpu = h.webui?.cpu_pct;
+    const ram = h.webui?.rss_mb;
+    const cpuStr = (cpu !== null && cpu !== undefined) ? cpu + "%" : "\u2014";
+    const ramStr = (ram !== null && ram !== undefined) ? ram + "\u041c\u0411" : "\u2014";
+    // v1.23.0: на мобиле (hw-opt) скрываются uptime, quiet, cpu/ram.
+    // Остаётся: Bridge vX · ● online · N/M.
+    const quietHtml = quietNow > 0 ? `<span class="hw-quiet hw-opt">\ud83d\udd07 ${quietNow}</span>` : "";
+    document.getElementById("hw-rest").innerHTML =
+      `<span class="hw-sep hw-opt">\u00b7</span> <span class="hw-opt">${up}</span> ` +
+      `<span class="hw-sep">\u00b7</span> ${online}/${total} ` +
+      (quietHtml ? `<span class="hw-sep hw-opt">\u00b7</span> ${quietHtml} ` : "") +
+      `<span class="hw-sep hw-opt">\u00b7</span> <span class="hw-dim hw-opt">\u2699 ${cpuStr} / ${ramStr}</span>`;
+
+    // v1.23.8: рендерим деталку, если открыта ИЛИ принудительно.
+    if (HEALTH_DETAIL_OPEN || force) renderHealthDetail(h);
+  } catch (e) {
+    const st = document.getElementById("hw-status");
+    if (st) { st.textContent = "\u043e\u0448\u0438\u0431\u043a\u0430"; st.className = "hw-err"; }
+    const rest = document.getElementById("hw-rest");
+    if (rest) rest.innerHTML = "";
+    // v1.23.8: если деталка открыта — покажем ошибку.
+    if (HEALTH_DETAIL_OPEN || force) {
+      const el = document.getElementById("health-detail");
+      if (el) el.innerHTML = '<div class="hd-row"><span class="hd-key">\u2014</span>'
+                          + '<span style="color:var(--red)">ошибка: '
+                          + escapeHtml(e.message) + '</span></div>';
+    }
+  }
+}
+
+function renderHealthDetail(h) {
+  const el = document.getElementById("health-detail");
+  if (!el) return;
+  // v1.22.1: не сбиваем выделение, если пользователь копирует текст.
+  try {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+      const r = sel.getRangeAt(0);
+      if (el.contains(r.commonAncestorContainer)) return;
+    }
+  } catch (e) { /* ignore */ }
+  const w = h.webui || {}; const b = h.bridge || {}; const db = h.db || {};
+  const fmt = (v, suf) => (v === null || v === undefined) ? "\u2014" : (v + (suf || ""));
+  el.innerHTML = `
+    <div class="hd-row"><span class="hd-key">WebUI:</span>
+      <span>v${fmt(w.version)} \u00b7 CPU ${fmt(w.cpu_pct, "%")} \u00b7 RAM ${fmt(w.rss_mb, " \u041c\u0411")} \u00b7 threads ${fmt(w.threads)}</span></div>
+    <div class="hd-row"><span class="hd-key">Bridge:</span>
+      <span>v${fmt(b.version)} \u00b7 ${fmt(b.status)} \u00b7 uptime ${fmtUptimeShort(b.uptime)}</span></div>
+    <div class="hd-row"><span class="hd-key">Devices:</span>
+      <span>${h.devices?.online || 0}/${h.devices?.total || 0} online \u00b7 quiet: ${h.quiet?.total || 0} (\u0441\u0435\u0439\u0447\u0430\u0441 ${h.quiet?.now || 0})</span></div>
+    <div class="hd-row"><span class="hd-key">SQLite:</span>
+      <span>analytics.db ${fmt(db.size_mb, " \u041c\u0411")} \u00b7 status_events ${fmt(db.status_events)} \u00b7 latency ${fmt(db.latency_history)} \u00b7 state ${fmt(db.state_history)}</span></div>
+  `;
+}
+
+function toggleHealthDetail() {
+  const el = document.getElementById("health-detail");
+  const widget = document.getElementById("health-widget");
+  if (!el) return;
+  HEALTH_DETAIL_OPEN = !HEALTH_DETAIL_OPEN;
+  if (HEALTH_DETAIL_OPEN) {
+    el.style.display = "block";
+    // v1.23.8: показываем индикатор загрузки, потом обновляем.
+    el.innerHTML = '<div class="hd-row"><span class="hd-key">—</span>'
+                 + '<span class="muted">загрузка…</span></div>';
+    if (widget) widget.classList.add("hw-expanded");
+    // v1.23.8: фикс — при простое >30 сек деталка была пустой.
+    // Всегда дёргаем refreshHealthWidget(true).
+    refreshHealthWidget(true);
+  } else {
+    el.style.display = "none";
+    if (widget) widget.classList.remove("hw-expanded");
+  }
+}
+
+async function loadAudit() {
+  const c = document.getElementById("tools-container");
+  const info = document.getElementById("tools-info");
+  if (!c) return;
+  c.innerHTML = '<div class="muted" style="padding:16px;"><span class="spin"></span> \u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430\u2026</div>';
+  try {
+    const r = await fetch("/api/config/audit?limit=100&_=" + Date.now());
+    const data = await r.json();
+    const items = data.items || [];
+    if (info) info.textContent = `\u0417\u0430\u043f\u0438\u0441\u0435\u0439: ${items.length}`;
+    if (items.length === 0) {
+      c.innerHTML = '<div class="audit-empty">\u0418\u0441\u0442\u043e\u0440\u0438\u044f \u043f\u0443\u0441\u0442\u0430 \u2014 \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0439 \u043a\u043e\u043d\u0444\u0438\u0433\u0430 \u0447\u0435\u0440\u0435\u0437 WebUI \u0435\u0449\u0451 \u043d\u0435 \u0431\u044b\u043b\u043e.</div>';
+      return;
+    }
+    let html = '<div style="padding:0 16px 16px 16px;"><table class="audit-table"><thead><tr>'
+      + '<th style="width:160px;">\u0412\u0440\u0435\u043c\u044f</th>'
+      + '<th style="width:90px;">\u041e\u043f\u0435\u0440\u0430\u0446\u0438\u044f</th>'
+      + '<th style="width:180px;">\u0423\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u043e</th>'
+      + '<th>\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u044f</th>'
+      + '<th style="width:70px;">\u0421\u0442\u0430\u0442\u0443\u0441</th>'
+      + '</tr></thead><tbody>';
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const ts = new Date((it.ts || 0) * 1000).toLocaleString("ru-RU");
+      const op = it.op || "?";
+      const opCls = ["edit","delete","import"].includes(op) ? op : "edit";
+      const dev = it.device ? escapeHtml(it.device) : "\u2014";
+      let changes = "";
+      if (op === "edit" && it.changes) {
+        const keys = Object.keys(it.changes);
+        if (keys.length <= 3) {
+          changes = keys.map(k => {
+            const c2 = it.changes[k] || {};
+            return `${escapeHtml(k)}: ${escapeHtml(String(c2.old ?? "\u2014"))} \u2192 ${escapeHtml(String(c2.new ?? "\u2014"))}`;
+          }).join(" \u00b7 ");
+        } else {
+          changes = `\u0438\u0437\u043c\u0435\u043d\u0435\u043d\u043e: ${keys.length} \u043f\u043e\u043b\u0435\u0439`;
+        }
+      } else if (op === "import") {
+        changes = `+${it.added || 0} / ~${it.updated || 0} / skip ${it.skipped || 0}`;
+      } else if (op === "delete") {
+        changes = "\u0443\u0434\u0430\u043b\u0435\u043d\u043e \u0438\u0437 \u043a\u043e\u043d\u0444\u0438\u0433\u0430";
+      }
+      const okHtml = it.ok
+        ? '<span style="color:var(--green);">\u2705</span>'
+        : '<span style="color:var(--red);">\u274c</span>';
+      const rowCls = it.ok ? "" : "fail";
+      const detailJson = escapeHtml(JSON.stringify(it, null, 2));
+      html += `<tr class="${rowCls}" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'table-row' : 'none';">
+        <td>${ts}</td>
+        <td><span class="audit-op ${opCls}">${escapeHtml(op)}</span></td>
+        <td>${dev}</td>
+        <td>${changes || '<span class="muted">\u2014</span>'}</td>
+        <td>${okHtml}</td>
+      </tr>
+      <tr style="display:none;"><td colspan="5"><div class="audit-detail">${detailJson}</div></td></tr>`;
+    }
+    html += '</tbody></table></div>';
+    c.innerHTML = html;
+  } catch (e) {
+    c.innerHTML = `<div class="tools-error">\u274c \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u0438\u0441\u0442\u043e\u0440\u0438\u044e: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// v1.23.6: mobile-only раскладка тулбара логов.
+// На десктопе ничего не делает — только проставляет data-role,
+// которые используются в @media (max-width:700px).
+let _MOBILE_LOGS_LAYOUT_APPLIED = false;
+function applyMobileLogsLayout() {
+  if (_MOBILE_LOGS_LAYOUT_APPLIED) return;
+  const tb = document.querySelector(".logs-toolbar");
+  if (!tb) return;
+  // v1.23.7: роли — по id/классу, не по позиции (структура изменилась).
+  const set = (sel, role) => {
+    const el = tb.querySelector(sel);
+    if (el && !el.dataset.role) el.dataset.role = role;
+  };
+  set("#pause-btn", "pause");
+  set("#log-source-switch", "source");
+  set("#log-level-filter", "level");
+  set("#log-level-webui-wrap", "level");
+  set("#find-info", "info");
+  set(".logs-tb-search", "search");
+  set(".logs-download", "download");
+  // Роль range — только у диапазона ВНУТРИ row2-right.
+  const rangeGroup = tb.querySelector(".logs-toolbar-row2-right .time-btn-group");
+  if (rangeGroup && !rangeGroup.dataset.role) rangeGroup.dataset.role = "range";
+  // Подпись «Источник:»
+  const lbl = Array.from(tb.querySelectorAll("span.muted"))
+    .find(s => s.textContent.trim().startsWith("Источник"));
+  if (lbl && !lbl.dataset.role) lbl.dataset.role = "source-label";
+  _MOBILE_LOGS_LAYOUT_APPLIED = true;
+}
+applyMobileLogsLayout();
+// v1.24.2: убран resize-listener — applyMobileLogsLayout имеет
+// флаг _MOBILE_LOGS_LAYOUT_APPLIED, повторные вызовы ничего не делают.
+
 // Init
 detectView();
 loadCloudCreds();
@@ -5469,8 +7310,66 @@ if (VIEW === "import") {
   })();
 }
 fetchStatus();
-loadLogHistory().then(() => { setLogRange(LOG_RANGE_SECONDS); connectSSE(); });
+// P2 1.22.0: применяем LOG_SOURCE из localStorage к кнопкам при старте
+// v1.23.0: плашка «Все» для WebUI
+(function() {
+  document.querySelectorAll(".log-source-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.src === LOG_SOURCE);
+  });
+  const lvlWrap = document.getElementById("log-level-filter");
+  const lvlWrapWebUI = document.getElementById("log-level-webui-wrap");
+  // v1.23.7: WebUI-уровень — «Уровень: [Все]», как у Bridge.
+  if (LOG_SOURCE === "bridge") {
+    if (lvlWrap) lvlWrap.classList.remove("hidden");
+    if (lvlWrapWebUI) lvlWrapWebUI.classList.add("hidden");
+    // v1.24.3: при старте подтягиваем сохранённый уровень Bridge
+    // и подсвечиваем активную кнопку уровня.
+    LOG_LEVEL_FILTER = _LAST_BRIDGE_LEVEL || "INFO";
+    document.querySelectorAll(".logs-toolbar button[data-level]").forEach(b => {
+      b.classList.toggle("active", b.dataset.level === LOG_LEVEL_FILTER);
+    });
+  } else {
+    if (lvlWrap) lvlWrap.classList.add("hidden");
+    if (lvlWrapWebUI) lvlWrapWebUI.classList.remove("hidden");
+    LOG_LEVEL_FILTER = "DEBUG";
+  }
+})();
+loadLogHistory().then((maxSeq) => {
+  if (maxSeq > lastSeq) lastSeq = maxSeq;
+  // v1.22.1: защита от backlog при пустом буфере
+  if (lastSeq <= 0) lastSeq = 1;
+  setLogRange(LOG_RANGE_SECONDS);
+  connectSSE();
+});
+// v1.23.8: восстанавливаем UI лог-панели из sessionStorage.
+(function restoreLogUiState() {
+  if (SEARCH_TERM) {
+    const inp = document.getElementById("log-search");
+    if (inp) inp.value = SEARCH_TERM;
+    doSearch();
+  }
+  if (logPaused) {
+    const btn = document.getElementById("pause-btn");
+    if (btn) {
+      btn.textContent = "▶ Продолжить";
+      btn.classList.add("active");
+    }
+    if (!document.getElementById("logs-paused-banner")) {
+      const b = document.createElement("div");
+      b.id = "logs-paused-banner";
+      b.className = "logs-paused-banner";
+      b.textContent = "⏸ Логи на паузе — новые записи не отображаются";
+      logsEl.parentNode.insertBefore(b, logsEl);
+    }
+  }
+  if (userScrolledUp) {
+    const sb = document.getElementById("scroll-down-btn");
+    if (sb) sb.classList.add("visible");
+  }
+})();
 setInterval(fetchStatus, 5000);
+refreshHealthWidget();
+setInterval(refreshHealthWidget, 30000);
 if (VIEW === "analytics" && ANALYTICS_ENABLED) {
   setLatencyPeriod(LATENCY_PERIOD);
   loadAnalytics();
@@ -5480,6 +7379,187 @@ if (VIEW === "analytics" && ANALYTICS_ENABLED) {
 </body>
 </html>
 """
+
+
+# ==================== HEALTH / AUDIT (v1.21.2) ====================
+_config_audit_lock = threading.Lock()
+
+
+def audit_init():
+    """Создать пустой config_audit.log, если нет."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_AUDIT_FILE) or ".", exist_ok=True)
+        if not os.path.exists(CONFIG_AUDIT_FILE):
+            open(CONFIG_AUDIT_FILE, "w", encoding="utf-8").close()
+            log.info(f"[Audit] Создан пустой {CONFIG_AUDIT_FILE}")
+    except Exception as e:
+        log.warning(f"[Audit] init: {e}")
+
+
+def audit_log(op, device=None, changes=None, ok=True, error=None, extra=None):
+    """Записать событие в config_audit.log (JSONL)."""
+    try:
+        entry = {"ts": int(time.time()), "op": op, "ok": bool(ok)}
+        if device:
+            entry["device"] = device
+        if changes:
+            entry["changes"] = changes
+        if error:
+            entry["error"] = str(error)
+        if extra and isinstance(extra, dict):
+            entry.update(extra)
+        line = json.dumps(entry, ensure_ascii=False)
+        with _config_audit_lock:
+            rotation_failed = False
+            try:
+                if (os.path.exists(CONFIG_AUDIT_FILE)
+                        and os.path.getsize(CONFIG_AUDIT_FILE) > AUDIT_MAX_BYTES):
+                    for i in range(AUDIT_BACKUPS, 0, -1):
+                        src = f"{CONFIG_AUDIT_FILE}.{i}" if i > 1 else CONFIG_AUDIT_FILE
+                        dst = f"{CONFIG_AUDIT_FILE}.{i}"
+                        if i == AUDIT_BACKUPS and os.path.exists(dst):
+                            os.unlink(dst)
+                        if os.path.exists(src):
+                            if os.path.exists(dst):
+                                os.unlink(dst)
+                            os.replace(src, dst)
+            except Exception as e:
+                # v1.22.6: если ротация упала — НЕ пишем в исходный файл,
+                # иначе он растёт без ограничений. Логируем и выходим.
+                rotation_failed = True
+                log.error(f"[Audit] rotate FAILED — запись пропущена: {e}")
+            if not rotation_failed:
+                with open(CONFIG_AUDIT_FILE, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+    except Exception as e:
+        log.warning(f"[Audit] write: {e}")
+
+
+def audit_read(limit=100):
+    """Прочитать последние N записей (свежие сверху)."""
+    try:
+        if not os.path.exists(CONFIG_AUDIT_FILE):
+            return []
+        # P2 1.22.0: deque(maxlen) — не грузим весь файл
+        with open(CONFIG_AUDIT_FILE, "r", encoding="utf-8") as f:
+            lines = deque(f, maxlen=limit)
+        items = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except Exception:
+                continue
+        items.reverse()
+        return items
+    except Exception as e:
+        log.warning(f"[Audit] read: {e}")
+        return []
+
+
+_health_last_flush = [0, 0, 0]
+_health_lock = threading.Lock()
+
+
+def _proc_self_stats():
+    """CPU% и RSS текущего процесса (WebUI)."""
+    result = {"cpu_pct": None, "rss_mb": None, "threads": None}
+    try:
+        with open("/proc/self/stat", "r") as f:
+            parts = f.read().split()
+        if len(parts) > 15:
+            utime = int(parts[13]); stime = int(parts[14])
+            threads = int(parts[19]) if len(parts) > 19 else None
+            result["threads"] = threads
+            now = time.time()
+            total_ticks = utime + stime
+            # P2 1.22.0: критическая секция под _health_lock
+            with _health_lock:
+                prev = tuple(_health_last_flush)
+                if prev[1] > 0:
+                    dt = now - prev[1]
+                    dticks = total_ticks - prev[0]
+                    if dt > 0:
+                        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+                        result["cpu_pct"] = round((dticks / hz) / dt * 100, 1)
+                _health_last_flush[0] = total_ticks
+                _health_last_flush[1] = now
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    result["rss_mb"] = round(kb / 1024, 1)
+                    break
+    except Exception:
+        pass
+    return result
+
+
+def _db_stats():
+    """Размер БД и количество строк в таблицах."""
+    out = {"size_mb": None, "status_events": None,
+           "latency_history": None, "state_history": None}
+    try:
+        if os.path.exists(DB_FILE):
+            out["size_mb"] = round(os.path.getsize(DB_FILE) / (1024 * 1024), 2)
+    except Exception:
+        pass
+    with _db_lock:
+        if _db_conn is None:
+            return out
+        try:
+            if STATUS_HISTORY_ENABLED:
+                out["status_events"] = _db_conn.execute(
+                    "SELECT COUNT(*) FROM status_events").fetchone()[0]
+                out["latency_history"] = _db_conn.execute(
+                    "SELECT COUNT(*) FROM latency_history").fetchone()[0]
+            if ANALYTICS_ENABLED:
+                out["state_history"] = _db_conn.execute(
+                    "SELECT COUNT(*) FROM state_history").fetchone()[0]
+        except Exception:
+            pass
+    return out
+
+
+def collect_health():
+    """Собрать health-инфо для /api/health/full."""
+    proc = _proc_self_stats()
+    db = _db_stats()
+    with STATE_LOCK:
+        bridge_status = STATE["bridge_status"]
+        bridge_uptime = STATE["uptime"]
+        bridge_version = STATE["version"]
+        total = len(STATE["devices"])
+        online = sum(1 for d in STATE["devices"].values() if d.get("status") == "online")
+        names = list(STATE["devices"].keys())
+    with QUIET_LOCK:
+        quiet_total = len([n for n in QUIET_CONFIG if QUIET_CONFIG[n].get("windows")])
+    quiet_now = 0
+    for n in names:
+        if is_quiet_now(n):
+            quiet_now += 1
+    return {
+        "webui": {
+            "version": WEBUI_VERSION,
+            "cpu_pct": proc["cpu_pct"],
+            "rss_mb": proc["rss_mb"],
+            "threads": proc["threads"],
+        },
+        "bridge": {
+            "version": bridge_version,
+            "status": bridge_status,
+            "uptime": bridge_uptime,
+        },
+        "devices": {"total": total, "online": online},
+        "quiet": {"total": quiet_total, "now": quiet_now},
+        "db": db,
+        "last_flush_sec": None,
+    }
 
 
 def render_html():
@@ -5519,6 +7599,56 @@ class WebUIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # v1.24.5: PWA — SVG-иконка 🌉 + manifest.json.
+    # Отдаются из Python-строк, никаких внешних файлов.
+    _PWA_SVG_ICON = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'>"
+        "<rect width='512' height='512' rx='96' fill='#0d1117'/>"
+        "<text x='256' y='256' font-size='330' text-anchor='middle'"
+        " dominant-baseline='central'>\U0001F309</text>"
+        "</svg>"
+    )
+
+    def _send_favicon_svg(self):
+        body = self._PWA_SVG_ICON.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_manifest(self):
+        import base64 as _b64
+        svg_b64 = _b64.b64encode(self._PWA_SVG_ICON.encode("utf-8")).decode("ascii")
+        icon_data = "data:image/svg+xml;base64," + svg_b64
+        manifest = {
+            "name": "Tuya Bridge",
+            "short_name": "Tuya",
+            "description": "Tuya Bridge — локальное управление устройствами",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "any",
+            "background_color": "#0d1117",
+            "theme_color": "#0d1117",
+            "icons": [
+                {"src": icon_data, "sizes": "192x192",
+                 "type": "image/svg+xml", "purpose": "any"},
+                {"src": icon_data, "sizes": "512x512",
+                 "type": "image/svg+xml", "purpose": "any"},
+                {"src": icon_data, "sizes": "512x512",
+                 "type": "image/svg+xml", "purpose": "maskable"},
+            ],
+        }
+        body = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/manifest+json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_body(self):
         try:
             cl = int(self.headers.get("Content-Length", 0))
@@ -5534,6 +7664,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path); path = parsed.path; qs = parse_qs(parsed.query)
+
+        if path == "/manifest.json":
+            self._send_manifest()
+            return
+        if path == "/favicon.svg":
+            self._send_favicon_svg()
+            return
 
         if path == "/":
             self._send_html(200, render_html())
@@ -5556,6 +7693,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
             payload = {"status": "ok" if st == "online" else "unhealthy", "bridge": st,
                        "analytics": ANALYTICS_ENABLED, "status_history": STATUS_HISTORY_ENABLED}
             self._send_json(200 if st == "online" else 503, payload)
+            return
+
+        if path == "/api/health/full":
+            try:
+                self._send_json(200, collect_health())
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": str(e)})
             return
 
         if path == "/api/status":
@@ -5584,9 +7728,24 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         "last_seen": info.get("last_seen"),
                         "latency_ms": info.get("latency_ms"), "latency_ts": info.get("latency_ts"),
                         "cache": info.get("cache", {}), "history": [],
+                        "quiet": is_quiet_now(name),
+                        "quiet_until": quiet_until_ts(name),
+                        "quiet_windows": (QUIET_CONFIG.get(name, {}) or {}).get("windows", []),
                     })
-            status["devices"].sort(key=lambda d: d["friendly_name"].lower())
+            # v1.22.1: безопасный sort по friendly_name (str + fallback)
+            status["devices"].sort(
+                key=lambda d: str(d.get("friendly_name") or d.get("name") or "").lower())
             self._send_json(200, status)
+            return
+
+        if path == "/api/config/audit":
+            try:
+                limit = int(qs.get("limit", ["100"])[0])
+                if limit < 1: limit = 100
+                if limit > 1000: limit = 1000
+            except Exception:
+                limit = 100
+            self._send_json(200, {"ok": True, "items": audit_read(limit)})
             return
 
         if path == "/api/config/raw":
@@ -5713,29 +7872,54 @@ class WebUIHandler(BaseHTTPRequestHandler):
             if latency_seconds < 0:
                 latency_seconds = 0
             meta_snap = snapshot_device_meta()
+            # P1 1.22.0: снимок под локом, SQL — вне лока.
             with STATE_LOCK:
-                latency = []
-                for name, info in STATE["devices"].items():
-                    m = meta_snap.get(name, {})
-                    avg_data = db_query_avg_latency(name, latency_seconds)
-                    latency.append({
-                        "name": name,
-                        "friendly_name": m.get("friendly_name", name),
-                        "ip": m.get("ip", ""),
-                        "latency_ms": info.get("latency_ms"),
-                        "latency_ts": info.get("latency_ts"),
-                        "avg_ms_24h": (avg_data or {}).get("avg"),
-                        "latency_count": (avg_data or {}).get("count", 0),
-                        "latency_timeouts": (avg_data or {}).get("timeouts", 0),
-                    })
-            timeline = db_query_timeline(24, 500)
+                info_snap = {
+                    n: {"latency_ms": i.get("latency_ms"),
+                        "latency_ts": i.get("latency_ts")}
+                    for n, i in STATE["devices"].items()
+                }
+            latency = []
+            for name, info in info_snap.items():
+                m = meta_snap.get(name, {})
+                avg_data = db_query_avg_latency(name, latency_seconds)
+                latency.append({
+                    "name": name,
+                    "friendly_name": m.get("friendly_name", name),
+                    "ip": m.get("ip", ""),
+                    "latency_ms": info.get("latency_ms"),
+                    "latency_ts": info.get("latency_ts"),
+                    "avg_ms_24h": (avg_data or {}).get("avg"),
+                    "latency_count": (avg_data or {}).get("count", 0),
+                    "latency_timeouts": (avg_data or {}).get("timeouts", 0),
+                })
+            # v1.21.0: quiet hours — исключаем устройства в окне/grace
+            def _is_quiet_or_grace(n):
+                if is_quiet_now(n):
+                    return True
+                return quiet_until_ts(n) > int(time.time())
+            quiet_names = set()
+            with STATE_LOCK:
+                all_names = list(STATE["devices"].keys())
+            for n in all_names:
+                if _is_quiet_or_grace(n):
+                    quiet_names.add(n)
+            timeline_raw = db_query_timeline(24, 500)
+            timeline = [x for x in timeline_raw if x.get("dev") not in quiet_names]
             timeline_total = db_query_timeline_total(24)
+            # v1.22.5: min_flaps 3 → 1, чтобы список «Мерцающие
+            # устройства» совпадал с графиком «Мерцания по часам».
+            flappers_raw = db_query_flappers(24, 1)
+            flappers = [x for x in flappers_raw if x.get("dev") not in quiet_names]
+            # v1.22.3: график мерцаний фильтруется так же, как список flappers —
+            # иначе в «Мерцающих устройствах (24ч)» пусто, а на графике столбики.
+            flaps_hourly = _db_query_flaps_hourly_excluding(24, quiet_names)
             self._send_json(200, {
                 "activity": db_query_hourly(24),
-                "flaps_hourly": db_query_flaps_hourly(24),
+                "flaps_hourly": flaps_hourly,
                 "timeline": timeline,
                 "timeline_total": timeline_total,
-                "flappers": db_query_flappers(24, 3),
+                "flappers": flappers,
                 "latency": latency,
                 "latency_seconds": latency_seconds,
             })
@@ -5743,7 +7927,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
 
         if path == "/api/logs/history":
             tail = int(qs.get("tail", ["1000"])[0])
-            with _log_buffer_lock: items = list(_log_buffer)[-tail:]
+            src = qs.get("source", ["all"])[0]
+            with _log_buffer_lock:
+                if src in ("bridge", "webui"):
+                    items_all = [x for x in _log_buffer if x.get("source") == src]
+                else:
+                    items_all = list(_log_buffer)
+            items = items_all[-tail:]
             self._send_json(200, {"logs": items})
             return
 
@@ -5938,6 +8128,40 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": str(e)})
             return
 
+        dev = self._parse_dev_path(path, "/quiet")
+        if dev is not None:
+            if body is None or "windows" not in body:
+                self._send_json(400, {"ok": False, "error": "windows required"})
+                return
+            windows_in = body.get("windows") or []
+            if not isinstance(windows_in, list):
+                self._send_json(400, {"ok": False, "error": "windows must be list"})
+                return
+            parsed = []
+            for w in windows_in:
+                if not isinstance(w, dict):
+                    continue
+                f_, t_ = w.get("from"), w.get("to")
+                if _quiet_parse_hm(f_) is None or _quiet_parse_hm(t_) is None:
+                    self._send_json(400, {"ok": False, "error": f"invalid time: {f_}-{t_}"})
+                    return
+                if f_ == t_:
+                    self._send_json(400, {"ok": False, "error": f"from == to: {f_}"})
+                    return
+                parsed.append({"from": f_, "to": t_})
+            with QUIET_LOCK:
+                new_cfg = dict(QUIET_CONFIG)
+            if parsed:
+                new_cfg[dev] = {"windows": parsed}
+            else:
+                new_cfg.pop(dev, None)
+            ok, err = quiet_save(new_cfg)
+            if ok:
+                self._send_json(200, {"ok": True, "windows": parsed})
+            else:
+                self._send_json(500, {"ok": False, "error": err})
+            return
+
         dev = self._parse_dev_path(path, "/config")
         if dev is not None:
             if not body or "changes" not in body:
@@ -5950,6 +8174,16 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 with DEVICE_META_LOCK:
                     if dev in DEVICE_META:
                         DEVICE_META[dev].update(body["changes"])
+                try:
+                    meta_before = dict(DEVICE_META.get(dev, {}))
+                    changes_for_audit = {}
+                    for k, v in (body.get("changes") or {}).items():
+                        old_v = meta_before.get(k) if k != "local_key" else "***"
+                        new_v = "***" if k == "local_key" else v
+                        changes_for_audit[k] = {"old": old_v, "new": new_v}
+                    audit_log("edit", device=dev, changes=changes_for_audit, ok=True)
+                except Exception:
+                    pass
                 self._send_json(200, {"ok": True})
             else:
                 raw_err = result.get("error", "unknown")
@@ -5972,6 +8206,10 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 with _last_snapshot_lock:
                     for k in [k for k in _last_snapshot if k[0] == dev]:
                         _last_snapshot.pop(k, None)
+                try:
+                    audit_log("delete", device=dev, ok=True)
+                except Exception:
+                    pass
                 self._send_json(200, {"ok": True})
             else:
                 self._send_json(400, {"ok": False, "error": result.get("error", "unknown")})
@@ -6022,7 +8260,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
             if not aid or not asec:
                 self._send_json(400, {"ok": False, "error": "creds required"})
                 return
-            result = tuya_cloud_fetch(aid, asec, region, fetch_mappings=True)
+            # v1.22.6: оборачиваем в поток с таймаутом 60 сек —
+            # иначе при недоступном Tuya Cloud воркер висит вечно.
+            result = _cloud_fetch_with_timeout(aid, asec, region, fetch_mappings=True)
             if not result["ok"]:
                 self._send_json(400, {"ok": False, "error": result.get("error")})
                 return
@@ -6057,6 +8297,16 @@ class WebUIHandler(BaseHTTPRequestHandler):
                                    timeout=IMPORT_TIMEOUT_WAIT + 5)
             if result.get("ok"):
                 load_device_meta()
+                try:
+                    names_imported = [d.get("name") for d in devices if isinstance(d, dict) and d.get("name")]
+                    audit_log("import", ok=True, extra={
+                        "added": result.get("added", 0),
+                        "updated": result.get("updated", 0),
+                        "skipped": result.get("skipped", 0),
+                        "devices": names_imported[:50],
+                    })
+                except Exception:
+                    pass
                 self._send_json(200, {"ok": True, "added": result.get("added", 0),
                                       "updated": result.get("updated", 0),
                                       "skipped": result.get("skipped", 0),
@@ -6132,8 +8382,14 @@ def main():
     if not HAS_YAML: log.warning("[tuya-local] pyyaml не установлен — YAML-обогащение отключено")
     db_init()
     load_device_meta()
+    quiet_load()
+    _check_tz_for_quiet()
+    audit_init()
     _read_initial_log()
-    threading.Thread(target=_log_tailer, daemon=True, name="log-tailer").start()
+    threading.Thread(target=_log_tailer, args=(LOG_FILE, "bridge"),
+                     daemon=True, name="log-tailer-bridge").start()
+    threading.Thread(target=_log_tailer, args=(LOG_FILE_WEBUI, "webui"),
+                     daemon=True, name="log-tailer-webui").start()
     if STATUS_HISTORY_ENABLED or ANALYTICS_ENABLED:
         threading.Thread(target=db_worker, daemon=True, name="db-worker").start()
     threading.Thread(target=latency_worker, daemon=True, name="latency").start()

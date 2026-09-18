@@ -3,13 +3,13 @@
 Локальный мост Tuya-устройств в Home Assistant через MQTT. Работает **без Tuya Cloud** — всё общение с устройствами идёт по локальной сети через `tinytuya`. Автоматически создаёт сущности в HA через MQTT Discovery.
 
 ![version](https://img.shields.io/badge/bridge-1.8.4-blue)
-![webui](https://img.shields.io/badge/webui-1.20.1-blue)
+![webui](https://img.shields.io/badge/webui-1.24.5-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 ## История возникновения и предпосылки
 
-Долгое время я использовал свой HA в купе с [tuya-local](https://github.com/make-all/tuya-local), но начиная с версии 2026.3.3 появились постоянные отвалы и залипания устройств, шло время версии менялись, но проблема так и не была решена. Я решил создать свой mqtt мост для управленяи своими устройствами локально и держать все под своим контролем. На данный момент проект полностью стабилен и каких то особых дополнительных фич не планирууется. Единственное что не доделано это управление рулонными шторами и вентиляторами т.к их у меня нет.
+Долгое время я использовал свой HA в купе с [tuya-local](https://github.com/make-all/tuya-local), но начиная с версии 2026.3.3 появились постоянные отвалы и залипания устройств, шло время версии менялись, но проблема так и не была решена. Я решил создать свой mqtt мост для управления своими устройствами локально и держать все под своим контролем. На данный момент проект полностью стабилен и каких-то особых дополнительных фич не планируется. Единственное что не доделано — управление рулонными шторами и вентиляторами, т.к. их у меня нет.
 
 Проект был собран специально как монолит по сути в 2 файлах и около 10 000 строк.
 Исключительно на русском языке.
@@ -44,9 +44,8 @@ nano .env  # отредактируйте TZ и если нужно WEB порт
 или
 - Внести данные в `./data/config/devices_config.json`:
 
-
-  **Где взять `local_key`?**
-- [Tuya Cloud](https://iot.tuya.com) → Project → Devices → Local key  
+**Где взять `local_key`?**
+- [Tuya Cloud](https://iot.tuya.com) → Project → Devices → Local key
 
 Пример
 ```json
@@ -64,17 +63,17 @@ nano .env  # отредактируйте TZ и если нужно WEB порт
     "enabled": true,
     "dps_map": {
       "20": { "component": "switch", "name": "switch_led" },
-      "22": { 
-        "component": "number", 
-        "name": "bright_value", 
-        "min": 10, 
+      "22": {
+        "component": "number",
+        "name": "bright_value",
+        "min": 10,
         "max": 1000,
         "unit_of_measurement": "%"
       },
-      "23": { 
-        "component": "number", 
-        "name": "temp_value", 
-        "kelvin_min": 2700, 
+      "23": {
+        "component": "number",
+        "name": "temp_value",
+        "kelvin_min": 2700,
         "kelvin_max": 6500
       }
     }
@@ -121,13 +120,12 @@ nano .env  # отредактируйте TZ и если нужно WEB порт
 | `enabled` | — | `false` чтобы пропустить (default: `true`) |
 | `dps_map` | ✅ | Маппинг DP → сущности HA |
 
-
-
 ### 3. Запуск
 
 ```bash
 docker compose up -d
 ```
+
 ## Полезные команды
 
 ```bash
@@ -185,7 +183,7 @@ docker compose down                     # Остановить
 - **Дашборд** — устройства
 - **Аналитика** — задержка, хронология, мерцания, активность, **логи**
 - **Импорт устройств** — Cloud + скан сети + локальные базы DP
-- **Инструменты** — read-only просмотр `devices_config.json`
+- **Инструменты** — read-only просмотр `devices_config.json` + **История конфига**
 
 
 ## Архитектура
@@ -213,14 +211,17 @@ docker compose down                     # Остановить
               └──────────────────────┘
 
 Shared volumes:
-  config/devices_config.json          — общий (backend: rw, webui: ro)
+  config/devices_config.json   — общий (backend: rw, webui: ro)
   logs/bridge.log              — backend пишет, webui читает
   state/state_cache.json       — только backend
-  state/              		   — только webui:
+  state/                       — webui_state (backend-agnostic):
     analytics.db
     tinytuya_devices.json
     tuya_cloud_cache.json
+    quiet_hours.json           — v1.21.0
+    config_audit.log           — v1.21.2
     tuya-local-db/
+    logs/webui.log             — v1.21.3
 ```
 ---
 
@@ -232,6 +233,7 @@ Shared volumes:
 - Падение WebUI не влияет на мост. Рестарт моста не роняет WebUI.
 - **Tuya-устройства не терпят два TCP-соединения** — WebUI использует **только ICMP ping** для latency, без TCP-connect к порту 6668.
 - **Cloud-кэш и tuya-local** живут на сервере (`webui_state/`), не в браузере.
+- **Режим тишины (Quiet Hours)** — v1.21.0, только на уровне WebUI. Bridge не дорабатывался.
 
 
 ## Требования
@@ -244,6 +246,8 @@ Shared volumes:
 - **Docker**  и **Docker Compose**
 - **iputils-ping** — для WebUI (ICMP latency)
 - **CAP_NET_RAW** — для WebUI-контейнера (для native ICMP ping)
+- **pyyaml** — для tuya-local парсинга (в WebUI-контейнере)
+- **curl** — для скачивания tuya-local базы (в WebUI-контейнере)
 
 ### Home Assistant
 
@@ -290,32 +294,38 @@ HA автоматически подхватит Discovery-топики и со�
 | `SCAN_TIMEOUT` | `0.3` | Таймаут TCP-connect на 6668 |
 | `LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
 
-### Настройки в `webui.py` (WebUI v1.20.1)
+### Настройки в `webui.py` (WebUI v1.24.5)
 
-| Параметр | Default | Описание                                                         |
-|---|---|------------------------------------------------------------------|
-| `WEBUI_PORT` | `5386` | HTTP-порт                                                        |
-| `WEBUI_HOST` | `0.0.0.0` | HTTP-хост                                                        |
-| `ANALYTICS_ENABLED` | `True` | Полная аналитика                                                 |
-| `STATUS_HISTORY_ENABLED` | `True` | Минимальная история в ммодалке устрйоства                        |
+| Параметр | Default | Описание |
+|---|---|---|
+| `WEBUI_PORT` | `5386` | HTTP-порт |
+| `WEBUI_HOST` | `0.0.0.0` | HTTP-хост |
+| `ANALYTICS_ENABLED` | `True` | Полная аналитика |
+| `STATUS_HISTORY_ENABLED` | `True` | Минимальная история в модалке устройства |
 | `BRIDGE_STARTUP_GRACE_SEC` | `60` | Игнор online/offline первые N сек после старта bridge (v1.18.9+) |
-| `LATENCY_INTERVAL` | `900` | Замер latency (15 минут)                                         |
-| `LATENCY_INITIAL_DELAY` | `5` | Первый замер через 5 сек                                         |
-| `LATENCY_PING_TIMEOUT` | `1` | Таймаут одной попытки ping (сек)                                 |
-| `LATENCY_RETRY_COUNT` | `3` | Кол-во попыток при timeout (v1.18.5+)                            |
-| `LATENCY_RETRY_DELAY` | `10` | Пауза между retry (сек)                                          |
-| `LATENCY_RETRY_WORKERS` | `10` | Параллельных retry (ThreadPoolExecutor)                          |
-| `RETENTION_DAYS` | `3` | Хранение истории в SQLite                                        |
-| `SNAPSHOT_INTERVAL` | `60` | Мин. интервал между снапшотами                                   |
-| `FLUSH_INTERVAL` | `30` | Запись буфера в SQLite                                           |
-| `SSE_MAX_SUBSCRIBERS` | `50` | Лимит SSE-подписчиков                                            |
-| `SSE_IDLE_TIMEOUT` | `60` | Таймаут неактивного SSE                                          |
-| `EDIT_TIMEOUT_WAIT` | `20` | Таймаут MQTT-ответа edit_config (сек)                            |
-| `DELETE_TIMEOUT_WAIT` | `20` | Таймаут delete_device (сек)                                      |
-| `IMPORT_TIMEOUT_WAIT` | `30` | Таймаут import_devices (сек)                                     |
-| `SCAN_TIMEOUT_WAIT` | `30` | Таймаут scan_network (сек)                                       |
-| `SAFE_PORTS` | см. файл | Порты для WebUI-скана                                            |
-| `MAC_VENDOR_MAP` | см. файл | Префиксы MAC → вендор                                            |
+| `QUIET_GRACE_SEC` | `120` | Grace после окна тишины (v1.21.0+) |
+| `LATENCY_INTERVAL` | `900` | Замер latency (15 минут) |
+| `LATENCY_INITIAL_DELAY` | `5` | Первый замер через 5 сек |
+| `LATENCY_PING_TIMEOUT` | `1` | Таймаут одной попытки ping (сек) |
+| `LATENCY_RETRY_COUNT` | `3` | Кол-во попыток при timeout (v1.18.5+) |
+| `LATENCY_RETRY_DELAY` | `10` | Пауза между retry (сек) |
+| `LATENCY_RETRY_WORKERS` | `10` | Параллельных retry (ThreadPoolExecutor) |
+| `CLOUD_FETCH_TIMEOUT` | `60` | Таймаут Cloud-запросов (v1.22.6+) |
+| `AUDIT_MAX_BYTES` | `5*1024*1024` | Размер `config_audit.log` (v1.22.0+) |
+| `AUDIT_BACKUPS` | `3` | Бэкапов аудита (v1.22.0+) |
+| `LOG_FILE_MAX_BYTES_WEBUI` | `5*1024*1024` | Размер `logs/webui.log` (v1.21.3+) |
+| `LOG_FILE_BACKUPS_WEBUI` | `2` | Бэкапов webui-лога (v1.21.3+) |
+| `RETENTION_DAYS` | `3` | Хранение истории в SQLite |
+| `SNAPSHOT_INTERVAL` | `60` | Мин. интервал между снапшотами |
+| `FLUSH_INTERVAL` | `30` | Запись буфера в SQLite |
+| `SSE_MAX_SUBSCRIBERS` | `50` | Лимит SSE-подписчиков |
+| `SSE_IDLE_TIMEOUT` | `180` | Таймаут неактивного SSE (v1.22.1+) |
+| `EDIT_TIMEOUT_WAIT` | `20` | Таймаут MQTT-ответа edit_config (сек) |
+| `DELETE_TIMEOUT_WAIT` | `20` | Таймаут delete_device (сек) |
+| `IMPORT_TIMEOUT_WAIT` | `30` | Таймаут import_devices (сек) |
+| `SCAN_TIMEOUT_WAIT` | `30` | Таймаут scan_network (сек) |
+| `SAFE_PORTS` | см. файл | Порты для WebUI-скана |
+| `MAC_VENDOR_MAP` | см. файл | Префиксы MAC → вендор |
 
 
 ### DEBUG-флаги (Bridge)
@@ -331,6 +341,45 @@ DEBUG_MQTT_CMD = 0         # логировать входящие команд�
 
 ## Возможности фронта
 
+### Общее (v1.24.5)
+
+**UI (ПК):**
+- Кнопка темы (☀️/🌙) прижата вправо в шапке (v1.23.8)
+- Вкладки — вторая строка, под заголовком (v1.23.8)
+- Health-бадж длинный: `Bridge vX · WebUI vX · uptime · online · N/M · quiet · cpu/ram`. Короткий — только на мобиле (v1.23.9)
+- Лог-тулбар в две строки (v1.23.7):
+  * row1: Источник + Bridge/WebUI + Уровень + DEBUG/INFO+/WARN+/ERROR + Скачать
+  * row2: слева Пауза + Поиск(×▲▼), справа 30м/1ч/Сутки/Всё
+- Кнопка «📡 Ping» в одном ряду с health-баджем
+- «Хронология» и «Мерцающие» — широкие, растянуты по высоте ряда
+- WebUI-уровень логов — «Уровень: [Все]», как у Bridge
+
+**UI (мобильный):**
+- Кнопки «Локальные базы DP» — столбиком на всю ширину (v1.23.7)
+- Модалка прижимается к верху (`align-items:flex-start` + `dvh` + safe-area) (v1.24.0)
+- `.detail-table` в модалке — одна колонка (label сверху серым, значение под ним) (v1.23.10)
+- Лог-тулбар — grid order через `data-role`, обёртки `display:contents` (v1.23.7)
+
+**Fix (1.23.x/1.24.x):**
+- `body.modal-open{overflow:hidden}` + `overscroll-behavior:contain` — скролл модалки не дёргает фон (v1.24.0)
+- Клик по health-баджу всегда заполняет деталку (`refreshHealthWidget(true)`) (v1.23.8)
+- Состояние лог-панели (пауза/диапазон/поиск/скролл) в `sessionStorage` — выживает при переключении вкладок (v1.23.8)
+- `_LAST_BRIDGE_LEVEL` выживает F5 (localStorage, `tuya_webui_bridge_level`) (v1.24.2/v1.24.3)
+- `renderTools` при `TOOLS_VIEW === 'audit'` не сбрасывает вид (v1.23.7)
+- `db_insert_snapshot` отключён — `state_history` была мёртвой фичей (v1.24.2)
+- Убран мёртвый `resize`-listener у `applyMobileLogsLayout` (v1.24.2)
+
+**«Кэш состояния» (v1.23.10):**
+- `<details>` с умным порогом: ≤ 8 DP — раскрыт, > 8 — свёрнут
+- Состояние раскрытия в `_CACHE_OPEN_STATE[name]`, выживает между автообновлениями
+
+**PWA (v1.24.5):**
+- `/manifest.json` и `/favicon.svg` отдаются из Python-строк
+- SVG-иконка 🌉 через `data:image/svg+xml;base64`
+- Мета-теги в `<head>`: `link rel=manifest`, `theme-color`, `apple-mobile-web-app-*`
+- Service Worker **не делаем** — без HTTPS не зарегистрируется, offline не нужен
+- Установка — вручную через меню браузера
+
 ### Аналитика (`/analytics`)
 
 Ряд 1:
@@ -341,36 +390,51 @@ DEBUG_MQTT_CMD = 0         # логировать входящие команд�
   * Счётчик замеров динамический (4 / 24 / 96 / ~288)
   * Сортировка таблицы по клику на заголовок (имя / IP / средний / время)
   * Цветовой индикатор: `< 20 мс`, `20-100 мс`, `> 100 мс`, `timeout`
+  * **Устройства в тишине не пингуются и не пишутся в `latency_history`** (v1.21.0+)
   * Skeleton при первой загрузке
 - **Хронология событий**:
   * Все переходы online/offline с timestamp
   * До 500 записей, подпись «показаны последние N из M»
+  * **Устройства в тишине исключаются** (v1.21.0+)
+  * **Friendly_name + серое name в скобках** (v1.22.4+)
   * Кнопка «🗑 Очистить» — 3 режима: всё / старше N дней-часов / до даты-времени
 
 Ряд 2:
-- **Мерцающие устройства (24ч)** — устройства с частыми переходами (≥3 за сутки), сортировка по клику
+- **Мерцающие устройства (24ч)** — устройства с частыми переходами (≥1 за сутки), сортировка по клику
+  * **Устройства в тишине исключаются** (v1.21.0+)
+  * **Friendly_name + серое name в скобках** (v1.22.4+)
   * Skeleton при первой загрузке
 - **Активность и мерцания (24ч)** — **два графика в одной карточке**:
   * Верхний — online по часам (зелёная линия + заливка, пунктир total)
   * Нижний — bar chart переходов online↔offline по часам (жёлтые столбики)
   * Подписи времени под каждым графиком, легенда вынесена из SVG
+  * **Границы графиков не теряются** — `tsStart` округляется до часа (v1.22.7+)
   * В шапке: «28/28 online сейчас · переходов: 47 (2.0/ч)»
 
 Ряд 3 (в самом низу):
 - **Логи (live)** — SSE-поток, все уровни, фильтры, поиск, пауза, автоскролл (см. ниже)
+
+> **v1.22.8+:** карточки в ряду выровнены по высоте (`align-items:stretch`), ряд ограничен `minmax(280px, 520px)`.
+> **v1.22.9:** `height:100%` только для таблиц с заглушкой (`:has(td[colspan])`).
+> **v1.23.7:** на ПК карточки широкие; `.compact` — только на мобиле.
 
 ### Live-логи
 
 - SSE-поток (Server-Sent Events) — реальное время
 - Все уровни (DEBUG/INFO/WARNING/ERROR/CRITICAL)
 - Кольцевой буфер 5000 строк на сервере
-- **Фильтр по уровню** (кнопки DEBUG/INFO/WARNING/ERROR)
+- **Переключатель источника**: `[Bridge]` / `[WebUI]` (v1.21.3+)
+- **Фильтр по уровню** (кнопки DEBUG/INFO/WARNING/ERROR) — только для Bridge
 - **Фильтр по времени** (30 мин / 1 час / Сутки / Всё)
-- **Поиск** с подсветкой, кнопки навигации ▲▼
+- **Поиск** с подсветкой, кнопки навигации ▲▼, кнопка «×» (очистить)
 - **Пауза** / Продолжить
-- **Скачать** — видимые строки в файл
+- **Скачать** — видимые строки в файл (текущий источник)
 - **Автоскролл** по расстоянию от низа, кнопка «↓ Вниз» при скролле вверх
+- **SSE переподключается при смене источника** (v1.21.4+)
+- **`LOG_SOURCE` сохраняется в `localStorage`** (v1.22.0+)
+- **Состояние панели (пауза / диапазон / поиск / скролл) в `sessionStorage`** — выживает при переключении вкладок (v1.23.8)
 
+> **v1.18.14:** логи перенесены из раздела «Дашборд» в самый низ раздела «Аналитика».
 
 ### История
 
@@ -389,6 +453,7 @@ SQLite-хранилище `webui_state/analytics.db`:
 - Retention 3 дня
 - Snapshots пишутся только при изменении, не чаще 1/мин
 - Flush буфера раз в 30 сек
+- **`db_insert_snapshot` отключён** (v1.24.2) — `state_history` не читается UI
 
 ### Импорт устройств (`/import`)
 
@@ -399,6 +464,7 @@ SQLite-хранилище `webui_state/analytics.db`:
   * Цветной индикатор возраста в `#cloud-cache-info`: серый / жёлтый ⚠️ / жёлтый 🔴 / красный 🔴 устарел
 - **Кнопка «🗑 Очистить»** — рядом с «Запросить устройства»
 - **Fetch devices** — прямое обращение к Tuya API (в 2 запроса: `getdevices(True)` + `getdevices(False, include_map=True)`)
+  * **v1.22.6:** обёрнут в поток с `join(timeout=60s)` — при недоступном Tuya Cloud воркер не висит вечно
 - **Поиск** над Cloud-таблицей — имя / ID / продукт / тип, debounce 150 мс
 - **on/off** в колонке Online (зелёный / серый)
 - **Цветные плашки** типов устройств
@@ -414,6 +480,7 @@ SQLite-хранилище `webui_state/analytics.db`:
   * **`getDeviceMapping(d)`** — фолбэки `d.mapping → d._raw_cloud.mapping → d.dps_map_generated` (v1.18.10)
   * **Статус probe** в шапке карточки (`.preview-probe-status`), не пропадает после перерисовки (v1.18.14)
   * **Таймаут probe 15 сек** через `AbortController` (v1.18.11)
+  * **Параллельный probe** — по 5 одновременно (v1.22.1)
 - Импорт отправляется в backend через MQTT
 
 ### Network scan
@@ -424,7 +491,7 @@ SQLite-хранилище `webui_state/analytics.db`:
   * `tuya: {port_6668: true, udp_port: 6666|6667, gwId, productKey, version}` — если UDP-проба успешна (точно Tuya)
   * `tuya: {port_6668: true, tuya_probable: true}` — TCP открыт, UDP молчит (вероятно Tuya, но не факт)
   * `tuya_unknown: true` — для неизвестных IP с Tuya-признаками
-  WebUI использует эти поля **как есть** (не выдумывает на клиенте). Бейджи:
+    WebUI использует эти поля **как есть** (не выдумывает на клиенте). Бейджи:
   * `✅ Bridge: UDP 6666 подтверждён` + `Tuya (UDP подтверждён)`
   * `📡 Bridge: 6668 открыт` + `Tuya? (TCP 6668)`
   * `📡 из Bridge`
@@ -439,6 +506,7 @@ SQLite-хранилище `webui_state/analytics.db`:
   * **🔄 Обновить** — обновить инфо о базах
   * **⬇ Обновить tuya-local** — скачать/перекачать из GitHub (tarball)
   * **🔄 Пересобрать tinytuya.json** — фоновый probe каждого устройства + merge mapping (с прогресс-баром)
+- **v1.23.7 (мобиль):** кнопки столбиком на всю ширину
 
 **Автомиграция:** старая `/app/tuya-local-db` (из 1.18.0) → `webui_state/tuya-local-db` при первом старте.
 
@@ -447,8 +515,25 @@ SQLite-хранилище `webui_state/analytics.db`:
 - **Read-only** просмотр `devices_config.json`
 - **Raw JSON** — полный файл с подсветкой синтаксиса (**своя**, без CDN)
 - **По устройствам** — список слева, детали справа
+- **📜 История конфига** — последние 100 записей `config_audit.log` (v1.21.2+)
+  * Операции: edit / delete / import
+  * Изменения: старое → новое значение
+  * Клик по строке — раскрыть полный JSON записи
 - Кнопки: **Обновить**, **Копировать JSON**
 - При ошибке: «Конфиг недоступен» + кнопка «Повторить»
+- **v1.23.7:** «Обновить» при активной «Истории конфига» не сбрасывает вид на «По устройствам»
+
+### Health-виджет (v1.21.2+)
+
+- В шапке, компактный: `Bridge vX · WebUI vY · ● online · uptime · online/total · ⚙ CPU/RAM`
+- Обновление раз в 30 сек через `GET /api/health/full`
+- **Клик** → детальная панель:
+  * WebUI: версия, CPU%, RAM, threads
+  * Bridge: версия, статус, uptime
+  * Devices: online/total, quiet (всего / сейчас)
+  * SQLite: размер `analytics.db`, строки в `status_events` / `latency_history` / `state_history`
+- **v1.23.8:** клик всегда заполняет деталку (`refreshHealthWidget(true)`)
+- **v1.23.9:** длинный вид на ПК, короткий — на мобиле
 
 ### Тема
 
@@ -456,6 +541,103 @@ SQLite-хранилище `webui_state/analytics.db`:
 - Тёмная по умолчанию (GitHub Dark)
 - Светлая — GitHub Light
 - Выбор сохраняется в `localStorage`
+- **v1.20.1:** мигание при переключении вкладок устранено (inline-скрипт в `<head>`)
+
+### Уведомления
+
+- **`uiConfirm(title, message, opts)`** — модалка подтверждения (OK/Отмена)
+- **`uiAlert(title, message, type)`** — модалка оповещения (info/warning/success/error)
+- **`uiPrompt(title, message, opts)`** — модалка ввода с валидацией (v1.18.9+)
+- Никаких браузерных `confirm()` / `alert()` / `prompt()`
+
+### PWA (v1.24.5)
+
+- `/manifest.json` и `/favicon.svg` отдаются из Python-строк
+- SVG-иконка 🌉 через `data:image/svg+xml;base64`
+- Мета-теги в `<head>`
+- **Service Worker не делаем** — без HTTPS не зарегистрируется
+- Установка вручную: Android Chrome ⋮ → «Добавить на главный экран», iOS Safari Поделиться → «На экран Домой»
+
+## Режим тишины (Quiet Hours)
+
+*v1.21.0+*
+
+Настраиваемые окна тишины **для отдельных устройств**. Нужны, если ты физически выключаешь устройства — чтобы WebUI не считал это «мерцанием» в аналитике и не показывал в «Проблемных».
+
+**Важно:** Bridge (`main.py`) **не дорабатывался**. Он продолжает опрашивать устройства как обычно. Режим тишины — только на уровне WebUI (запись в БД, отображение, latency).
+
+### Что делает окно тишины
+
+| Что | Действие |
+|---|---|
+| `status_events` (мерцания, timeline) | ❌ не пишется |
+| «Мерцающие устройства (24ч)» | ❌ исключается |
+| «Хронология событий» | ❌ исключается |
+| `latency_history` (ICMP ping) | ❌ не пишется, не пингуется |
+| «Проблемные устройства» | ❌ исключается |
+| График «Online по часам» | ✅ без изменений |
+| `state_history` / `cache_snapshot` | ✅ без изменений |
+| Статус на дашборде | ✅ обновляется |
+| Бейдж 🔇 на дашборде | ✅ показывается |
+
+### Как настроить
+
+1. Открой карточку устройства на дашборде.
+2. Найди секцию **«🔇 Режим тишины»**.
+3. Нажми **«+ Добавить окно»**, задай `from`–`to` (например, `23:00`–`08:00`).
+4. Можно добавить несколько окон. Ночные (через полночь) поддерживаются.
+5. Нажми **«💾 Сохранить»**.
+
+Пока есть несохранённые изменения — метка **«● не сохранено»**.
+
+> **v1.24.0:** заголовок без капса, эмодзи 🔇 / 🔈, статус inline.
+> **v1.24.4:** разделитель + воздух между блоками.
+
+### Где хранится
+
+`webui_state/quiet_hours.json` — создаётся пустым `{}` при первом старте.
+
+```json
+{
+  "lyustra_v_spalne": {
+    "windows": [
+      {"from": "23:00", "to": "08:00"},
+      {"from": "14:00", "to": "15:00"}
+    ]
+  }
+}
+```
+
+- Ключ — `name` устройства.
+- `from` / `to` — `"HH:MM"`, локальное время контейнера (TZ).
+- `from > to` → ночное окно через полночь.
+- Дней недели нет — только часы.
+- Пустой массив `windows` → окна удалены.
+
+Файл можно править руками — изменения подхватятся при следующем старте контейнера.
+
+### Grace-period
+
+`QUIET_GRACE_SEC = 120` — после окончания окна устройство ещё 2 минуты не показывается в «Проблемных» и не пишется в `status_events` (v1.22.6+).
+
+### API
+
+```bash
+# Сохранить окна:
+curl -X POST http://deep-net:5386/api/device/lyustra_v_spalne/quiet \
+  -H "Content-Type: application/json" \
+  -d '{"windows": [{"from": "23:00", "to": "08:00"}]}'
+
+# Удалить окна:
+curl -X POST http://deep-net:5386/api/device/lyustra_v_spalne/quiet \
+  -H "Content-Type: application/json" \
+  -d '{"windows": []}'
+
+# Проверить статус:
+curl -s http://deep-net:5386/api/status | \
+  python3 -c "import json,sys; d=json.load(sys.stdin); \
+  [print(x['name'], x.get('quiet'), x.get('quiet_until')) for x in d['devices']]"
+```
 
 ## Топики MQTT
 
@@ -524,9 +706,13 @@ SQLite-хранилище `webui_state/analytics.db`:
 | GET | `/analytics` | HTML analytics |
 | GET | `/import` | HTML import |
 | GET | `/tools` | HTML tools |
+| GET | `/manifest.json` | PWA manifest (v1.24.5) |
+| GET | `/favicon.svg` | SVG-иконка 🌉 (v1.24.5) |
 | GET | `/healthz` | Healthcheck (200/503) |
+| GET | `/api/health/full` | Health-инфо (v1.21.2+) |
 | GET | `/api/status` | JSON: bridge + devices |
 | GET | `/api/config/raw` | JSON: полный `devices_config.json` |
+| GET | `/api/config/audit?limit=N` | История конфига (v1.21.2+) |
 | GET | `/api/device/<name>/secret` | Local key устройства |
 | GET | `/api/device/<name>/history` | История статусов |
 | GET | `/api/device/<name>/latency` | История latency |
@@ -543,6 +729,7 @@ SQLite-хранилище `webui_state/analytics.db`:
 | POST | `/api/db/cleanup` | Очистка SQLite (scope: all / timeline / timeline_age / timeline_before) |
 | POST | `/api/device/<name>/config` | Edit device |
 | POST | `/api/device/<name>/delete` | Delete device |
+| POST | `/api/device/<name>/quiet` | Сохранить окна тишины (v1.21.0+) |
 | POST | `/api/scan/extended` | WebUI-скан (ICMP + ARP + probe) |
 | POST | `/api/scan/bridge` | Bridge-скан через MQTT |
 | POST | `/api/cloud/fetch` | Fetch Tuya Cloud |
@@ -570,6 +757,7 @@ Tuya отвечает `914` в трёх случаях:
 
 Tuya-модули имеют конденсатор, который держит Wi-Fi **2-5 минут** после отключения. Это нормально. Watchdog сработает после `OFFLINE_TIMEOUT` (120 сек).
 
+**Совет:** для устройств, которые ты часто выключаешь руками, используй **режим тишины** (v1.21.0+) — тогда WebUI не будет писать фейковые мерцания в аналитику.
 
 ### Ошибка `905: Network Error: Device Unreachable`
 
@@ -583,7 +771,31 @@ Tuya-модули имеют конденсатор, который держит
 - **Нормальное поведение** для Tuya. Смотри `Мерцающие устройства` — 20-30 переходов за 24ч это обычная работа (перезапуски соединений, физические отключения).
 - Если переходов > 100 за сутки — смотри логи bridge: `docker logs tuya-bridge 2>&1 | grep -E "restart|914|905"`.
 - **Важно:** WebUI **не влияет** на мерцание. Bridge сам решает, когда переподключаться.
-- **v1.18.9:** введён grace period `BRIDGE_STARTUP_GRACE_SEC = 60` — после старта bridge события online/offline не пишутся в БД, чтобы рестарт bridge не выглядел «фантомным мерцанием».
+- **v1.18.9:** введён grace period `BRIDGE_STARTUP_GRACE_SEC = 60` — после старта bridge события online/offline не пишутся в БД.
+- **v1.21.0:** режим тишины.
+- **v1.22.6:** grace-period quiet — первые 2 минуты после окна тишины не пишутся в `status_events`.
+
+### Режим тишины не работает — устройство всё равно в мерцаниях
+
+**Чек-лист:**
+
+1. Открой модалку устройства — секция «🔇 Режим тишины» есть?
+2. Окна заданы и сохранены? Рядом с кнопкой «Сохранить» нет метки «● не сохранено»?
+3. Время на сервере (TZ контейнера) соответствует окну:
+   ```bash
+   docker exec tuya-webui date
+   ```
+4. Устройство в статусе `enabled: true` в `devices_config.json`?
+5. Проверь `/api/status`:
+   ```bash
+   curl -s http://deep-net:5386/api/status | \
+     python3 -c "import json,sys; d=json.load(sys.stdin); \
+     [print(x['name'], x.get('quiet'), x.get('quiet_until')) for x in d['devices']]"
+   ```
+6. Файл `webui_state/quiet_hours.json` существует и содержит твои окна?
+
+**Важно:** записи в `status_events`, сделанные **до** настройки окна тишины, остаются в БД.
+
 
 ## Известные особенности
 
@@ -608,6 +820,21 @@ HA не любит, когда в `color_mode: color_temp` публикуетс�
 
 Обязательно нужно использовать  **DHCP reservation** для всех Tuya-устройств по MAC-адресу на роутере.
 
+### Файл `state_cache.json`
+
+Монтируется **папкой**, не файлом. Bind-mount файла ломает `os.replace` → `[Errno 16] Device or resource busy`.
+
+### Файл `analytics.db` (SQLite)
+
+Монтируется **папкой**, не файлом. SQLite в WAL-режиме создаёт `-wal` и `-shm` рядом.
+
+### Файл `quiet_hours.json`
+
+Монтируется **папкой** (`webui_state/`). Создаётся автоматически при первом старте контейнера — пустой `{}`. Атомарная запись через `.tmp` + `os.replace`.
+
+### Файл `config_audit.log`
+
+Монтируется **папкой** (`webui_state/`). Создаётся автоматически. Ротация 5 МБ × 3 бэкапа. При провале ротации запись прерывается (v1.22.6+).
 
 ### Два TCP-соединения к Tuya — не работают
 
@@ -636,7 +863,7 @@ HA не любит, когда в `color_mode: color_temp` публикуетс�
 
 Раньше (1.8.3 и ниже) bridge отдавал только `{ip, ms}`, а WebUI **выдумывал** `tuya: {port_6668: true, tuya_probable: true}` для всех новых IP. Теперь всё — из bridge.
 
-### Cloud-кэш и tuya-local 
+### Cloud-кэш и tuya-local
 
 **Автомиграция** старой `/app/tuya-local-db` → `webui_state/tuya-local-db` при первом старте.
 
@@ -675,7 +902,7 @@ Tuya может обновить прошивку и сменить DP-раск�
 ## Версии
 
 - **Bridge**: v1.8.4
-- **WebUI**: v1.20.1
+- **WebUI**: v1.24.5
 
 # Благодарности
 

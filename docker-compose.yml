@@ -29,7 +29,7 @@ services:
       - "${WEBUI_PORT:-5386}:5386"
     volumes:
       - ./data/config/devices_config.json:/app/devices_config.json:ro
-      - ./data/logs:/app/logs:ro
+      - ./data/logs:/app/logs
       - ./data/webui_state:/app/webui_state
       # Монтируем .env внутрь контейнера (для переменных окружения)
       - ./webui/.env:/app/.env:ro
