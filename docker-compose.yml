@@ -1,0 +1,84 @@
+# Tuya WiFi → MQTT Bridge — docker-compose.yml
+#
+# Порядок запуска:
+#   1. cp .env.example .env
+#   2. отредактируйте .env (адрес MQTT-брокера, TZ, порт WebUI)
+#   3. положите свой конфиг в ./data/config/devices_config.json
+#      (образец — ./data/config/devices_config.json.example)
+#   4. docker compose up -d --build
+#
+# Образы собираются локально из ./bridge и ./webui.
+# Все переменные берутся из .env (файл рядом с этим compose).
+
+services:
+  tuya-bridge:
+    container_name: tuya-bridge
+    restart: unless-stopped
+    stop_grace_period: 10s
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    cap_add:
+      - NET_RAW                 # native ICMP (ping батарейных устройств)
+    volumes:
+      - ./data/config:/app/config
+      - ./data/state:/app/state
+      - ./data/logs:/app/logs
+      - ./data/backup:/app/backup
+    environment:
+      - TZ=${TZ:-Europe/Moscow}
+      - MQTT_BROKER=${MQTT_BROKER:-192.168.1.10}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - TOPIC_PREFIX=${TOPIC_PREFIX:-tuya}
+      - DISCOVERY_PREFIX=${DISCOVERY_PREFIX:-homeassistant}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'main.py' /proc/1/cmdline && test -f /app/state/state_cache.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tuya-webui:
+    container_name: tuya-webui
+    restart: unless-stopped
+    stop_grace_period: 10s
+    build:
+      context: ./webui
+      dockerfile: Dockerfile
+    cap_add:
+      - NET_RAW                 # native ICMP (задержка устройств)
+    ports:
+      # наружу — WEBUI_PORT из .env, внутри контейнера всегда 5386
+      - "${WEBUI_PORT:-5386}:5386"
+    volumes:
+      - ./data/config:/app/config:ro
+      - ./data/logs:/app/logs
+      - ./data/webui_state:/app/webui_state
+    environment:
+      - TZ=${TZ:-Europe/Moscow}
+      - MQTT_BROKER=${MQTT_BROKER:-192.168.1.10}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - TOPIC_PREFIX=${TOPIC_PREFIX:-tuya}
+      - WEBUI_PORT=5386       # внутренний порт контейнера (не путать с WEBUI_PORT из .env)
+      - WEBUI_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'webui.py' /proc/1/cmdline && wget -q --spider --timeout=3 http://localhost:5386/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,12 @@
+# Локальные настройки (адрес брокера, логины/пароли)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# ОС / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

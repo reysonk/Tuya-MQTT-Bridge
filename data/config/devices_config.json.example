@@ -1,0 +1,30 @@
+[
+  {
+    "id": "YOU_DEVICE_ID",
+    "name": "YOU_DEVICE_name_",
+    "friendly_name": "YOU_DEVICE_friendly_name_for_Home_Assistant",
+    "ip": "192.168.XXX.XXX",
+    "local_key": "DEVICE_LOCAL_KEY",
+    "version": "3.3",
+    "type": "light",
+    "model": "HiLightPRO-A",
+    "battery_powered": false,
+    "enabled": true,
+    "dps_map": {
+      "20": { "component": "switch", "name": "switch_led" },
+      "22": { 
+        "component": "number", 
+        "name": "bright_value", 
+        "min": 10, 
+        "max": 1000,
+        "unit_of_measurement": "%"
+      },
+      "23": { 
+        "component": "number", 
+        "name": "temp_value", 
+        "kelvin_min": 2700, 
+        "kelvin_max": 6500
+      }
+    }
+  }
+]

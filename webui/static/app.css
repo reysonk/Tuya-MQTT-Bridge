@@ -1,0 +1,2783 @@
+  :root {
+    --bg:#f4f6f8; --fg:#222; --muted:#666; --card:#fff; --border:#e1e4e8;
+    --green:#2ea043; --red:#d73a49; --yellow:#b08800; --accent:#1f6feb;
+    --code-bg:#f6f8fa;
+  }
+  html[data-theme="dark"] {
+    --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --card:#161b22; --border:#30363d;
+    --green:#3fb950; --red:#f85149; --yellow:#d29922; --accent:#1f6feb;
+    --code-bg:#0d1117;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; background:var(--bg); color:var(--fg); font-size:14px; }
+  code, pre { font-family:"JetBrains Mono",ui-monospace,monospace; }
+  /* v1.23.8: шапка — 3 строки (ПК).
+     row1: h1 + theme (прижат вправо)
+     row2: nav (вкладки) — под заголовком, слева
+     row3: health-widget + toolbar (вправо) */
+  header { display:flex; flex-direction:column; gap:12px; margin-bottom:16px; }
+  .header-row1 { display:flex; align-items:center; gap:16px; }
+  .header-row1 h1 { margin:0; font-size:20px; cursor:pointer; }
+  .header-row1 #theme-btn { margin-left:auto; }
+  header h1 { margin:0; font-size:20px; }
+  nav { display:flex; gap:6px; }
+  nav#main-nav { flex-wrap:wrap; }
+  .header-row3 { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .header-row3 .toolbar {
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+    margin-left:auto;
+  }
+  nav a { color:var(--fg); text-decoration:none; padding:7px 14px; border-radius:6px; font-size:13px; border:1px solid var(--border); transition: border-color .15s, background .15s; }
+  nav a:hover { border-color:var(--accent); background: rgba(3,102,214,0.08); }
+  nav a.active { background:var(--accent); color:white; border-color:var(--accent); }
+  .badge { padding:2px 8px; border-radius:12px; font-size:12px; background:var(--border); color:var(--muted); }
+  .badge.online { background:var(--green); color:white; }
+  .badge.offline { background:var(--red); color:white; }
+  .badge.battery { background:rgba(176,136,0,0.2); color:var(--yellow); }
+  /* v1.28.55: значок питания — без подложки. */
+  .power-glyph { opacity: 0.9; }
+  .badge.junk { background:rgba(215,58,73,0.15); color:var(--red); font-size:10px; white-space: nowrap; }
+  /* v1.27.5: на ПК — текст «мусор», на мобиле (см. @media) — иконка 🗑. */
+  .badge.junk .junk-icon { display: none; }
+  .badge.junk .junk-text { display: inline; }
+  .badge.quiet { background:rgba(163,113,247,0.18); color:#a371f7; border:1px solid rgba(163,113,247,0.25); }
+  .health-widget { display:inline-flex; align-items:center; gap:6px; padding:2px 10px;
+    border-radius:12px; font-size:12px; background:rgba(56,120,200,0.12); color:var(--fg);
+    border:1px solid rgba(56,120,200,0.2); cursor:pointer; user-select:none; }
+  .health-widget:hover { border-color:var(--accent); }
+  .health-widget .hw-sep { color:var(--muted); opacity:0.5; }
+  .health-widget .hw-dim { color:var(--muted); }
+  .health-widget .hw-quiet { color:#a371f7; }
+  .health-widget .hw-err { color:var(--red); font-weight:600; }
+  /* v1.23.7: фикс ширины, чтобы health-widget не дёргался при обновлении. */
+  .health-widget #hw-rest { min-width: 180px; display:inline-block; }
+  /* v1.23.9: на ПК health-бадж длинный, как было до 1.23.8.
+     Короткий вид (.hw-opt { display:none }) — только на мобиле,
+     см. @media (max-width:700px). */
+  .health-widget.hw-expanded { flex-wrap: wrap; }
+  .health-widget.hw-expanded #hw-rest { min-width: 0; }
+  .health-detail { padding:12px 16px; background:var(--bg);
+    border:1px solid var(--border); border-radius:6px; font-size:12px;
+    font-family:ui-monospace,monospace; line-height:1.6;
+    /* v1.23.1: внутри header — на ПК переносим на новую строку. */
+    flex-basis: 100%; width: 100%; order: 999; margin-top: 0; }
+  .health-detail .hd-row { display:flex; gap:16px; }
+  .health-detail .hd-key { color:var(--muted); min-width:90px; }
+  /* v1.25.0 (task #B-css): красивая health-карточка на русском. */
+  .health-detail { padding: 14px 18px; line-height: 1.7; }
+  .health-detail .hd-head {
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom: 10px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .health-detail .hd-head-title {
+    font-weight: 600; font-size: 13px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .health-detail .hd-grid {
+      display: grid;
+      grid-template-columns: 130px 1fr;
+      gap: 6px 14px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+    }
+  .health-detail .hd-lbl { color: var(--muted); }
+  .health-detail .hd-val { color: var(--fg); }
+  .health-detail .hd-dot {
+    display:inline-block; width:8px; height:8px; border-radius:50%;
+    margin-right:6px; vertical-align:middle;
+  }
+  .health-detail .hd-dot.g { background: var(--green); }
+  .health-detail .hd-dot.r { background: var(--red); }
+  .health-detail .hd-dot.y { background: var(--yellow); }
+  .health-detail .hd-badge {
+    display:inline-block; padding:1px 7px; border-radius:10px;
+    font-size:11px; font-weight:600;
+    background: var(--border); color: var(--muted); margin-left:6px;
+    /* v1.25.0 (fix2): cursor:help только у .muted (там есть title).
+       У .ok/.warn/.err — обычный вид. */
+    cursor: default;
+  }
+  .health-detail .hd-badge.ok { background: rgba(46,160,67,0.18); color: var(--green); }
+  .health-detail .hd-badge.warn { background: rgba(176,136,0,0.18); color: var(--yellow); }
+  .health-detail .hd-badge.err { background: rgba(215,58,73,0.18); color: var(--red); }
+  .health-detail .hd-badge.muted { background: var(--border); color: var(--muted); cursor: help; }
+  .health-detail .hd-section {
+    margin-top: 12px; padding-top: 10px;
+    border-top: 1px dashed var(--border);
+  }
+  .health-detail .hd-section-title {
+    color: var(--muted); font-size:11px; text-transform:uppercase;
+    letter-spacing:0.5px; margin-bottom:6px;
+  }
+  .modal-header .refresh-btn { background:none; border:1px solid var(--border);
+    padding:2px 10px; font-size:14px; line-height:1.4; cursor:pointer; border-radius:6px;
+    color:var(--fg); margin-right:6px; }
+  .modal-header .refresh-btn:hover { border-color:var(--accent); }
+  .modal-header .refresh-btn.spinning { animation: spin 0.8s linear infinite; }
+  .audit-table { width:100%; border-collapse:collapse; font-size:12px; }
+  .audit-table th { padding:6px 10px; text-align:left; color:var(--muted);
+    font-size:11px; text-transform:uppercase; letter-spacing:0.5px;
+    border-bottom:1px solid var(--border); }
+  .audit-table td { padding:6px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .audit-table tr.fail td { background:rgba(215,58,73,0.06); }
+  .audit-table tr:hover td { background:var(--bg); cursor:pointer; }
+  .audit-op { display:inline-block; padding:1px 6px; border-radius:4px; font-size:10px;
+    font-weight:600; text-transform:uppercase; }
+  .audit-op.edit { background:rgba(56,139,253,0.18); color:#388bfd; }
+  .audit-op.delete { background:rgba(215,58,73,0.18); color:var(--red); }
+  .audit-op.import { background:rgba(46,160,67,0.18); color:var(--green); }
+  .audit-detail { background:var(--bg); padding:10px; border-radius:4px;
+    font-family:ui-monospace,monospace; font-size:11px; white-space:pre-wrap;
+    word-break:break-all; margin-top:6px; }
+  .audit-empty { padding:24px; text-align:center; color:var(--muted); }
+  /* v1.28.7: обёртка для горизонтального скролла таблицы
+     «История конфига» на мобиле. 5 колонок (160+90+180+70
+     = ~500px) не влезают в экран ~350px. */
+  .audit-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .audit-wrap table.audit-table {
+    min-width: 500px;
+  }
+  /* v1.28.9: обёртки таблиц на ПК — без скролла, ничего не меняют. */
+  .devices-table-wrap,
+  .latency-table-wrap {
+    /* на ПК — обычный блок */
+  }
+  .muted { color:var(--muted); }
+  /* v1.23.4: универсальный класс скрытия (без !important-конфликтов) */
+  .hidden { display: none !important; }
+  button { padding:6px 14px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; font-size:13px; transition: border-color .15s, background .15s; }
+  button:not(.primary):not(.danger):hover { border-color:var(--accent); background:rgba(3,102,214,0.08); }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  button.active { background:var(--accent); color:white; border-color:var(--accent); }
+  button.primary { background:var(--accent); color:white; border-color:var(--accent); }
+  button.danger { background:var(--red); color:white; border-color:var(--red); }
+  button.logs-pause.active { background:var(--yellow); color:white; border-color:var(--yellow); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.65;} }
+  input, select { padding:6px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg); font-size:13px; width:100%; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .form-group { margin-bottom:12px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:0; overflow:hidden; margin-bottom:16px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:8px 12px; text-align:left; border-bottom:1px solid var(--border); }
+  th { font-weight:600; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:0.5px; }
+  th[data-sort] { cursor:pointer; user-select:none; }
+  th[data-sort]:hover { color:var(--accent); }
+  .sort-ind { color:var(--accent); font-weight:700; }
+  tr:last-child td { border-bottom:none; }
+  .device-row:hover { background:var(--border); cursor:pointer; }
+  /* v1.27.7: отключённое устройство — серый фон в дашборде. */
+  .device-row-disabled td { opacity: 0.6; }
+  .device-row-disabled:hover td { opacity: 0.85; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--muted); }
+  .dot.online { background:var(--green); }
+  .dot.offline { background:var(--red); }
+  .type-badge { display:inline-block; padding:1px 6px; font-size:11px; border-radius:4px; background:var(--border); color:var(--muted); }
+  .type-badge.primary { background:rgba(3,102,214,0.15); color:var(--accent); }
+  .device-ip { font-size:11px; color:var(--muted); margin-top:2px; }
+  .latency { display:inline-block; padding:1px 6px; font-size:11px; border-radius:3px; }
+  .lat-good { background:rgba(46,160,67,0.15); color:var(--green); }
+  .lat-mid { background:rgba(176,136,0,0.15); color:var(--yellow); }
+  .lat-bad { background:rgba(215,58,73,0.15); color:var(--red); }
+  .lat-timeout { background:rgba(215,58,73,0.25); color:var(--red); }
+  .problems { background:var(--card); border:1px solid var(--yellow); border-radius:8px; margin-bottom:16px; overflow:hidden; }
+  /* v1.27.7: секция отключённых устройств в дашборде. */
+  #disabled-block { margin-bottom: 16px; }
+  #disabled-block > details > summary {
+    padding: 12px 16px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #disabled-block > details > summary::-webkit-details-marker { display: none; }
+  #disabled-block > details > summary::before {
+    content: "▶";
+    color: var(--muted);
+    font-size: 10px;
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  #disabled-block > details[open] > summary::before { transform: rotate(90deg); }
+  #disabled-block > details > summary:hover { color: var(--fg); }
+  .problems-header { padding:10px 16px; background:rgba(176,136,0,0.12); font-size:13px; color:var(--yellow); font-weight:600; border-bottom:1px solid var(--border); }
+  .problem-item { padding:8px 16px; border-bottom:1px solid var(--border); font-size:13px; display:flex; justify-content:space-between; gap:16px; cursor:pointer; }
+  /* v1.28.27: агрегирующее сообщение про CAP_NET_RAW — не кликабельно. */
+  .problem-item.problem-ping {
+    background: rgba(176,136,0,0.08);
+    border-left: 3px solid var(--yellow);
+    display: block;
+    cursor: default;
+  }
+  .problem-item.problem-ping code {
+    background: var(--bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+  .logs-toolbar {
+    display:flex; flex-direction:column; gap:6px;
+    padding:8px 16px; border-bottom:1px solid var(--border);
+    background:var(--card);
+  }
+  .logs-toolbar button { padding:4px 10px; font-size:12px; }
+  .logs-toolbar input { width:auto; padding:4px 10px; font-size:12px; }
+  .time-btn-group { display:flex; gap:0; }
+  .time-btn-group button { border-radius:0; border-right-width:0; padding:4px 10px; font-size:11px; }
+  .time-btn-group button:first-child { border-radius:6px 0 0 6px; }
+  .time-btn-group button:last-child { border-radius:0 6px 6px 0; border-right-width:1px; }
+
+  /* v1.23.7: две строки тулбара логов.
+     row1 — слева всё подряд; row2 — слева Пауза+Поиск, справа диапазоны. */
+  .logs-toolbar-row1 {
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    justify-content:flex-start;
+  }
+  .logs-toolbar-row2 {
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    justify-content:space-between;
+  }
+  .logs-toolbar-row2-left {
+    display:flex; align-items:center; gap:8px; flex:0 1 auto;
+  }
+  .logs-toolbar-row2-right {
+    display:flex; align-items:center; gap:8px; flex:0 0 auto;
+    margin-left:auto;
+  }
+  /* v1.23.9: «⬇ Скачать» — к правому краю первой строки. */
+  .logs-toolbar-row1 .logs-download { margin-left: auto; }
+  /* v1.23.7: input + × + ▲ + ▼ в одной строке. Поиск чуть шире. */
+  .logs-tb-search {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 1 auto;
+  }
+  .logs-tb-search #log-search {
+    min-width: 220px;
+    max-width: 280px;
+  }
+  .logs-tb-search #find-next-btn,
+  .logs-tb-search #find-prev-btn,
+  .logs-tb-search #find-clear-btn {
+    min-width: 30px;
+    padding: 4px 8px;
+  }
+  .logs-tb-search #find-clear-btn {
+    color: var(--muted);
+    font-size: 16px;
+    line-height: 1;
+  }
+  .logs-tb-search #find-clear-btn:hover {
+    color: var(--red);
+    border-color: var(--red);
+  }
+  .logs-paused-banner { background:var(--yellow); color:white; padding:6px 12px; font-size:12px; text-align:center; font-weight:600; }
+  .logs { background:#0a0e14; color:#d1d5da; font-family:"JetBrains Mono",ui-monospace,monospace; font-size:12px; line-height:1.5; max-height:420px; min-height:420px; overflow-y:auto; padding:12px; position:relative; }
+  .logs .line { white-space:pre-wrap; word-break:break-all; }
+  .logs .lvl-DEBUG { color:#6e7681; } .logs .lvl-INFO { color:#d1d5da; }
+  .logs .lvl-WARNING { color:#d29922; } .logs .lvl-ERROR, .logs .lvl-CRITICAL { color:#f85149; }
+  .logs mark { background:#ffd33d; color:#000; padding:0 2px; }
+  .logs .line.current-match { background:rgba(88,166,255,0.15); }
+  .scroll-down-btn { position:sticky; bottom:12px; left:50%; transform:translateX(-50%); background:var(--accent); color:#fff; border:none; padding:6px 14px; border-radius:16px; cursor:pointer; font-size:12px; box-shadow:0 2px 8px rgba(0,0,0,0.3); display:none; z-index:10; margin:0 auto; width:fit-content; }
+  .scroll-down-btn.visible { display:block; }
+  .section-title { margin:0; padding:12px 16px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
+  .section-title .hint { font-size:11px; text-transform:none; letter-spacing:0; color:var(--muted); font-weight:400; }
+  .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  /* v1.23.8: отступ вправо задаётся .header-row3 .toolbar { margin-left:auto }. */
+  .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .table-toolbar { display:flex; gap:8px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--bg); flex-wrap:wrap; }
+  .table-toolbar input[type="text"] { max-width:280px; padding:5px 10px; font-size:12px; }
+  .table-toolbar .toolbar-info { font-size:11px; color:var(--muted); margin-left:auto; }
+  .table-toolbar .toolbar-clear { padding:3px 8px; font-size:11px; }
+  .skeleton { display:inline-block; height:12px; border-radius:3px;
+    background: linear-gradient(90deg, var(--border) 25%, var(--bg) 50%, var(--border) 75%);
+    background-size: 200% 100%; animation: shimmer 1.5s infinite; vertical-align:middle; }
+  .skeleton.w40 { width:40%; } .skeleton.w60 { width:60%; } .skeleton.w80 { width:80%; }
+  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+  .version-badge { display:inline-block; padding:1px 6px; border-radius:4px; font-size:11px;
+    font-weight:600; font-family:ui-monospace,monospace; vertical-align:middle; }
+  .version-badge.v31 { background:rgba(148,163,184,0.18); color:#94a3b8; }
+  .version-badge.v32 { background:rgba(56,189,248,0.15); color:#38bdf8; }
+  .version-badge.v33 { background:rgba(46,160,67,0.18); color:var(--green); }
+  .version-badge.v34 { background:rgba(3,102,214,0.18); color:var(--accent); }
+  .version-badge.v35 { background:rgba(163,113,247,0.18); color:#a371f7; }
+  .badge.bridge-version, .badge.webui-version {
+    background: rgba(56,120,200,0.18); color: #6ea8fe; border:1px solid rgba(56,120,200,0.25); }
+  html[data-theme="light"] .badge.bridge-version,
+  html[data-theme="light"] .badge.webui-version {
+    background: rgba(3,102,214,0.12); color: #0550ae; border:1px solid rgba(3,102,214,0.2); }
+  .type-badge.light { background:rgba(210,153,34,0.18); color:#d29922; }
+  .type-badge.switch { background:rgba(46,160,67,0.18); color:var(--green); }
+  .type-badge.climate { background:rgba(219,109,40,0.18); color:#db6d28; }
+  .type-badge.sensor { background:rgba(56,139,253,0.18); color:#388bfd; }
+  .type-badge.binary_sensor { background:rgba(163,113,247,0.18); color:#a371f7; }
+  /* v1.25.0 (fix3): цветной бейдж для component DP. */
+  .component-badge { display:inline-block; padding:1px 6px; font-size:11px; border-radius:4px;
+    background:var(--border); color:var(--muted); }
+  .component-badge.switch        { background: rgba(46,160,67,0.18);  color: var(--green); }
+  .component-badge.sensor        { background: rgba(56,139,253,0.18); color: #388bfd; }
+  .component-badge.binary_sensor { background: rgba(163,113,247,0.18); color: #a371f7; }
+  .component-badge.select        { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.number        { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.preset        { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.light         { background: rgba(210,153,34,0.18); color: #d29922; }
+  .component-badge.climate       { background: rgba(219,109,40,0.18); color: #db6d28; }
+  .component-badge.button        { background: rgba(139,148,158,0.18); color: var(--muted); }
+  .component-badge.time          { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .component-badge.lock          { background: rgba(215,58,73,0.18);  color: var(--red); }
+  .component-badge.phase_a       { background: rgba(210,153,34,0.18); color: #d29922; }
+  /* v1.25.0 (fix3): статусные кнопки баз DP. */
+  .base-info-actions button.btn-success {
+    background: rgba(46,160,67,0.18);
+    color: var(--green);
+    border-color: rgba(46,160,67,0.4);
+  }
+  .base-info-actions button.btn-error {
+    background: rgba(215,58,73,0.18);
+    color: var(--red);
+    border-color: rgba(215,58,73,0.4);
+  }
+  .base-info-actions button .spin {
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .state-on { color:var(--green); font-weight:600; }
+  .state-off { color:var(--muted); }
+  .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.55); z-index:1000; align-items:center; justify-content:center; padding:20px; overscroll-behavior: contain; }
+  /* v1.24.0: заморозка фона при открытой модалке —
+     скролл внутри модалки больше не дёргает страницу за ней. */
+  body.modal-open { overflow: hidden; }
+  .modal-overlay.open { display:flex; }
+  .modal-overlay.top { z-index:1100; }
+  .modal { background:var(--card); border:1px solid var(--border); border-radius:8px; max-width:750px; width:100%; max-height:92vh; display:flex; flex-direction:column; overflow:hidden; }
+  .modal.wide { max-width:1100px; }
+  .modal.small { max-width:440px; }
+  .modal-header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); }
+  .modal-header h2 { margin:0; font-size:16px; }
+  .modal-close { background:none; border:none; color:var(--fg); font-size:24px; cursor:pointer; padding:0 8px; line-height:1; }
+  .modal-body { padding:12px 14px; overflow-y:auto; overscroll-behavior: contain; }
+  /* v1.18.11: запрещаем браузеру "прыгать" к фокусному чекбоксу
+     внутри overflow:auto контейнера (Firefox/Chrome focus-scroll). */
+  .modal-body input[type="checkbox"],
+  .modal-body input[type="radio"] { scroll-margin: 9999px; }
+  /* v1.28.51: больше воздуха между разделами модалок. */
+  .modal-body h3 { margin:20px 0 8px 0; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
+  .modal-body h3:first-child { margin-top:0; }
+  .modal-body > table,
+  .modal-body > .wide-table-wrap,
+  .modal-body > .detail-table { margin-bottom: 14px; }
+  .detail-table { width:100%; border-collapse:collapse; font-size:13px; }
+  .detail-table td { padding:4px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .detail-table td:first-child { color:var(--muted); width:35%; white-space:nowrap; }
+  .history-scroll { max-height:300px; overflow-y:auto; }
+  .history-item { padding:4px 8px; font-family:ui-monospace,monospace; font-size:12px; border-bottom:1px solid var(--border); }
+  .history-item.online { color:var(--green); }
+  .history-item.offline { color:var(--red); }
+  code { font-family:ui-monospace,monospace; font-size:12px; background:var(--bg); padding:1px 5px; border-radius:3px; }
+  .copy-row { display:inline-flex; align-items:center; gap:4px; max-width:100%; }
+  .copy-row code { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; user-select:all; -webkit-user-select:all; }
+  .copy-row code.sel-ok { background:var(--accent); color:#fff; }
+  .copy-hint { cursor:pointer; opacity:0.5; font-size:11px; user-select:none; display:inline-block; padding:0 2px; border-radius:3px; }
+  .copy-hint:hover { opacity:1; background:var(--border); }
+  .copy-hint.copied { color:var(--green); opacity:1; }
+  .secret-masked { letter-spacing:2px; color:var(--muted); }
+  /* v1.28.73: Local key — отдельная сущность, нужен разделитель от Tuya ID. */
+  #modal-key-zone {
+    margin-top: 18px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  #modal-key-zone:empty { display: none; }
+  /* v1.24.4: «Local key» получает верхний разделитель. */
+  #modal-key-zone h3:first-child {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+  }
+  /* v1.24.0: заголовок quiet — без капса, без «(для аналитики)».
+     🔇 в тишине, 🔈 не в тишине. quiet-off — приглушён целиком. */
+  .quiet-title {
+    text-transform: none !important;
+    letter-spacing: 0 !important;
+    font-size: 14px !important;
+    font-weight: 600;
+    color: var(--fg);
+    /* v1.28.73: единый вертикальный ритм с остальными секциями (h3). */
+    margin: 20px 0 8px 0;
+    padding: 0;
+    border-top: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .quiet-title .quiet-emoji { font-size: 15px; line-height: 1; }
+  .quiet-title .quiet-status-inline {
+    font-size: 11px;
+    font-weight: 400;
+    color: #a371f7;
+    margin-left: 2px;
+  }
+  .quiet-title.quiet-off {
+    opacity: 0.6;
+  }
+  .quiet-title.quiet-off .quiet-emoji {
+    filter: grayscale(0.4);
+  }
+  .quiet-help {
+    font-size: 12px;
+    margin: 8px 0 12px 0;
+    line-height: 1.4;
+  }
+  /* v1.24.4: блок кнопок quiet — верхний отступ. */
+  .quiet-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  /* v1.25.12: имя DP + ☁ в кэше — flex, значок не съезжает. */
+  .cache-dp-name {
+    display: inline-flex;
+    align-items: baseline;
+    flex-wrap: nowrap;
+    gap: 2px;
+    max-width: 100%;
+  }
+  .cache-dp-name > span {
+    flex-shrink: 0;
+  }
+  .cache-details .detail-table td:first-child {
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
+  }
+  /* v1.23.10: секция «Кэш состояния» в модалке — сворачиваемая. */
+  .cache-details > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 4px 0;
+    line-height: 1.25;
+    user-select: none;
+    display: flex;
+    align-items: center;
+  }
+  .cache-details > summary::-webkit-details-marker { display: none; }
+  .cache-details > summary::before {
+    content: "▶";
+    color: var(--muted);
+    font-size: 10px;
+    margin-right: 6px;
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  .cache-details[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  .cache-details > summary:hover h3 { color: var(--accent); }
+  .sparkline { background:var(--bg); border-radius:4px; padding:8px; margin-bottom:8px; }
+  .sparkline svg { display:block; width:100%; height:40px; }
+  .sparkline-labels { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); margin-top:2px; }
+  .analytics-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;
+    align-items:stretch; grid-auto-rows:minmax(280px, 520px); }
+  @media (max-width:700px) { .analytics-grid { grid-template-columns:1fr; grid-auto-rows: auto; } }
+  .analytics-card { margin-bottom:0; display:flex; flex-direction:column;
+    min-height:200px; max-height:560px; overflow:hidden; }
+  .analytics-card > .analytics-card-header { flex-shrink:0; }
+  .analytics-card-header { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 16px; border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  .analytics-card-header h2 { margin:0; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
+  .analytics-card-header .analytics-toolbar { display:flex; gap:8px; align-items:center; margin-left:auto; flex-wrap:wrap; }
+  .analytics-table-scroll { flex:1 1 auto; min-height:120px; overflow-y:auto; }
+  /* v1.22.9: height:100% только для таблиц-заглушек (через :has()).
+     Иначе flappers/хронология с 1-2 строками раздуваются пустотой. */
+  .analytics-table-scroll table:has(td[colspan]) { height:100%; }
+  .analytics-table-scroll td[colspan] {
+    text-align:center; vertical-align:middle; height:100%;
+  }
+  .timeline-scroll > .muted:only-child {
+    display:flex; align-items:center; justify-content:center;
+    height:100%; margin:0;
+  }
+  .timeline-scroll { flex:1 1 auto; min-height:120px; overflow-y:auto; }
+  .timeline-item { padding:6px 16px; border-bottom:1px solid var(--border); font-size:12px; display:flex; gap:12px; }
+  .timeline-item .timeline-ts { color:var(--muted); flex:0 0 155px; white-space:nowrap; }
+
+  /* v1.23.7: .compact — только в мобильной вёрстке (см. @media ниже).
+     На ПК карточки «Хронология» и «Мерцающие» — широкие и растянуты
+     по высоте ряда. */
+  .scan-host { padding:10px 12px; border:1px solid var(--border); border-radius:6px; margin-bottom:6px; }
+  .scan-host:hover { border-color:var(--accent); }
+  .scan-host.bridge-new { border-left:3px solid var(--accent); }
+  .scan-meta { font-size:11px; color:var(--muted); margin-top:2px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .scan-badge { display:inline-block; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:600; }
+  .scan-badge.tuya-unknown { background:rgba(215,58,73,0.2); color:var(--red); }
+  .scan-badge.router { background:rgba(3,102,214,0.2); color:var(--accent); }
+  .scan-badge.known { background:rgba(46,160,67,0.2); color:var(--green); }
+  .scan-badge.iot { background:rgba(176,136,0,0.2); color:var(--yellow); }
+  .scan-badge.unknown { background:var(--border); color:var(--muted); }
+  .scan-badge.bridge { background:rgba(163,113,247,0.2); color:#a371f7; }
+  .scan-badge.bridge-confirmed { background:rgba(46,160,67,0.25); color:var(--green); font-weight:700; }
+  .scan-port { font-family:ui-monospace,monospace; font-size:10px; background:var(--bg); padding:0 4px; border-radius:2px; }
+  .scan-toolbar { display:flex; gap:8px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--bg); flex-wrap:wrap; }
+  .scan-toolbar-info { font-size:12px; color:var(--muted); }
+  details summary { cursor:pointer; padding:6px 0; user-select:none; }
+  details summary::-webkit-details-marker { color:var(--muted); }
+  .theme-btn { background:none; border:1px solid var(--border); padding:4px 10px; font-size:16px; line-height:1; cursor:pointer; border-radius:6px; }
+  .theme-btn:hover { border-color:var(--accent); }
+
+  /* v1.23.3: burger-кнопка для мобильной навигации */
+  #nav-toggle { display: none; background:none; border:1px solid var(--border);
+    padding:4px 10px; font-size:16px; line-height:1; cursor:pointer; border-radius:6px;
+    color:var(--fg); }
+  #nav-toggle:hover { border-color:var(--accent); }
+  .tools-toolbar { display:flex; gap:8px; padding:12px 16px; border-bottom:1px solid var(--border); background:var(--bg); align-items:center; flex-wrap:wrap; }
+  .tools-split { display:grid; grid-template-columns:280px 1fr; min-height:500px; }
+  .tools-list { border-right:1px solid var(--border); max-height:70vh; overflow-y:auto; }
+  .tools-list-item { padding:8px 12px; border-bottom:1px solid var(--border); cursor:pointer; font-size:13px; }
+  .tools-list-item:hover { background:var(--border); }
+  .tools-list-item.active { background:var(--accent); color:white; }
+  .tools-list-item .tools-list-ip { font-size:11px; color:var(--muted); margin-top:2px; }
+  .tools-list-item.active .tools-list-ip { color:rgba(255,255,255,0.7); }
+  .tools-detail { padding:16px; overflow-y:auto; max-height:70vh; }
+  .tools-error { padding:24px; text-align:center; color:var(--red); }
+  /* v1.25.12: обёртка для горизонтального скролла широких таблиц
+     (глобально, не только в мобильном медиа). */
+  .wide-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -14px;
+    padding: 0 14px;
+  }
+  pre.json-view { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:12px; font-size:12px; overflow-x:auto; max-height:600px; margin:0; }
+  pre.json-view code { background:none; padding:0; }
+  html[data-theme="dark"] .hljs-attr { color:#79c0ff; }
+  html[data-theme="dark"] .hljs-string { color:#a5d6ff; }
+  html[data-theme="dark"] .hljs-number { color:#79c0ff; }
+  html[data-theme="dark"] .hljs-literal { color:#ff7b72; }
+  html[data-theme="dark"] .hljs-punctuation { color:#8b949e; }
+  html[data-theme="light"] .hljs-attr { color:#0550ae; }
+  html[data-theme="light"] .hljs-string { color:#0a3069; }
+  html[data-theme="light"] .hljs-number { color:#0550ae; }
+  html[data-theme="light"] .hljs-literal { color:#cf222e; }
+  html[data-theme="light"] .hljs-punctuation { color:#57606a; }
+  .base-info { padding:12px 16px; display:flex; gap:20px; align-items:center; flex-wrap:wrap; font-size:13px; }
+  .base-info-item { display:flex; align-items:center; gap:6px; }
+
+  /* v1.23.7: кнопки «Локальные базы DP» — единый стиль.
+     v1.28.48: фон var(--bg), иначе на карточке кнопки сливались. */
+  .base-info button,
+  .base-info-actions button {
+    padding:6px 14px;
+    font-size:13px;
+    border-radius:6px;
+    border:1px solid var(--border);
+    background:var(--bg);
+    color:var(--fg);
+    cursor:pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .base-info button:hover,
+  .base-info-actions button:hover { border-color:var(--accent); }
+  .base-info button.primary,
+  .base-info-actions button.primary {
+    background:var(--accent); color:#fff; border-color:var(--accent);
+  }
+  .base-info-actions {
+    display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    margin-left:auto;
+  }
+  .junk-row { background:rgba(215,58,73,0.05); }
+  .junk-row td { opacity:0.7; }
+  .preview-dp-table { font-size:12px; }
+  .preview-dp-table th { padding:4px 8px; }
+  .preview-dp-table td { padding:3px 8px; }
+  .preview-device { border:1px solid var(--border); border-radius:6px; margin-bottom:12px; overflow:hidden; }
+  .preview-device { position: relative; }
+  .preview-device-header { padding:8px 12px; background:var(--bg); display:flex; justify-content:space-between; align-items:center; font-weight:600; }
+  /* v1.27.7: если есть крестик — резервируем место справа. */
+  .preview-device.has-remove-btn .preview-device-header { padding-right: 44px; }
+  /* v1.27.6: крестик «уже в конфиге — убрать» в правом верхнем углу. */
+  .preview-remove-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    background: rgba(215,58,73,0.15);
+    border: 1px solid rgba(215,58,73,0.4);
+    color: var(--red);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    z-index: 2;
+    padding: 0;
+  }
+  .preview-remove-btn:hover { background: rgba(215,58,73,0.25); }
+  /* Бейдж «уже в конфиге» в шапке карточки превью. */
+  .preview-already-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    background: rgba(46,160,67,0.18);
+    color: var(--green);
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .preview-device-body { padding:8px 12px; }
+  /* v1.27.7d: ошибка импорта — красная плашка на карточке. */
+  .preview-device-error {
+    background: rgba(215,58,73,0.12);
+    border: 1px solid rgba(215,58,73,0.4);
+    color: var(--red);
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    margin: 0 0 6px 0;
+    border-radius: 4px;
+  }
+  /* v1.28.10: тулбар устройства в превью импорта. */
+  .preview-device-header-tools {
+    padding: 6px 12px 8px 12px;
+    background: var(--bg);
+    border-top: 1px dashed var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  /* v1.28.10c: визуальный тумблер «Батарейное» (iOS-style switch). */
+  .battery-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+    margin: 0;
+    transition: color 0.15s;
+  }
+  .battery-switch:hover {
+    color: var(--fg);
+  }
+  /* Скрытый input — источник правды (checked). Кликается через label. */
+  .battery-switch-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    border: 0;
+    opacity: 0;
+  }
+  /* Трек — «дорожка» тумблера. */
+  .battery-switch-track {
+    position: relative;
+    display: inline-block;
+    width: 34px;
+    height: 20px;
+    background: var(--border);
+    border-radius: 10px;
+    transition: background 0.2s ease;
+    flex-shrink: 0;
+  }
+  /* Ползунок. */
+  .battery-switch-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    background: #fff;
+    border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+    transition: transform 0.2s ease;
+    will-change: transform;
+  }
+  /* Состояние ВКЛ — трек жёлтый, ползунок справа. */
+  .battery-switch-input:checked ~ .battery-switch-track {
+    background: var(--yellow);
+  }
+  .battery-switch-input:checked ~ .battery-switch-track .battery-switch-thumb {
+    transform: translateX(14px);
+  }
+  /* Hover на треке — чуть светлее. */
+  .battery-switch:hover .battery-switch-track {
+    background: rgba(139,148,158,0.35);
+  }
+  .battery-switch:hover .battery-switch-input:checked ~ .battery-switch-track {
+    background: #c8a02e;
+  }
+  /* Фокус с клавиатуры — обводка на треке. */
+  .battery-switch-input:focus-visible ~ .battery-switch-track {
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  /* Лейбл рядом с тумблером — два варианта текста. */
+  .battery-switch-label {
+    line-height: 1.2;
+  }
+  /* По умолчанию видно OFF-вариант (Проводное), ON скрыт. */
+  .battery-switch-label .battery-label-on { display: none; }
+  .battery-switch-label .battery-label-off { display: inline; }
+  /* Состояние ВКЛ: показываем ON, скрываем OFF. */
+  .battery-switch-input:checked ~ .battery-switch-label .battery-label-on { display: inline; }
+  .battery-switch-input:checked ~ .battery-switch-label .battery-label-off { display: none; }
+  /* Состояние ВКЛ — лейбл акцентным цветом. */
+  .battery-switch-input:checked ~ .battery-switch-label {
+    color: var(--yellow);
+    font-weight: 500;
+  }
+  /* Мобиль: чуть крупнее тумблер для пальца. */
+  @media (max-width: 700px) {
+    .battery-switch { font-size: 13px; gap: 10px; }
+    .battery-switch-track { width: 40px; height: 24px; border-radius: 12px; }
+    .battery-switch-thumb { width: 20px; height: 20px; top: 2px; left: 2px; }
+    .battery-switch-input:checked ~ .battery-switch-track .battery-switch-thumb {
+      transform: translateX(16px);
+    }
+  }
+  /* v1.27.7d: баннер ошибок в шапке превью. */
+  #preview-errors-banner {
+    background: rgba(215,58,73,0.12);
+    border-bottom: 1px solid rgba(215,58,73,0.4);
+    color: var(--red);
+    padding: 10px 16px;
+    font-size: 13px;
+  }
+  #preview-errors-banner .peb-title {
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  #preview-errors-banner ul {
+    margin: 4px 0 0 20px;
+    padding: 0;
+  }
+  .mobile-nav { display:none; padding:8px 12px; background:var(--bg); border-bottom:1px solid var(--border); align-items:center; justify-content:space-between; }
+  @media (max-width:700px) { .mobile-nav { display:flex; } }
+  .cloud-warn { background:rgba(176,136,0,0.12); border:1px solid var(--yellow); color:var(--yellow); padding:8px 12px; border-radius:6px; margin-bottom:12px; font-size:12px; }
+  /* v1.27.6: строка Cloud-устройства, уже добавленного в конфиг. */
+  tr.cloud-row-in-config td { background: rgba(46,160,67,0.08); }
+  tr.cloud-row-in-config:hover td { background: rgba(46,160,67,0.14); }
+  /* v1.27.7: disabled-устройство — серый фон вместо зелёного. */
+  tr.cloud-row-disabled td { background: rgba(139,148,158,0.10); }
+  tr.cloud-row-disabled:hover td { background: rgba(139,148,158,0.16); }
+  /* v1.28.45: выбранная строка (клик по галочке) — одна акцентная полоса
+     у левого края (раньше тень рисовалась у каждой ячейки). */
+  tr.cloud-row-selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  tr[data-cloud-idx] { cursor: pointer; }
+  /* v1.28.50: фильтры Cloud — как группа периодов (time-btn-group). */
+  .cloud-filter-btns { margin-left: 6px; }
+  .cloud-filter-btns button:not(.active):hover { border-color: var(--accent); background: rgba(3,102,214,0.08); }
+  .badge.enabled-ok { background: rgba(46,160,67,0.18); color: var(--green); }
+  .badge.enabled-off { background: rgba(139,148,158,0.18); color: var(--muted); }
+  .rebuild-bar { width:100%; height:6px; background:var(--border); border-radius:3px; overflow:hidden; margin-top:6px; }
+  .rebuild-bar-fill { height:100%; background:var(--accent); transition: width 0.3s; }
+  /* v1.28.65: неопределённый прогресс (фаза скачивания tuya-local). */
+  .rebuild-bar-fill.indeterminate {
+    width: 40% !important;
+    margin-left: -40%;
+    animation: base-indet 1.2s linear infinite;
+  }
+  @keyframes base-indet {
+    0%   { margin-left: -40%; }
+    100% { margin-left: 100%; }
+  }
+  .cloud-cache-banner {
+    display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    padding:8px 16px; font-size:12px;
+    background:rgba(176,136,0,0.12); color:var(--yellow);
+    border-bottom:1px solid var(--border);
+  }
+  .cloud-cache-banner.red {
+    background:rgba(215,58,73,0.12); color:var(--red);
+  }
+  .cloud-cache-banner button {
+    padding:3px 10px; font-size:11px;
+  }
+  select { appearance: auto; }
+  /* v1.28.12: секции в editDevice */
+  .edit-section {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+  .edit-section > summary {
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    font-weight: 500;
+    background: var(--bg);
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .edit-section > summary::-webkit-details-marker { display: none; }
+  .edit-section > summary::before {
+    content: "▶";
+    color: var(--muted);
+    font-size: 10px;
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  .edit-section[open] > summary::before { transform: rotate(90deg); }
+  .edit-section > summary:hover { background: var(--border); }
+  .edit-section-body {
+    padding: 12px 14px 6px 14px;
+    border-top: 1px solid var(--border);
+  }
+  .edit-section-danger > summary {
+    color: var(--red);
+    background: rgba(215,58,73,0.06);
+  }
+  .edit-section-danger > summary:hover {
+    background: rgba(215,58,73,0.12);
+  }
+  .edit-row-v2 { margin-bottom: 14px; }
+  .edit-row-v2 > label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 5px;
+    font-weight: 500;
+  }
+  .edit-row-v2 > input,
+  .edit-row-v2 > select {
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .edit-hint {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+  /* v1.28.13: подсветка изменённых полей в editDevice. */
+  .field-modified {
+    border-color: var(--yellow) !important;
+    box-shadow: 0 0 0 1px var(--yellow) inset;
+  }
+  /* ● рядом с лейблом изменённого поля. */
+  .edit-label-modified::after {
+    content: " ●";
+    color: var(--yellow);
+    font-weight: 700;
+    margin-left: 4px;
+  }
+  .edit-danger-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .edit-danger-row:last-child { border-bottom: none; }
+  .edit-danger-title {
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 4px;
+  }
+  .edit-danger-row button {
+    flex-shrink: 0;
+    align-self: center;
+    min-width: 110px;
+  }
+  .edit-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+    gap: 12px;
+  }
+  .edit-changed-indicator {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .edit-changed-indicator.dirty {
+    color: var(--yellow);
+    font-weight: 500;
+  }
+  .edit-row {
+    display:flex; gap:10px; align-items:flex-start;
+    padding:10px 0; border-bottom:1px solid var(--border);
+  }
+  .edit-row:last-of-type { border-bottom:none; }
+  .quiet-row { display:flex; gap:8px; align-items:center; padding:6px 0; }
+  .quiet-row input[type="time"] { width:auto; padding:4px 8px; font-size:12px; }
+  .edit-check { padding-top:22px; cursor:pointer; }
+  .edit-check input[type="checkbox"] {
+    width:18px; height:18px; cursor:pointer; accent-color:var(--accent);
+  }
+  .edit-field { flex:1; }
+  .edit-field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .edit-field input:disabled,
+  .edit-field select:disabled,
+  .edit-field button:disabled {
+    opacity:0.45; cursor:not-allowed;
+  }
+  .radio-row { display:flex; gap:8px; align-items:center; margin:8px 0; cursor:pointer; }
+  .radio-row input[type="radio"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
+  .radio-row label { cursor:pointer; margin:0; font-size:13px; color:var(--fg); }
+  /* v1.25.14: pre-wrap — uiConfirm/uiAlert используют textContent,
+     без этого \n в сообщениях теряются (склеиваются в одну строку). */
+  .ui-confirm-text { margin:0 0 16px 0; font-size:14px; line-height:1.5; white-space: pre-wrap; }
+  .ui-alert-icon { font-size:32px; text-align:center; margin-bottom:8px; }
+  .modal-footer { display:flex; gap:8px; justify-content:flex-end; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg); }
+  .latency-spark-labels { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); margin-top:2px; }
+  .chart-block { position:relative; }
+  .chart-subtitle { font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:0.5px; }
+  .chart-legend { display:flex; gap:16px; align-items:center; margin-top:6px; font-size:11px; color:var(--muted); flex-wrap:wrap; }
+  .legend-item { display:inline-flex; align-items:center; gap:6px; }
+  .legend-line { display:inline-block; width:20px; height:0; border-top:2px solid; }
+  .legend-line.online { border-color:var(--green); }
+  .legend-line.total { border-top-style:dashed; border-color:var(--muted); }
+  .legend-bar { display:inline-block; width:12px; height:10px; border-radius:2px; }
+  .legend-bar.flaps { background:var(--yellow); }
+
+  /* v1.24.6: tooltip для графиков. */
+  .chart-tooltip {
+    position: fixed;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+    pointer-events: none;
+    z-index: 2500;
+    max-width: 280px;
+    font-family: ui-monospace, monospace;
+    line-height: 1.45;
+  }
+  .chart-tooltip .tt-head {
+    color: var(--muted);
+    font-size: 11px;
+    margin-bottom: 4px;
+    white-space: nowrap;
+  }
+  .chart-tooltip .tt-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    white-space: nowrap;
+  }
+  .chart-tooltip .tt-name {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+  .chart-tooltip .tt-val { color: var(--muted); }
+  .chart-tooltip .tt-more {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .chart-tooltip .tt-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .chart-tooltip .tt-badge.good { background: rgba(46,160,67,0.18); color: var(--green); }
+  .chart-tooltip .tt-badge.mid  { background: rgba(176,136,0,0.18); color: var(--yellow); }
+  .chart-tooltip .tt-badge.bad  { background: rgba(215,58,73,0.18); color: var(--red); }
+  .chart-tooltip .tt-badge.online  { background: rgba(46,160,67,0.18); color: var(--green); }
+  .chart-tooltip .tt-badge.offline { background: rgba(215,58,73,0.18); color: var(--red); }
+
+  /* v1.24.6: подсветка элементов на hover/tap. */
+  svg .hoverable { transition: opacity 0.1s; }
+  svg .hoverable.dim { opacity: 0.35; }
+  svg rect.bar-hover { cursor: pointer; }
+  svg rect.bar-hover.hover { stroke: var(--fg); stroke-width: 1.5; }
+  svg rect.seg-hover { cursor: pointer; }
+  svg rect.seg-hover.hover { stroke: var(--fg); stroke-width: 1.5; }
+
+  /* v1.25.6: превью-таблица DP — 5 колонок, а не 7.
+     Фиксируем ширины по назначению, чтобы table-layout: fixed
+     из .wide-table не растягивал «Имя» и «Component». */
+  .detail-table.wide-table.preview-dp-table th:nth-child(1),
+  .detail-table.wide-table.preview-dp-table td:nth-child(1) {
+    width: 44px;
+    max-width: 44px;
+  }
+  /* v1.27.5: preview-dp-table col-dp 80 → 110px (ПК) — «209 мусор». */
+  .detail-table.wide-table.preview-dp-table th:nth-child(2),
+  .detail-table.wide-table.preview-dp-table td:nth-child(2) {
+    width: 110px;
+    max-width: 110px;
+  }
+  .detail-table.wide-table.preview-dp-table th:nth-child(3),
+  .detail-table.wide-table.preview-dp-table td:nth-child(3) {
+    width: 200px;
+    max-width: 220px;
+  }
+  .detail-table.wide-table.preview-dp-table th:nth-child(4),
+  .detail-table.wide-table.preview-dp-table td:nth-child(4) {
+    width: 90px;
+    max-width: 90px;
+    text-align: center;
+    vertical-align: middle;
+  }
+  .detail-table.wide-table.preview-dp-table th:nth-child(5),
+  .detail-table.wide-table.preview-dp-table td:nth-child(5) {
+    width: 110px;
+    max-width: 130px;
+  }
+
+  /* v1.23.0: probe-подсветка карточки */
+  .preview-device.probing { border-left: 3px solid var(--yellow); }
+  .preview-device.probe-ok { border-left: 3px solid var(--green); transition: border-color 0.5s; }
+  .preview-device.probe-fail { border-left: 3px solid var(--red); transition: border-color 0.5s; }
+
+  /* v1.23.0: короткие метки кнопок (по умолчанию скрыты, показываются на мобиле) */
+  .btn-label-short { display: none; }
+
+  /* v1.25.12: code в wide-table — box-sizing: border-box,
+     компактный padding, фон. Короткое — nowrap + ellipsis.
+     Длинное — 2 строки через -webkit-box. */
+  .detail-table.wide-table code {
+    box-sizing: border-box;
+    padding: 2px 5px;
+    border-radius: 3px;
+    background: var(--code-bg);
+    display: block;
+    width: 100%;
+    font-size: 11px;
+    line-height: 1.35;
+    vertical-align: top;
+  }
+  .detail-table.wide-table code.nowrap-short {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: normal;
+    overflow-wrap: normal;
+  }
+  .detail-table.wide-table code.trunc-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: anywhere;
+    max-height: calc(1.35em * 2 + 4px);
+    cursor: help;
+  }
+  /* v1.25.12: пустое значение — просто muted-прочерк, без фона. */
+  .detail-table.wide-table td.cell > .cell-inner > span.muted {
+    display: inline;
+    background: transparent;
+    padding: 0;
+  }
+
+  /* v1.25.12: table-layout: fixed + colgroup — колонки фиксированы,
+     содержимое ячеек обёрнуто в .cell-inner для overflow: hidden. */
+  .detail-table.wide-table {
+    table-layout: fixed;
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .detail-table.wide-table col.col-check     { width: 40px; }
+  /* v1.27.5: col-dp 80 → 110px — чтобы «209 мусор» влезало в строку. */
+  .detail-table.wide-table col.col-dp        { width: 110px; }
+  .detail-table.wide-table col.col-code      { width: 160px; }
+  .detail-table.wide-table col.col-name      { width: 200px; }
+  /* v1.27.5: колонка «Перевод» — только под иконку. */
+  /* v1.27.12: 90px — «Перевод» + значок по центру. */
+  .detail-table.wide-table col.col-translate { width: 90px; }
+  .detail-table.wide-table td.cell.col-translate,
+  .detail-table.wide-table th.col-translate {
+    text-align: center;
+    vertical-align: middle;
+  }
+  .detail-table.wide-table col.col-type      { width: 90px; }
+  .detail-table.wide-table col.col-values    { width: 240px; }
+  .detail-table.wide-table col.col-current   { width: 220px; }
+  .detail-table.wide-table col.col-component { width: 110px; }
+  /* v1.28.35: колонки превью импорта (источник/выбор) + узкие
+     Значения/Текущее именно для превью (в Cloud-модалке они шире). */
+  .detail-table.wide-table col.col-rowsrc     { width: 170px; }
+  .detail-table.wide-table col.col-src        { width: 100px; }
+  .detail-table.wide-table.preview-dp-table col.col-values  { width: 180px; }
+  .detail-table.wide-table.preview-dp-table col.col-current { width: 120px; }
+  .detail-table.wide-table td.cell {
+    padding: 6px 8px;
+    vertical-align: top;
+    overflow: hidden;
+    white-space: normal;
+    word-break: normal;
+  }
+  .detail-table.wide-table td.cell > .cell-inner {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .detail-table.wide-table td.cell.col-dp > .cell-inner,
+  .detail-table.wide-table td.cell.col-code > .cell-inner,
+  .detail-table.wide-table td.cell.col-type > .cell-inner,
+  .detail-table.wide-table td.cell.col-component > .cell-inner {
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .detail-table.wide-table td.cell > .cell-trunc {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  /* v1.25.8: не рвём по буквам. overflow-wrap: break-word
+     рвёт только если слово не влезает целиком. word-break: normal
+     сохраняет перенос по границам токенов (пробел, запятая). */
+  .detail-table.wide-table th,
+  .detail-table.wide-table td {
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
+    vertical-align: top;
+    overflow: hidden;
+    padding: 6px 8px;
+  }
+  /* узкие колонки — nowrap */
+  .detail-table.wide-table td:nth-child(1),
+  .detail-table.wide-table th:nth-child(1),
+  .detail-table.wide-table td:nth-child(2),
+  .detail-table.wide-table th:nth-child(2),
+  .detail-table.wide-table td:nth-child(3),
+  .detail-table.wide-table th:nth-child(3),
+  .detail-table.wide-table td:nth-child(4),
+  .detail-table.wide-table th:nth-child(4) {
+    white-space: nowrap;
+  }
+  /* .copy-row и бейджи — не вылезают */
+  .detail-table.wide-table .copy-row {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  .detail-table.wide-table .copy-hint {
+    display: none;
+  }
+  .detail-table.wide-table .badge.junk,
+  .detail-table.wide-table .type-badge,
+  .detail-table.wide-table .component-badge {
+    /* v1.28.35: бейджи не обрезаем (были «binary_sensor» → «binary_sen…»). */
+    vertical-align: middle;
+  }
+  /* v1.25.8: колонки «Значения»/«Текущее» — шире,
+     чтобы влезали короткие JSON без переноса. */
+  /* v1.28.35: порядок колонок — 5=Тип, 6=Значения, 7=Текущее. */
+  .detail-table.wide-table td:nth-child(6),
+  .detail-table.wide-table th:nth-child(6) {
+    width: 240px;
+    max-width: 240px;
+  }
+  .detail-table.wide-table td:nth-child(7),
+  .detail-table.wide-table th:nth-child(7) {
+    width: 220px;
+    max-width: 220px;
+  }
+  /* v1.25.8: code в колонках Значения/Текущее —
+     word-break: normal, overflow-wrap: break-word.
+     Плюс внутренний скролл для огромных JSON (scene_data),
+     которые всё равно не влезают в 260px. */
+  /* v1.25.10: содержимое td:nth-child(5)/(6) управляется
+     классами .nowrap-short и .trunc-2 — они дают overflow: hidden. */
+
+  /* Fallback: если code без класса (не через _truncCell) —
+     обрезаем с ellipsis. */
+  .detail-table.wide-table td:nth-child(6) code:not(.nowrap-short):not(.trunc-2) {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    font-size: 11px;
+  }
+  .detail-table.wide-table .copy-row code {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
+  }
+  /* «STATUS ИЗ ОБЛАКА» — 2 колонки (Код + Значение).
+     v1.25.6: правила согласованы для td и th.
+     max-width: 0 не даём — таблица не fixed, поэтому ширины
+     работают как обычные (проценты от 100%). */
+  /* v1.27.12: заголовок «Перевод» в wide-table — по центру, nowrap. */
+  .detail-table.wide-table th.col-translate,
+  .detail-table.wide-table th:nth-child(3) {
+    text-align: center;
+    white-space: nowrap;
+    overflow: visible;
+  }
+
+  .detail-table.wide-table.wide-table-2col td:nth-child(1),
+  .detail-table.wide-table.wide-table-2col th:nth-child(1) {
+    width: 35%;
+    max-width: 260px;
+  }
+  .detail-table.wide-table.wide-table-2col td:nth-child(2),
+  .detail-table.wide-table.wide-table-2col th:nth-child(2) {
+    width: 65%;
+    max-width: 520px;
+  }
+  .detail-table.wide-table.wide-table-2col td:nth-child(2) code,
+  .detail-table.wide-table.wide-table-2col td:nth-child(2) .copy-row code {
+    display: block;
+    white-space: normal;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    max-width: 100%;
+  }
+
+  /* v1.23.3: мобильная адаптация — burger-меню + grid. */
+  @media (max-width: 700px) {
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 8px;
+      padding: 10px 12px;
+      align-items: center;
+    }
+    header h1 { grid-column: 1; grid-row: 1; font-size: 16px; margin: 0; }
+    #nav-toggle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      grid-column: 2; grid-row: 1;
+      min-width: 44px; min-height: 44px;
+      font-size: 20px; padding: 6px;
+    }
+    #theme-btn {
+      grid-column: 3; grid-row: 1;
+      min-width: 44px; min-height: 44px;
+      font-size: 18px; padding: 6px;
+    }
+
+    /* v1.23.3: nav — выпадающее меню, скрыто по умолчанию */
+    nav#main-nav {
+      display: none;
+      grid-column: 1 / -1;
+      grid-row: 2;
+      flex-direction: column;
+      gap: 0;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px;
+      margin-top: 8px;
+    }
+    nav#main-nav.nav-open { display: flex; }
+    nav#main-nav a {
+      display: block;
+      width: 100%;
+      padding: 12px 16px;
+      font-size: 14px;
+      text-align: left;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+
+    /* v1.23.8: обёртки шапки «растворяем» — дети снова прямые в grid. */
+    .header-row1, .header-row3 { display: contents; }
+
+    #health-widget {
+      grid-column: 1 / -1; grid-row: 3;
+      justify-content: center;
+      font-size: 12px; padding: 6px 10px; gap: 4px;
+    }
+    #health-widget .hw-opt { display: none; }
+    #health-widget.hw-expanded { flex-wrap: wrap; }
+    #health-widget.hw-expanded .hw-opt { display: inline; }
+    #health-detail {
+      grid-column: 1 / -1; grid-row: 4;
+      margin: 0;
+    }
+    .toolbar {
+      grid-column: 1 / -1; grid-row: 5;
+      display: flex;
+      flex-direction: row;
+      gap: 6px;
+      width: 100%;
+      margin-left: 0;
+      flex-wrap: wrap;
+    }
+    /* v1.23.7: фиксируем flex-basis 30% — 3 кнопки в ряд, но с переносом. */
+    .toolbar > button {
+      flex: 1 1 30%;
+      min-width: 0;
+      padding: 12px 8px;
+      font-size: 12px;
+      min-height: 44px;
+    }
+    .toolbar .btn-label { display: none; }
+    .toolbar .btn-label-short { display: inline; }
+    #latency-result:empty, #cleanup-result:empty { display: none; }
+
+    button { min-height: 36px; }
+
+    /* v1.23.6: логи — mobile-only. Порядок строк через grid order.
+       Десктопные правила выше НЕ трогаем. */
+    .logs-toolbar {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      padding: 8px 10px;
+    }
+    /* Скрываем подписи «Источник:» и счётчик поиска на мобиле */
+    .logs-toolbar [data-role="source-label"],
+    .logs-toolbar [data-role="info"] { display: none; }
+
+    /* Порядок: пауза → источник → уровень/Все → диапазон → скачать → поиск */
+    .logs-toolbar [data-role="pause"]    { order: 1; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="source"]   { order: 2; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="level"]    { order: 3; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="range"]    { order: 4; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="download"] { order: 5; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="search"]   { order: 6; grid-column: 1 / -1; }
+
+    /* v1.23.7: обёртки-строки «растворяем» — дети снова в grid. */
+    .logs-toolbar-row1,
+    .logs-toolbar-row2,
+    .logs-toolbar-row2-left,
+    .logs-toolbar-row2-right { display: contents; }
+
+    .logs-toolbar #log-source-switch {
+      display: flex;
+      gap: 0;
+      width: 100%;
+    }
+    .logs-toolbar .log-source-btn {
+      flex: 1 1 0;
+      min-height: 36px;
+      padding: 8px 6px;
+      font-size: 12px;
+    }
+
+    /* Bridge: DEBUG/INFO+/WARN+/ERROR — как было */
+    #log-level-filter {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+    }
+    #log-level-filter.hidden { display: none !important; }
+    #log-level-filter button { padding: 5px 8px; font-size: 11px; }
+
+    .logs-toolbar .time-btn-group {
+      display: flex;
+      width: 100%;
+      margin-left: 0 !important;
+    }
+    .logs-toolbar .time-btn-group button {
+      flex: 1 1 0;
+      padding: 8px 4px;
+      font-size: 12px;
+      min-height: 36px;
+    }
+
+    .logs-toolbar .logs-download {
+      width: 100%;
+      min-height: 36px;
+    }
+
+    /* Поиск: input + × + ▲ + ▼ одной строкой */
+    .logs-toolbar .logs-tb-search {
+      display: flex;
+      width: 100%;
+      gap: 4px;
+      align-items: stretch;
+      margin-left: 0;
+    }
+    .logs-tb-search #log-search {
+      flex: 1 1 auto;
+      min-width: 0;
+      max-width: none;
+      height: 36px;
+    }
+    .logs-tb-search #find-clear-btn,
+    .logs-tb-search #find-next-btn,
+    .logs-tb-search #find-prev-btn {
+      flex: 0 0 auto;
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      font-size: 14px;
+    }
+    /* v1.23.4: диапазоны (30мин/1час/Сутки/Всё) — на всю ширину, равные */
+    /* v1.25.13: дубль .logs-toolbar .time-btn-group удалён —
+       выше уже есть такой же блок (после .logs-tb-search). */
+    /* v1.23.4: import-actions — 3 строки */
+    #import-actions {
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    #import-actions > button { flex: 1 1 auto; }
+    #import-actions #selected-count {
+      flex-basis: 100%;
+      text-align: center;
+      margin: 0;
+    }
+    #import-actions .primary {
+      flex-basis: 100%;
+      margin-left: 0 !important;
+    }
+
+    /* v1.23.4: Tools — кнопки в столбик на всю ширину, счётчик по центру */
+    .tools-toolbar {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 6px;
+      padding: 10px 12px;
+    }
+    .tools-toolbar button {
+      width: 100%;
+      text-align: center;
+      margin-left: 0 !important;
+      padding: 10px 8px;
+      min-height: 40px;
+      font-size: 12px;
+    }
+    .tools-toolbar #tools-info {
+      text-align: center;
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    /* v1.23.4: tools — левая колонка уже */
+    .tools-split { grid-template-columns: 140px 1fr; }
+    .tools-list-item { padding: 8px 10px; font-size: 12px; }
+    .tools-list-item .tools-list-ip {
+      font-size: 10px;
+      word-break: break-all;
+      line-height: 1.3;
+    }
+    .tools-detail { padding: 12px; }
+
+    /* v1.23.4: hint в заголовке — под заголовком, мельче, курсив */
+    .section-title {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }
+    .section-title .hint {
+      display: block;
+      font-size: 10px;
+      font-style: italic;
+      color: var(--muted);
+      margin: 0;
+      line-height: 1.3;
+    }
+
+    /* v1.27.9: .modal-overlay.center-on-mobile — центрируется
+       по вертикали (ui-confirm/ui-alert/ui-prompt и прочие
+       small-модалки). Большие (device/cloud/preview) остаются
+       flex-start, чтобы не обрезались сверху на низких экранах. */
+    .modal-overlay.center-on-mobile {
+      align-items: center;
+    }
+
+    /* v1.24.0 (мобиль): модалка прижимается к верху,
+       max-height от dvh, учитывается safe-area. Не уезжает под бар. */
+    .modal-overlay {
+      align-items: flex-start;
+      padding: calc(env(safe-area-inset-top, 0px) + 8px) 8px
+               calc(env(safe-area-inset-bottom, 0px) + 8px) 8px;
+      overflow: hidden;
+    }
+    .modal {
+      max-height: calc(100dvh - env(safe-area-inset-top, 0px)
+                       - env(safe-area-inset-bottom, 0px) - 16px);
+      margin: 0;
+    }
+    .modal.small { max-height: calc(100dvh - 24px); }
+
+    /* v1.23.10 (мобиль): info-таблицы в модалке (Status, Info,
+       Last seen) ломаем в одну колонку — label сверху, значение снизу.
+       НЕ трогаем .wide-table (много-колоночные) и .cache-details.
+       v1.25.1: :not(.wide-table) — чтобы не перебивать широкие таблицы. */
+    .detail-table:not(.wide-table):not(.cache-details .detail-table),
+    .detail-table:not(.wide-table):not(.cache-details .detail-table) tbody,
+    .detail-table:not(.wide-table):not(.cache-details .detail-table) tr,
+    .detail-table:not(.wide-table):not(.cache-details .detail-table) td {
+      display: block;
+      width: 100%;
+    }
+    .detail-table:not(.wide-table) tr {
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-table:not(.wide-table) tr:last-child { border-bottom: none; }
+    .detail-table:not(.wide-table) td {
+      padding: 0;
+      border-bottom: none;
+      white-space: normal;
+      word-break: break-word;
+    }
+    .detail-table:not(.wide-table) td:first-child {
+      width: 100%;
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: none;
+      margin-bottom: 2px;
+      white-space: normal;
+    }
+    .detail-table:not(.wide-table) td:last-child {
+      font-size: 13px;
+      color: var(--fg);
+    }
+
+    /* v1.25.11: старый v1.25.1 блок .wide-table удалён. */
+
+    /* v1.25.1: обёртка для горизонтального скролла широких таблиц. */
+    /* v1.25.5: на мобиле — уже колонки, тот же перенос. */
+    /* v1.28.34: удалены мёртвые width:30%/22% для :nth-child(5)/(6) —
+       те же селекторы переопределяются ниже (220px/200px). */
+
+
+    /* v1.25.1: «Кэш состояния» — 2 колонки, не ломаем через :not(). */
+
+    .cache-details .detail-table tbody {
+      display: table-row-group !important;
+    }
+    .cache-details .detail-table tr {
+      display: table-row !important;
+    }
+    .cache-details .detail-table td {
+      display: table-cell !important;
+      width: auto !important;
+      padding: 4px 8px !important;
+      border-bottom: 1px solid var(--border);
+    }
+    .cache-details .detail-table td:first-child {
+      width: 55% !important;
+      color: var(--fg) !important;
+      font-size: 12px !important;
+      text-transform: none !important;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    .cache-details .detail-table td:last-child {
+      font-size: 12px !important;
+    }
+
+    /* v1.23.7 (мобиль): узкие карточки «Хронология» и «Мерцающие» —
+       высота по содержимому, не больше 420px. */
+    .analytics-card.compact {
+      max-height: 420px;
+      min-height: 0;
+      align-self: start;
+    }
+    .analytics-card.compact .analytics-table-scroll,
+    .analytics-card.compact .timeline-scroll {
+      min-height: 0;
+      max-height: 340px;
+    }
+
+    /* v1.25.7 (мобиль): «Локальные базы DP» — 2 колонки.
+       Инфо-строки: label слева, значение справа (grid 1fr auto).
+       Кнопки: grid 1fr 1fr (2 колонки, каждая на всю ширину ячейки).
+       Последняя кнопка («Пересобрать tinytuya.json») растягивается
+       на 2 колонки. */
+    .base-info {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      padding: 12px 14px;
+    }
+    .base-info-item {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+    }
+    .base-info-item b {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .base-info-item span {
+      font-size: 12px;
+      text-align: right;
+    }
+    .base-info-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      width: 100%;
+      margin-left: 0;
+    }
+    .base-info-actions button {
+      width: 100%;
+      text-align: center;
+      min-height: 40px;
+      font-size: 12px;
+      padding: 8px 6px;
+      margin: 0;
+    }
+    /* «Пересобрать tinytuya.json» — на 2 колонки */
+    .base-info-actions #rebuild-btn {
+      grid-column: 1 / -1;
+    }
+    /* base-update-result — на всю ширину, по центру */
+    .base-info-actions #base-update-result {
+      grid-column: 1 / -1;
+      text-align: center;
+      font-size: 11px;
+    }
+
+    /* v1.23.3: чуть меньше padding body */
+    body { padding: 12px; }
+
+    /* v1.25.1: health-деталка на мобиле — 2 колонки сохраняем,
+       но первая колонка компактнее (90px), бейджи CPU/RAM
+       в одну строку без переносов. */
+    .health-detail {
+      padding: 12px 14px;
+    }
+    .health-detail .hd-grid {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 4px 6px;
+      font-size: 11px;
+    }
+    .health-detail .hd-badge {
+      padding: 0px 4px;
+      font-size: 10px;
+      margin-left: 4px;
+    }
+    .health-detail .hd-lbl {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: none;
+      letter-spacing: 0;
+      margin-top: 0;
+      align-self: start;
+      padding-top: 2px;
+      white-space: nowrap;
+    }
+    .health-detail .hd-val {
+      font-size: 12px;
+      line-height: 1.5;
+      word-break: normal;
+    }
+    .health-detail .hd-val .hd-badge {
+      display: inline-flex;
+      align-items: center;
+      margin: 0;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    .health-detail .hd-head {
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .health-detail .hd-section-title {
+      margin-top: 4px;
+    }
+
+    /* v1.25.1: широкие таблицы в модалках на мобиле —
+       горизонтальный скролл, а не «в столбик».
+       Правило .detail-table ниже уже ломает таблицы в одну
+       колонку (label сверху, значение снизу) — это ок для
+       info-таблиц (Status, Info), но НЕ для таблиц
+       «Сопоставление DP» / «STATUS ИЗ ОБЛАКА» / «Кэш состояния»,
+       где колонок много. */
+    /* v1.25.10 (мобиль): .wide-table — auto + фикс. ширины.
+       overflow: hidden не даёт значениям наезжать друг на друга. */
+    .detail-table.wide-table {
+      display: table !important;
+      width: auto !important;
+      min-width: 100%;
+      table-layout: auto;
+      border-collapse: collapse;
+    }
+    .detail-table.wide-table th,
+    .detail-table.wide-table td {
+      vertical-align: top;
+      overflow: hidden;
+      padding: 6px 8px !important;
+      border-bottom: 1px solid var(--border);
+    }
+    /* Узкие колонки — nowrap */
+    .detail-table.wide-table th:nth-child(1),
+    .detail-table.wide-table td:nth-child(1),
+    .detail-table.wide-table th:nth-child(2),
+    .detail-table.wide-table td:nth-child(2),
+    .detail-table.wide-table th:nth-child(3),
+    .detail-table.wide-table td:nth-child(3),
+    .detail-table.wide-table th:nth-child(4),
+    .detail-table.wide-table td:nth-child(4) {
+      white-space: nowrap;
+    }
+    /* v1.28.35: 5=Тип, 6=Значения, 7=Текущее. */
+    .detail-table.wide-table th:nth-child(6),
+    .detail-table.wide-table td:nth-child(6) {
+      width: 220px;
+      max-width: 220px;
+    }
+    .detail-table.wide-table th:nth-child(7),
+    .detail-table.wide-table td:nth-child(7) {
+      width: 200px;
+      max-width: 200px;
+    }
+    /* COMPONENT */
+    .detail-table.wide-table th:nth-child(4),
+    .detail-table.wide-table td:nth-child(4) { min-width: 90px; }
+    /* v1.25.8: code внутри «Значения» — не рвём по буквам. */
+    .detail-table.wide-table td:nth-child(6) code,
+    .detail-table.wide-table td:nth-child(6) .copy-row code {
+      display: block;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+      max-width: 100%;
+      max-height: 200px;
+      overflow-x: auto;
+      overflow-y: auto;
+    }
+    .detail-table.wide-table .copy-row code {
+      overflow: visible;
+      text-overflow: clip;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    /* «STATUS ИЗ ОБЛАКА» — 2 колонки */
+    /* v1.25.8: STATUS ИЗ ОБЛАКА — 2 колонки, значение переносится
+       только по границам токенов. */
+    .detail-table.wide-table.wide-table-2col th:nth-child(1),
+    .detail-table.wide-table.wide-table-2col td:nth-child(1) {
+      min-width: 100px;
+      max-width: 140px;
+      white-space: nowrap;
+    }
+    .detail-table.wide-table.wide-table-2col th:nth-child(2),
+    .detail-table.wide-table.wide-table-2col td:nth-child(2) {
+      min-width: 240px;
+      max-width: 340px;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    .detail-table.wide-table.wide-table-2col td:nth-child(2) code,
+    .detail-table.wide-table.wide-table-2col td:nth-child(2) .copy-row code {
+      display: block;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+      max-width: 100%;
+      max-height: 200px;
+      overflow-x: auto;
+      overflow-y: auto;
+    }
+    /* Обёртка для горизонтального скролла */
+    .wide-table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 0 -14px;
+      padding: 0 14px;
+    }
+
+    /* «Кэш состояния» — таблица из 2 колонок, на мобиле
+       оставляем как есть (label сверху не нужен — там и так
+       DP + значение). Но не даём .detail-table ломать её. */
+    .cache-details .detail-table,
+    .cache-details .detail-table tbody,
+    .cache-details .detail-table tr,
+    .cache-details .detail-table td {
+      display: table;
+      width: auto;
+    }
+    .cache-details .detail-table {
+      display: table !important;
+      width: 100% !important;
+      border-collapse: collapse;
+    }
+    .cache-details .detail-table tbody {
+      display: table-row-group;
+    }
+    .cache-details .detail-table tr {
+      display: table-row;
+    }
+    .cache-details .detail-table td {
+      display: table-cell;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--border);
+      width: auto;
+    }
+    .cache-details .detail-table td:first-child {
+      width: 55%;
+      color: var(--fg);
+      font-size: 12px;
+      text-transform: none;
+      margin-bottom: 0;
+      white-space: normal;
+      word-break: normal;
+      overflow-wrap: break-word;
+    }
+    .cache-details .detail-table td:last-child {
+      width: 45%;
+      font-size: 12px;
+      word-break: break-all;
+      overflow-wrap: break-word;
+    }
+
+    /* v1.28.9: таблицы устройств и latency — горизонтальный скролл
+       на мобиле. Иначе «Задержка» обрезается по правому краю
+       (4 колонки ~480px не влезают в ~350px экрана). */
+    .devices-table-wrap,
+    .latency-table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 0 -14px;
+      padding: 0 14px;
+    }
+    .devices-table-wrap > table {
+      min-width: 460px;
+    }
+    .latency-table-wrap > table {
+      min-width: 420px;
+    }
+  }
+  /* ============ v1.27.0: DPS EDIT ============ */
+  .dps-section {
+    margin: 12px 0 0 0;
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+  }
+  .dps-section > h3 {
+    font-size: 12px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .dps-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .dps-header h3 {
+    margin: 0;
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .dps-header-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .dps-header-actions button {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .dps-list-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 12px 0 6px 0;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+  }
+  .dps-list-title:first-of-type {
+    border-top: none;
+    padding-top: 0;
+  }
+  .dps-count {
+    background: var(--border);
+    color: var(--muted);
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 11px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .dps-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    /* v1.28.33.fixup: fixed — колонки фиксируются по width,
+       «пустоты» между Code и Перевод больше нет. */
+    table-layout: fixed;
+  }
+  .dps-table th {
+    padding: 6px 8px;
+    text-align: left;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+  }
+  .dps-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+    word-break: normal;
+    overflow-wrap: break-word;
+  }
+  /* v1.27.5: короткое — без переносов (переносы только для длинных
+     JSON-значений в col-val/col-src). */
+  /* v1.28.84 (Firefox): при border-collapse: collapse FF по-разному
+     округляет границы строк → линии «дёргались». separate + spacing 0
+     рисует границу каждой ячейкой — ровно. */
+  .dps-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
+  .dps-table td.col-dp,
+  .dps-table td.col-code,
+  .dps-table td.col-comp,
+  .dps-table td.col-act { white-space: nowrap; }
+  .dps-table tr:last-child td {
+    border-bottom: none;
+  }
+  /* v1.28.35: ширины под бейджи/иконки (cloud+cache, binary_sensor). */
+  .dps-table .col-dp { width: 90px; }
+  .dps-table .col-code { width: 170px; }
+  /* v1.28.33: колонка «Перевод» — только под иконку, по центру. */
+  .dps-table .col-translate {
+    width: 70px;
+    min-width: 70px;
+    max-width: 70px;
+    text-align: center;
+    vertical-align: middle;
+  }
+  /* v1.28.35: единый порядок — DP/Code/Перевод/Component/Тип/Значения/
+     Текущее/Источник/действие (во всех модалках). */
+  .dps-table .col-comp { width: 120px; }
+  .dps-table .col-type { width: 80px; }
+  .dps-table .col-values { width: 160px; }
+  .dps-table .col-current { width: 120px; }
+  .dps-table .col-src { width: 110px; }
+  /* v1.27.2: фиксированная ширина последней колонки.
+     Иначе в списке 2 (одна кнопка ➕) и в списке 1 (две-три кнопки)
+     ячейки «плывут» по ширине — кнопки смещаются вправо-влево. */
+  .dps-table .col-act {
+    width: 90px;
+    min-width: 90px;
+    max-width: 90px;
+    text-align: right;
+  }
+  .dps-table th.col-act {
+    width: 90px;
+    min-width: 90px;
+    max-width: 90px;
+  }
+  .dps-table code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+  /* v1.28.33.fixup: col-code — обычный table-cell. Flex растягивал
+     колонку и сдвигал col-translate. Значок 📖 теперь в col-translate. */
+  .dps-table td.col-code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dps-table td.col-code > code {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  /* v1.28.35: клип только для DP-кода (длинные ключи вида 6_voltage).
+     Бейджи/иконки не обрезаем — колонки под них расширены. */
+  .dps-table td.col-dp {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dps-table td.col-dp > code {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  .dps-actions button {
+    padding: 2px 8px;
+    font-size: 11px;
+    line-height: 1.2;
+    min-width: 28px;
+  }
+  .dps-warn {
+    color: var(--yellow);
+    font-size: 11px;
+  }
+  .dps-empty {
+    padding: 12px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .dps-source-badge {
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;   /* v1.27.5 */
+  }
+  .dps-source-badge.cloud-cache { background: rgba(56,139,253,0.18); color: #388bfd; }
+  /* v1.27.2: бейдж для DP, убранных пользователем (в _removed). */
+  .dps-source-badge.removed {
+    background: rgba(215,58,73,0.18);
+    color: var(--red);
+  }
+  /* v1.27.4: единый JS-тултип #dp-tooltip.
+     .dp-tip — только значки 📖/🈶/☁.
+     .tip-generic — общие подсказки (например Health-бейдж).
+     Позиция и внешний вид — из JS (position: fixed), не обрезается. */
+  #dp-tooltip {
+    position: fixed;
+    z-index: 5000;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+    /* v1.27.6: pre-wrap — перенос длинных строк. max-width/min —
+       чтобы Health-тултип не растягивался на весь экран. */
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+    color: var(--fg);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    pointer-events: none;
+    max-width: min(420px, 90vw);
+    max-height: 50vh;
+    overflow-y: auto;
+  }
+  .dp-tip {
+    cursor: help;
+    display: inline-block;
+    vertical-align: middle;
+    margin-left: 4px;
+  }
+  .tip-generic {
+    cursor: help;
+    /* v1.27.6: по умолчанию — без подчёркивания (для эмодзи ⚠️/📖). */
+  }
+  /* Текстовые бейджи (например «не читается UI») — с подчёркиванием. */
+  .tip-generic.tip-text {
+    border-bottom: 1px dotted var(--muted);
+  }
+  /* Мобиль: расширенная зона тапа (44×44) через padding+margin.
+     Визуально значок не меняется, но палец попадает. */
+  @media (max-width: 700px) {
+    /* v1.28.48: зона тапа увеличивается через ::after, а визуал — нет
+       (раньше padding раздувал фон бейджа). */
+    .dp-tip { padding: 0; margin: 0; position: relative; }
+    .dp-tip::after { content: ""; position: absolute; inset: -12px -10px; }
+    .tip-generic { padding: 0; margin: 0; position: relative; }
+    .tip-generic::after { content: ""; position: absolute; inset: -8px; }
+    .badge-locked { position: relative; }
+    .badge-locked::after { content: ""; position: absolute; inset: -10px -6px; }
+    /* v1.28.48: Local key — маска и кнопка 👁 в одну строку. */
+    .detail-table-key-merged td:last-child {
+      display: flex; align-items: center; gap: 8px; flex-wrap: nowrap;
+    }
+  }
+  .dps-source-badge.cloud       { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .dps-source-badge.cache       { background: rgba(176,136,0,0.18); color: var(--yellow); }
+  /* v1.28.35: «Текущее»/«Тип» — обычный текст; полосы кода только
+     у «Code» и «Значения». */
+  .dps-table td.col-current {
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dps-table td.col-type {
+    font-size: 11px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dps-hint {
+    font-size: 11px;
+    color: var(--muted);
+    margin: 4px 0 8px 0;
+    line-height: 1.3;
+  }
+  .dps-dirty-banner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(176,136,0,0.12);
+    color: var(--yellow);
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    margin-top: 8px;
+  }
+  .dps-actions-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .dps-actions-bar .dps-save-btn {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .dps-info {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 8px 0;
+    line-height: 1.4;
+  }
+  .dps-info a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .dps-info a:hover {
+    text-decoration: underline;
+  }
+  /* Модалки: shared */
+  .dps-fill-value {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+    word-break: break-all;
+    white-space: pre-wrap;
+    margin-bottom: 8px;
+  }
+  .dps-fill-hint {
+    color: var(--muted);
+    font-size: 11px;
+    margin-bottom: 12px;
+  }
+  /* v1.28.69: сводка «Будет записано в конфиг» в форме DP. */
+  .dps-fill-willwrite {
+    margin-top: 10px;
+    padding: 6px 10px;
+    font-size: 11px;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+  }
+  .dps-fill-willwrite code {
+    background: none;
+    padding: 0;
+    color: var(--fg);
+  }
+  /* v1.28.71: справочные значения в форме DP. */
+  .dps-fill-ref {
+    margin-top: 10px;
+  }
+  .dps-fill-ref > summary {
+    font-size: 12px;
+    cursor: pointer;
+    color: var(--muted);
+  }
+  .dps-fill-ref-body {
+    margin-top: 6px;
+    font-size: 12px;
+  }
+  .dps-fill-ref-row {
+    display: flex;
+    gap: 8px;
+    padding: 2px 0;
+    flex-wrap: wrap;
+  }
+  .dps-fill-ref-label {
+    color: var(--muted);
+    min-width: 150px;
+  }
+  /* v1.28.71: сырые данные устройства (модалка дашборда).
+     v1.28.73: тот же вертикальный ритм, что у остальных секций. */
+  .raw-details {
+    margin: 0;
+  }
+  .raw-details > summary {
+    margin: 0;
+    padding: 2px 0;
+    font-size: 12px;
+    line-height: 1.2;
+    cursor: pointer;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .raw-pre {
+    background: var(--bg);
+    padding: 12px;
+    border-radius: 4px;
+    font-size: 11px;
+    /* v1.28.85: width:0 → блок не влияет на max-content модалки;
+       min-width:100% → занимает ширину карточки и текст ПЕРЕНОСИТСЯ. */
+    width: 0;
+    min-width: 100%;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    overflow-x: hidden;
+    overflow-y: auto;
+    max-height: 400px;
+    margin-top: 8px;
+    scrollbar-width: thin;
+  }
+  /* v1.28.83 (Firefox): тонкий скроллбар — иначе классический «толстый»
+     сдвигает таблицу и давал лёгкие скачки. */
+  .dps-table-wrap,
+  .wide-table-wrap,
+  #modal-body { scrollbar-width: thin; }
+  .dps-compare-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .dps-compare-table th {
+    padding: 6px 10px;
+    text-align: left;
+    font-size: 11px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  .dps-compare-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+  }
+
+  /* v1.28.75: единый ритм секций модалки устройства — h3:first-child внутри
+     зон больше не «слипает» соседние блоки. */
+  #modal-volatile-rest > div > h3:first-child { margin-top: 16px; }
+  #mv-history > h3:first-child { margin-top: 16px; }
+  #mv-cache .cache-details > summary,
+  #mv-raw .raw-details > summary { margin: 4px 0; padding: 0; line-height: 1.25; }
+  .raw-details > summary { margin: 4px 0; padding: 0; line-height: 1.25; }
+  /* v1.28.88: раздел «Справка». */
+  #nav-help .help-q { color: var(--red); font-weight: 700; }
+  .help-tabs { display: block; margin: 4px 0 0 0; }
+  .help-tabs button {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  .help-tabs button:hover { border-color: var(--accent); }
+  .help-tabs button.active {
+    border-color: var(--accent); color: var(--accent); background: rgba(3,102,214,0.10);
+  }
+  .help-body { font-size: 13px; line-height: 1.65; }
+  .help-body h3 { margin: 18px 0 6px 0; font-size: 13px; color: var(--fg); }
+  .help-body h3:first-child { margin-top: 0; }
+  .help-body ul { margin: 6px 0 12px 20px; padding: 0; }
+  .help-body li { margin: 5px 0; line-height: 1.65; }
+  .help-body li > code:first-child { white-space: nowrap; }
+  .help-body .help-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .help-body code { font-size: 12px; }
+  /* v1.28.89: два уровня справки — Bridge / WebUI, ниже разделы. */
+  .card-pad { padding: 0 16px 16px 16px; }
+  .help-top-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 10px 0; }
+  .help-top-row .help-top {
+    padding: 7px 14px; font-size: 13px; font-weight: 500;
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .help-top-row .help-top:hover { border-color: var(--accent); background: rgba(3,102,214,0.08); }
+  .help-top-row .help-top.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .help-tabs-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px 0; }
+  .help-tabs-row button {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  .help-tabs-row button:hover { border-color: var(--accent); }
+  .help-tabs-row button.active {
+    border-color: var(--accent); color: var(--accent); background: rgba(3,102,214,0.10);
+  }
+
+  /* Мобильная адаптация секции DP */
+  @media (max-width: 700px) {
+    /* v1.27.5: на мобиле badge junk — иконка 🗑 вместо текста «мусор». */
+    .badge.junk .junk-icon { display: inline; }
+    .badge.junk .junk-text { display: none; }
+
+    .dps-header {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 6px;
+    }
+    .dps-header h3 {
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+    }
+    .dps-header-actions {
+      display: flex;
+      gap: 6px;
+      width: 100%;
+    }
+    .dps-header-actions button {
+      flex: 1 1 auto;
+      min-height: 40px;
+      font-size: 13px;
+    }
+    .dps-list-title {
+      flex-wrap: wrap;
+    }
+    .dps-actions {
+      display: flex;
+      gap: 4px;
+      justify-content: flex-end;
+    }
+    .dps-edit-mode-bar {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 6px;
+    }
+    .dps-edit-mode-toggle {
+      width: 100%;
+      min-height: 40px;
+      font-size: 13px;
+    }
+    .dps-actions-bar {
+      flex-direction: column;
+      align-items: stretch;
+    }
+    .dps-actions-bar button {
+      width: 100%;
+      min-height: 44px;
+      font-size: 14px;
+    }
+    .dps-dirty-banner {
+      width: 100%;
+    }
+    .dps-fill-value {
+      max-height: 140px;
+    }
+    /* v1.28.74: мобильный DP — таблица с горизонтальной прокруткой
+       (вместо «столбика» карточек); второстепенные колонки скрыты. */
+    .dps-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .dps-table { display: table; min-width: 430px; border-collapse: collapse; }
+    .dps-table thead { display: table-header-group; }
+    .dps-table tbody { display: table-row-group; }
+    .dps-table tr {
+      display: table-row; border: none; border-radius: 0;
+      margin: 0; padding: 0; background: none; position: static;
+    }
+    .dps-table td {
+      display: table-cell; width: auto; padding: 5px 8px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap; text-align: left; overflow-wrap: normal;
+    }
+    .dps-table .col-translate,
+    .dps-table .col-src { display: none; }
+    .dps-table td.col-dp { border-bottom: 1px solid var(--border); margin: 0; padding-bottom: 5px; }
+    .dps-table td.col-act { position: static; width: auto; text-align: right; padding-top: 5px; }
+    .dps-table td.col-code,
+    .dps-table td.col-values,
+    .dps-table td.col-current {
+      max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .dps-table td code { white-space: nowrap; word-break: normal; }
+    .dps-actions button { min-width: 30px; min-height: 30px; font-size: 15px; padding: 0; line-height: 1; }
+    /* Модалки: full-width на мобиле */
+    #dps-preview-overlay .modal,
+    #dps-fill-overlay .modal {
+      max-width: 100%;
+      max-height: calc(100dvh - env(safe-area-inset-top, 0px)
+                       - env(safe-area-inset-bottom, 0px) - 16px);
+    }
+  }
+
+  /* ============ v1.27.1: DPS edit расширения ============ */
+  .dps-edit-mode-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0;
+    flex-wrap: wrap;
+  }
+  .dps-edit-mode-toggle {
+    padding: 4px 12px;
+    font-size: 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .dps-edit-mode-toggle:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .dps-edit-mode-toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+  .dps-edit-mode-toggle-on {
+    background: rgba(176,136,0,0.15);
+    border-color: var(--yellow);
+    color: var(--yellow);
+  }
+  .dps-edit-mode-locked { font-size: 11px; font-style: italic; }
+  .dps-edit-mode-warning {
+    background: rgba(176,136,0,0.12);
+    color: var(--yellow);
+    border: 1px solid rgba(176,136,0,0.4);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    margin: 6px 0 8px 0;
+  }
+  .dps-actions {
+    display: flex;
+    gap: 4px;
+    justify-content: flex-end;
+    flex-wrap: nowrap;
+  }
+  .dps-actions button {
+    min-width: 28px;
+  }
+  .dps-badge-mod {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    background: rgba(176,136,0,0.18);
+    color: var(--yellow);
+  }
+  .dps-fill-field-error {
+    border-color: var(--red) !important;
+    box-shadow: 0 0 0 1px var(--red) inset;
+  }
+  /* v1.27.10: badge для bridge-forced DP (preset_mode и т.п.).
+     v1.28.40: компактно — только 🔒 вплотную к code. */
+  .badge-locked {
+    display: inline-block;
+    padding: 0 3px;
+    border-radius: 3px;
+    font-size: 10px;
+    background: rgba(139,148,158,0.18);
+    color: var(--muted);
+    margin-left: 2px;
+    cursor: help;
+    white-space: nowrap;
+  }
+  .dps-fill-input-warn {
+    border-color: var(--yellow) !important;
+    box-shadow: 0 0 0 1px var(--yellow) inset;
+  }
+  /* v1.28.54: поле, заполненное эвристикой по code. */
+  .heuristic-field {
+    border-color: var(--yellow) !important;
+    background: rgba(210,153,34,0.08) !important;
+  }
+  .dps-fill-warn-msg {
+    color: var(--yellow);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .dps-fill-hint-locked {
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 4px;
+    font-style: italic;
+  }
+  #dps-fill-options-preview {
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.4;
+  }
+  #dps-fill-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* v1.27.5: секция мусорных DP */
+  .dps-junk-section {
+    margin-top: 12px;
+    border-top: 1px dashed var(--border);
+    padding-top: 8px;
+  }
+  .dps-junk-section > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 4px 0;
+    font-size: 12px;
+    color: var(--yellow);
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dps-junk-section > summary::-webkit-details-marker { display: none; }
+  .dps-junk-section > summary::before {
+    content: "▶";
+    color: var(--muted);
+    font-size: 10px;
+    display: inline-block;
+    transition: transform 0.15s;
+  }
+  .dps-junk-section[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  .dps-junk-section .dps-table td { opacity: 0.75; }
+  /* Красная кнопка [➕] для мусорных DP */
+  .dps-actions button.junk-add {
+    color: var(--red);
+    border-color: rgba(215,58,73,0.4);
+  }
+  .dps-actions button.junk-add:hover {
+    background: rgba(215,58,73,0.08);
+  }
+
+  /* v1.28.16: radio выбора языка preset-режимов в шапке превью. */
+  .preset-lang-bar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 8px 12px;
+    margin: 0 0 10px 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+    flex-wrap: wrap;
+  }
+  .preset-lang-label {
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 11px;
+  }
+  .preset-lang-opt {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--fg);
+    margin: 0;
+    white-space: nowrap;
+  }
+  .preset-lang-opt input[type="radio"] {
+    width: auto;
+    margin: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  /* v1.28.40: компактный «плоский» превью preset-режимов (чипы). */
+  .preset-preview {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    font-size: 11px;
+  }
+  .preset-preview-title { color: var(--muted); }
+  .preset-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .preset-chip code {
+    background: none;
+    padding: 0;
+    font-size: 10px;
+    color: var(--muted);
+  }
+  .preset-chip.muted { color: var(--muted); }
+  @media (max-width: 700px) {
+    .preset-lang-bar {
+      font-size: 11px;
+      padding: 6px 10px;
+      gap: 10px;
+    }
+    .preset-lang-label {
+      flex-basis: 100%;
+    }
+    .preset-preview {
+      font-size: 10px;
+    }
+  }
+
+  /* v1.28.0: Local key на дашборде — прижат к таблице «Информация». */
+  .detail-table-key-merged {
+    margin-top: -1px;
+    border-top: none;
+  }
+  .detail-table-key-merged td:first-child {
+    border-top: none;
+  }
+  #modal-key-zone {
+    margin: 0;
+    padding: 0;
+  }
+  /* v1.28.34: выбор источника данных в превью импорта. */
+  .preview-source-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 0;
+    margin-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .preview-source-label { color: var(--muted); font-size: 12px; }
+  /* v1.28.78: выбор источника строки превью — кнопка + список (fixed,
+     точка «из шапки» показывается только в раскрытом списке). */
+  .prev-src { display: inline-block; }
+  .prev-src-btn {
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 8px; font-size: 12px; cursor: pointer;
+    max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .prev-src-btn:hover { border-color: var(--accent); }
+  .prev-src-menu {
+    position: fixed; z-index: 2600; display: flex; flex-direction: column; gap: 2px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px; box-shadow: 0 8px 22px rgba(0,0,0,0.45);
+    max-height: 60vh; overflow-y: auto;
+  }
+  .prev-src-item {
+    text-align: left; white-space: nowrap; padding: 6px 10px; font-size: 12px;
+    border: 1px solid transparent; border-radius: 4px; background: none; color: var(--fg);
+    cursor: pointer;
+  }
+  .prev-src-item:hover { background: rgba(3,102,214,0.14); border-color: var(--accent); }
+  .prev-src-item.active {
+    background: rgba(3,102,214,0.22); color: var(--fg);
+    border-color: var(--accent); font-weight: 600;
+  }
+  .prev-src-item:disabled { opacity: 0.5; cursor: not-allowed; }
+  .prev-src-dot { color: var(--yellow); font-weight: 700; margin-left: 5px; }
+  /* v1.28.66: источник в форме DP — кнопки (по умолчанию не выбрано). */
+  .src-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .src-btn {
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+  }
+  .src-btn:hover { border-color: var(--accent); }
+  .src-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(3,102,214,0.10); }
+  .src-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* v1.28.50: «Значения» — одна строка с ellipsis, таблица не «едет». */
+  code.nowrap-short { white-space: nowrap; }
+  .dps-table td.col-values { overflow: hidden; text-overflow: ellipsis; }
+  .dps-table td.col-values code { white-space: nowrap; }
+  .preview-dp-table td { overflow: hidden; }
+  .preview-dp-table code.nowrap-short {
+    display: inline-block; max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    vertical-align: middle;
+  }
+  .preview-src-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
+    background: var(--border);
+    color: var(--muted);
+  }
+  .preview-src-badge.src-cloud      { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .preview-src-badge.src-tuya_local { background: rgba(46,160,67,0.18);  color: var(--green); }
+  .preview-src-badge.src-cache      { background: rgba(176,136,0,0.18);  color: var(--yellow); }
+  .preview-src-badge.src-heuristic  { background: rgba(215,58,73,0.16);  color: var(--red); }
+  /* v1.28.35: на ПК модалки с широкими таблицами — по ширине контента
+     (не фиксированные 750/1100px). */
+  @media (min-width: 701px) {
+    #preview-overlay .modal,
+    #cloud-modal-overlay .modal {
+      width: max-content;
+      max-width: 96vw;
+    }
+    #preview-overlay .detail-table.wide-table,
+    #cloud-modal-overlay .detail-table.wide-table {
+      width: auto;
+    }
+    #modal-overlay .modal { width: max-content; max-width: 96vw; }
+    /* v1.28.82: таблицы DP — ОПРЕДЕЛЁННАЯ ширина (9 колонок = 1010px).
+       Иначе table-layout:fixed + width:auto считались по контенту → «скачки». */
+    #modal-overlay .dps-table { width: 1010px; }
+    #modal-body { overflow-x: auto; }
+  }
+  /* v1.28.38: массовые кнопки чекбоксов + дифф overwrite. */
+  .preview-mass-btns { display: inline-flex; gap: 6px; margin-left: auto; }
+  .preview-mass-btns button { padding: 3px 8px; font-size: 12px; }
+  .preview-diff {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    background: var(--border); font-size: 11px; white-space: nowrap;
+  }
+  .preview-edit-btn { padding: 3px 8px; font-size: 12px; }
+  .preview-edit-btn.active { border-color: var(--red); color: var(--red); }
+  .preview-sandbox-label { font-size: 11px; color: var(--muted); margin-left: 4px; }
+  /* v1.28.42: code + 🔒 в одну строку (🔒 не съезжает под значение). */
+  .code-line {
+    display: inline-flex; align-items: center; gap: 3px;
+    max-width: 100%; overflow: hidden;
+  }
+  .code-line > code {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    min-width: 0;
+  }
+  .code-line .badge-locked { flex-shrink: 0; }
+  /* v1.28.41: источник данных — кнопки с иконками; пометка источника «Текущего». */
+  .cur-origin { opacity: 0.85; font-size: 12px; padding: 0 6px; cursor: help; }
+  .preview-src-btns { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .preview-src-btns button {
+    padding: 3px 8px; font-size: 12px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--fg); cursor: pointer;
+  }
+  .preview-src-btns button.active { border-color: var(--accent); color: var(--accent); background: var(--bg); }

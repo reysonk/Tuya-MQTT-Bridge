@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQTT Tuya Bridge</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MQTT Tuya Bridge">
+<link rel="apple-touch-icon" href="/favicon.svg">
+<meta name="mobile-web-app-capable" content="yes">
+<script>
+  // v1.20.1: применяем тему ДО рендера, чтобы не мигало белым
+  // при переключении вкладок.
+  (function() {
+    try {
+      var t = localStorage.getItem("tuya_webui_theme") || "dark";
+      document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {
+      document.documentElement.setAttribute("data-theme", "dark");
+    }
+  })();
+</script>
+<link rel="stylesheet" href="/static/app.css?v=__WEBUI_VERSION__">
+</head>
+<body>
+
+<header>
+  <div class="header-row1">
+    <h1 onclick="goHome()" title="На дашборд">MQTT Tuya Bridge</h1>
+    <button id="nav-toggle" onclick="toggleNav()" title="Меню" aria-label="Меню">☰</button>
+    <button id="theme-btn" class="theme-btn" onclick="toggleTheme()" title="Переключить тему">🌙</button>
+  </div>
+  <nav id="main-nav">
+    <a href="/" id="nav-dashboard">📊 Дашборд</a>
+    <a href="/analytics" id="nav-analytics">📈 Аналитика</a>
+    <a href="/import" id="nav-import">📥 Импорт устройств</a>
+    <a href="/tools" id="nav-tools">🛠 Инструменты</a>
+  </nav>
+  <div class="header-row3">
+    <span id="health-widget" class="health-widget" onclick="toggleHealthDetail()" title="Клик — детали">
+      <!-- v1.28.17: шапка — WebUI ● Bridge. Точка — статус bridge. -->
+      <span id="hw-webui">WebUI v?</span>
+      <span class="hw-sep">·</span>
+      <span id="hw-status" class="hw-dim">…</span>
+      <span class="hw-sep">·</span>
+      <span id="hw-bridge">Bridge v?</span>
+      <span class="hw-sep hw-opt">·</span>
+      <span id="hw-rest" class="hw-opt"></span>
+    </span>
+    <div class="toolbar">
+      <button id="latency-btn" onclick="doLatencyRefresh()">📡<span class="btn-label"> Ping</span><span class="btn-label-short"> Ping</span></button>
+      <span id="latency-result" class="muted" style="font-size:11px;"></span>
+      <button id="help-btn" onclick="location.href='/help'"><span class="help-q">❓</span><span class="btn-label"> Справка</span><span class="btn-label-short"> ?</span></button>
+    </div>
+  </div>
+  <div id="health-detail" class="health-detail" style="display:none;"></div>
+</header>
+
+<div id="view-dashboard">
+  <div id="problems-block" class="problems" style="display:none;">
+    <div class="problems-header">⚠️ Проблемные устройства <span id="problems-count"></span></div>
+    <div id="problems-list"></div>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">Устройства <span class="hint">клик по строке — подробности, клик по заголовку — сортировка</span></h2>
+    <div class="table-toolbar">
+      <input id="device-search" type="text" placeholder="Поиск: имя, IP, тип…" oninput="onDeviceSearch(this.value)">
+      <button class="toolbar-clear" onclick="clearDeviceSearch()">×</button>
+      <span class="toolbar-info" id="device-search-info"></span>
+    </div>
+    <div class="devices-table-wrap">
+    <table>
+      <thead><tr>
+        <th data-sort="name" onclick="sortDevices('name')">Имя <span class="sort-ind"></span></th>
+        <th data-sort="type" onclick="sortDevices('type')">Тип <span class="sort-ind"></span></th>
+        <th data-sort="status" onclick="sortDevices('status')">Статус <span class="sort-ind"></span></th>
+        <th data-sort="latency" onclick="sortDevices('latency')">Задержка <span class="sort-ind"></span></th>
+      </tr></thead>
+      <tbody id="devices-body"><tr><td colspan="4" class="muted">Загрузка…</td></tr></tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card" id="disabled-block" style="display:none;">
+    <details>
+      <summary>⛔ Отключённые (<span id="disabled-count">0</span>)</summary>
+      <table>
+        <thead><tr>
+          <!-- v1.27.7d: только name/type — status/latency у disabled пусты -->
+          <!-- v1.27.9: независимая сортировка через sortDisabled -->
+          <th data-sort="name" onclick="sortDisabled('name')">Имя <span class="sort-ind"></span></th>
+          <th data-sort="type" onclick="sortDisabled('type')">Тип <span class="sort-ind"></span></th>
+        </tr></thead>
+        <tbody id="disabled-body"></tbody>
+      </table>
+    </details>
+  </div>
+</div>
+
+<div id="view-analytics" style="display:none;">
+  <div class="analytics-grid">
+    <div class="card analytics-card">
+      <div class="analytics-card-header">
+        <h2>Задержка (ICMP ping)</h2>
+        <div class="analytics-toolbar">
+          <div class="time-btn-group" id="latency-period-group">
+            <button data-lat="1800" onclick="setLatencyPeriod(1800)">30мин</button>
+            <button data-lat="3600" class="active" onclick="setLatencyPeriod(3600)">1час</button>
+            <button data-lat="21600" onclick="setLatencyPeriod(21600)">6час</button>
+            <button data-lat="86400" onclick="setLatencyPeriod(86400)">Сутки</button>
+            <button data-lat="0" onclick="setLatencyPeriod(0)">Всё</button>
+          </div>
+        </div>
+      </div>
+      <div class="analytics-table-scroll">
+        <div class="latency-table-wrap">
+        <table>
+          <thead><tr>
+            <th data-lsort="name" onclick="sortLatency('name')">Устройство <span class="sort-ind"></span></th>
+            <th data-lsort="avg" onclick="sortLatency('avg')">Средний ping <span class="sort-ind"></span></th>
+            <th data-lsort="ts" onclick="sortLatency('ts')">Последняя проверка <span class="sort-ind"></span></th>
+          </tr></thead>
+          <tbody id="latency-body"><tr><td colspan="3" class="muted">Загрузка…</td></tr></tbody>
+        </table>
+        </div>
+      </div>
+    </div>
+    <div class="card analytics-card compact">
+      <div class="analytics-card-header">
+        <h2>Хронология событий</h2>
+        <div class="analytics-toolbar">
+          <span id="timeline-count" class="muted" style="font-size:11px;"></span>
+          <button onclick="openTimelineCleanup()" style="padding:3px 10px; font-size:11px;">🗑 Очистить</button>
+        </div>
+      </div>
+      <div id="timeline-list" class="timeline-scroll"></div>
+    </div>
+  </div>
+  <div class="analytics-grid">
+    <div class="card analytics-card compact">
+      <div class="analytics-card-header"><h2>Мерцающие устройства (24ч)</h2></div>
+      <div class="analytics-table-scroll">
+        <table>
+          <thead><tr>
+            <th data-fsort="dev" onclick="sortFlappers('dev')">Устройство <span class="sort-ind"></span></th>
+            <th data-fsort="flaps" onclick="sortFlappers('flaps')">Переходов <span class="sort-ind"></span></th>
+          </tr></thead>
+          <tbody id="flappers-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card analytics-card" style="max-height:none;">
+      <div class="analytics-card-header">
+        <h2>Активность и мерцания (24ч)</h2>
+        <span id="activity-summary" class="muted" style="font-size:11px;"></span>
+      </div>
+      <div style="padding:0 16px 12px 16px;">
+        <div class="chart-block">
+          <div class="chart-subtitle">Online по часам</div>
+          <svg id="chart-activity" viewBox="0 0 800 180" preserveAspectRatio="none" style="width:100%; height:180px; display:block;"></svg>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-line online"></span>online</span>
+            <span class="legend-item"><span class="legend-line total"></span>total (всего устройств)</span>
+          </div>
+        </div>
+        <div class="chart-block" style="margin-top:16px;">
+          <div class="chart-subtitle">Мерцания (переходы online↔offline по часам)</div>
+          <svg id="chart-flaps" viewBox="0 0 800 140" preserveAspectRatio="none" style="width:100%; height:140px; display:block;"></svg>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-bar flaps"></span>переходов за час</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+
+  <div class="card">
+    <h2 class="section-title">Логи (live, все уровни)</h2>
+    <div class="logs-toolbar">
+      <!-- Строка 1: Источник + Bridge/WebUI + Уровень + DEBUG/INFO+/WARN+/ERROR + Скачать -->
+      <div class="logs-toolbar-row1">
+        <span class="muted" style="font-size:12px;">Источник:</span>
+        <div class="time-btn-group" id="log-source-switch">
+          <button class="log-source-btn" data-src="bridge" onclick="switchLogSource('bridge')">Bridge</button>
+          <button class="log-source-btn" data-src="webui" onclick="switchLogSource('webui')">WebUI</button>
+        </div>
+        <span id="log-level-filter" style="display:inline-flex; align-items:center; gap:8px;">
+          <span class="muted" style="font-size:12px; margin-left:8px;">Уровень:</span>
+          <button data-level="DEBUG" onclick="toggleLevel('DEBUG')">DEBUG</button>
+          <button data-level="INFO" onclick="toggleLevel('INFO')">INFO+</button>
+          <button data-level="WARNING" onclick="toggleLevel('WARNING')">WARN+</button>
+          <button data-level="ERROR" onclick="toggleLevel('ERROR')">ERROR</button>
+        </span>
+        <button onclick="downloadLogs()" class="logs-download">⬇ Скачать</button>
+      </div>
+
+      <!-- Строка 2: слева Пауза+Поиск, справа диапазоны -->
+      <div class="logs-toolbar-row2">
+        <div class="logs-toolbar-row2-left">
+          <button onclick="pauseLogs()" id="pause-btn" class="logs-pause">⏸ Пауза</button>
+          <div class="logs-tb-search">
+            <input id="log-search" type="text" placeholder="Поиск..." oninput="doSearch()">
+            <button onclick="clearLogSearch()" id="find-clear-btn" title="Очистить">×</button>
+            <button onclick="findPrev()" id="find-prev-btn" disabled title="Предыдущее">▲</button>
+            <button onclick="findNext()" id="find-next-btn" disabled title="Следующее">▼</button>
+          </div>
+          <span id="find-info" class="muted" style="font-size:11px;"></span>
+        </div>
+        <div class="logs-toolbar-row2-right">
+          <div class="time-btn-group">
+            <button data-range="1800" onclick="setLogRange(1800)">30 мин</button>
+            <button data-range="3600" onclick="setLogRange(3600)">1 час</button>
+            <button data-range="86400" onclick="setLogRange(86400)">Сутки</button>
+            <button data-range="0" onclick="setLogRange(0)">Всё</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="logs" id="logs"></div>
+    <button class="scroll-down-btn" id="scroll-down-btn" onclick="scrollLogsToBottom()">↓ Вниз</button>
+  </div>
+</div>
+<div id="view-import" style="display:none;">
+  <div class="card">
+    <h2 class="section-title">Доступы к Tuya Cloud</h2>
+    <div id="cloud-cache-banner" class="cloud-cache-banner" style="display:none;"></div>
+    <div style="padding:16px;">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+        <div class="form-group"><label>Access ID</label><input id="cloud-access-id" type="text"></div>
+        <div class="form-group"><label>Access Secret</label><input id="cloud-access-secret" type="password"></div>
+        <div class="form-group"><label>Region</label>
+          <select id="cloud-region">
+            <option value="eu">EU</option><option value="us">US</option>
+            <option value="us-e">US-E</option><option value="eu-w">EU-W</option>
+            <option value="cn">CN</option><option value="in">IN</option>
+            <option value="sg">SG</option>
+          </select>
+        </div>
+        <div class="form-group"><label>&nbsp;</label>
+          <div style="display:flex; gap:8px;">
+            <button class="primary" onclick="fetchCloudDevices()" id="fetch-btn" style="flex:1;">📥 Запросить устройства</button>
+            <button onclick="clearCloudCache()" title="Очистить кэш">🗑</button>
+          </div>
+        </div>
+      </div>
+      <div id="cloud-result" class="muted" style="margin-top:12px;"></div>
+      <div id="cloud-cache-info" class="muted" style="margin-top:4px; font-size:11px;"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">Локальные базы DP</h2>
+    <div class="base-info">
+      <div class="base-info-item">
+        <b>tinytuya devices.json:</b>
+        <span id="base-tinytuya-info" class="muted">—</span>
+      </div>
+      <div class="base-info-item">
+        <b>tuya-local база:</b>
+        <span id="base-tuya-local-info" class="muted">—</span>
+      </div>
+      <div class="base-info-actions">
+        <button onclick="updateTuyaLocalDb()" id="tuya-local-update-btn"
+                title="Скачать ~50 МБ из GitHub (make-all/tuya-local). Займёт до 2 минут.">⬇ Обновить tuya-local</button>
+        <button onclick="rebuildTinytuyaJson()" id="rebuild-btn"
+                title="Пробовать каждое устройство через tinytuya, сопоставить DP. Несколько минут.">🔄 Пересобрать tinytuya.json</button>
+        <span id="base-update-result" class="muted" style="font-size:11px;"></span>
+      </div>
+    </div>
+    <div id="rebuild-progress" style="display:none; padding:0 16px 12px 16px;">
+      <div class="muted" style="font-size:12px;" id="rebuild-progress-text"></div>
+      <div class="rebuild-bar"><div class="rebuild-bar-fill" id="rebuild-bar-fill" style="width:0%"></div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">Устройства из Cloud <span id="cloud-count" class="muted" style="float:right; text-transform:none;"></span></h2>
+    <div class="table-toolbar">
+      <input id="cloud-search" type="text" placeholder="Поиск: имя, ID, продукт…" oninput="onCloudSearch(this.value)">
+      <button class="toolbar-clear" onclick="clearCloudSearch()">×</button>
+      <span class="cloud-filter-btns time-btn-group">
+        <button type="button" id="cf-all" class="active" onclick="setCloudFilter('all')">Все</button>
+        <button type="button" id="cf-new" onclick="setCloudFilter('new')">Новые</button>
+        <button type="button" id="cf-added" onclick="setCloudFilter('added')">Добавленные</button>
+      </span>
+      <span class="toolbar-info" id="cloud-search-info"></span>
+    </div>
+    <div id="cloud-devices-container">
+      <div class="muted" style="padding:16px;">Введите данные и нажмите «Запросить устройства»</div>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg);" id="import-actions">
+      <button onclick="selectAllCloud(true)">Выбрать все</button>
+      <button onclick="selectAllCloud(false)">Снять всё</button>
+      <span id="selected-count" class="muted">Выбрано: 0</span>
+      <button class="primary" onclick="importSelected()" style="margin-left:auto;">📦 Импортировать выбранные</button>
+    </div>
+  </div>
+
+  <div id="import-result-block" class="card" style="display:none;">
+    <h2 class="section-title">Результат импорта</h2>
+    <div style="padding:16px;" id="import-result-content"></div>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">Безопасный скан LAN</h2>
+    <div style="padding:16px;">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+        <div class="form-group"><label>Сеть (первые 3 октета)</label>
+          <input id="scan-subnet" type="text" placeholder="192.168.0" value="192.168.0" oninput="updateScanHint()">
+        </div>
+        <div class="form-group"><label>&nbsp;</label>
+          <button class="primary" onclick="doScanExtended()" id="scan-btn" style="width:100%;">🔍 Безопасный скан</button>
+        </div>
+      </div>
+      <div class="muted" style="font-size:11px; margin-top:4px;">
+        Сканируются адреса <b><span id="scan-subnet-hint">192.168.1.1–254</span></b> (/24). ICMP + безопасные порты. Tuya-проба (6668+UDP) только для неизвестных. Сортировка по IP.
+      </div>
+      <div id="scan-result" style="margin-top:12px; display:none;"></div>
+    </div>
+  </div>
+</div>
+
+<div id="view-tools" style="display:none;">
+  <div class="card">
+    <h2 class="section-title">Конфигурация (devices_config.json) <span class="hint">только просмотр</span></h2>
+    <div class="tools-toolbar">
+      <button id="tools-view-raw" class="active" onclick="setToolsView('raw')">📄 Raw JSON</button>
+      <button id="tools-view-bydev" onclick="setToolsView('bydev')">📋 По устройствам</button>
+      <button id="tools-view-audit" onclick="setToolsView('audit')">📜 История конфига</button>
+      <button onclick="loadConfig()" style="margin-left:auto;">🔄 Обновить</button>
+      <button id="tools-copy-raw-btn" onclick="copyConfigRaw()">📋 Копировать JSON</button>
+      <button id="tools-copy-dev-btn" style="display:none;" onclick="copyConfigDevice()">📋 Копировать JSON выбранного</button>
+      <button id="tools-audit-cleanup-btn" style="display:none;" onclick="openAuditCleanup()">🗑 Очистить</button>
+      <span id="tools-info" class="muted" style="font-size:11px;"></span>
+    </div>
+    <div id="tools-container">
+      <div class="muted" style="padding:16px;">Загрузка…</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">🗑 Обслуживание БД <span class="hint">analytics.db</span></h2>
+    <div class="card-pad">
+      <p class="muted" style="margin-top:0; font-size:13px;">
+        Удаляет <b>старые</b> записи из БД: историю задержек (ping) и снапшоты состояний.
+        Нужно, чтобы файл не рос бесконечно. Хронология событий и история конфига не трогаются.
+      </p>
+      <div class="toolbar" style="margin-top:8px;">
+        <button id="db-cleanup-open" onclick="openDbCleanup()">🗑 Очистить БД</button>
+        <span class="muted" style="font-size:11px;">Можно оставить последние 3/7/30 дней, своё значение или удалить всё.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">🧹 Discovery в Home Assistant</h2>
+    <div class="card-pad">
+      <p class="muted" style="margin-top:0; font-size:13px;">
+        Полная перепубликация MQTT Discovery: bridge удаляет свои retained config-топики,
+        ждёт и публикует заново. Home Assistant на короткое время удалит сущности и создаст
+        их снова — это убирает «фантомные» сущности и рассинхрон имён.
+        <br>При каждом старте bridge <b>сам</b> чистит «зависшие» (orphan) retained-топики.
+      </p>
+      <div class="toolbar" style="margin-top:8px;">
+        <button id="cleanup-btn" onclick="doCleanup()">🧹 Очистить Discovery</button>
+        <span id="cleanup-result" class="muted" style="font-size:11px;"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="view-help" style="display:none;">
+  <div class="card">
+    <h2 class="section-title">❓ Справка <span class="hint">полное описание возможностей</span></h2>
+    <div class="card-pad">
+      <div class="help-tabs" id="help-tabs"></div>
+      <div id="help-body" class="help-body"></div>
+    </div>
+  </div>
+</div>
+
+<div id="modal-overlay" class="modal-overlay" onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2 id="modal-title">Устройство</h2>
+      <div style="display:flex; align-items:center;">
+        <button class="refresh-btn" id="modal-edit-btn" onclick="editDeviceFromModal()" title="Изменить настройки">✏️</button>
+        <button class="refresh-btn" id="modal-refresh-btn" onclick="refreshModal()" title="Обновить">🔄</button>
+        <button class="modal-close" onclick="closeModal()">×</button>
+      </div>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="cloud-modal-overlay" class="modal-overlay" onclick="closeCloudModal(event)">
+  <div class="modal wide" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2 id="cloud-modal-title">Cloud Device</h2>
+      <button class="modal-close" onclick="closeCloudModal()">×</button>
+    </div>
+    <div id="cloud-modal-body" class="modal-body"></div>
+  </div>
+</div>
+
+<div id="preview-overlay" class="modal-overlay" onclick="closePreview(event)">
+  <div class="modal wide" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2 id="preview-title">Превью импорта</h2>
+      <button class="modal-close" onclick="closePreview()">×</button>
+    </div>
+    <div id="preview-mobile-nav" class="mobile-nav">
+      <button onclick="previewPrev()">◀ Назад</button>
+      <span id="preview-counter">1/1</span>
+      <button onclick="previewNext()">Далее ▶</button>
+    </div>
+    <div id="preview-errors-banner" style="display:none;"></div>
+    <div id="preview-body" class="modal-body"></div>
+    <div style="display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg);">
+      <button onclick="closePreview()">Отмена</button>
+      <button onclick="probeAllInPreview()" id="preview-probe-all-btn">🔍 Probe все</button>
+      <button class="primary" onclick="confirmImport()" style="margin-left:auto;" id="preview-import-btn">📦 Импортировать всё</button>
+    </div>
+  </div>
+</div>
+
+<div id="edit-device-overlay" class="modal-overlay center-on-mobile" onclick="closeEditDevice(event)">
+  <div class="modal" style="max-width:560px;" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 id="edit-device-title">Редактирование</h2>
+      <button class="modal-close" onclick="closeEditDevice()">×</button>
+    </div>
+    <div class="modal-body">
+
+      <details class="edit-section" open>
+        <summary>📡 Подключение</summary>
+        <div class="edit-section-body">
+          <div class="edit-row-v2">
+            <label id="edit-device-ip-label">IP-адрес</label>
+            <input id="edit-device-ip" type="text" placeholder="192.168.1.100"
+                   oninput="updateEditSubmitState()">
+            <div id="edit-device-ip-error" class="edit-hint" style="color:var(--red); display:none;"></div>
+          </div>
+
+          <div class="edit-row-v2">
+            <label id="edit-device-version-label">Версия протокола</label>
+            <select id="edit-device-version" onchange="updateEditSubmitState()">
+              <option value="3.1">3.1</option>
+              <option value="3.2">3.2</option>
+              <option value="3.3">3.3</option>
+              <option value="3.4">3.4</option>
+              <option value="3.5">3.5</option>
+            </select>
+          </div>
+
+          <div class="edit-row-v2">
+            <label id="edit-device-key-label">Local key</label>
+            <input id="edit-device-key" type="text" autocomplete="new-password"
+                   placeholder="введи новый key (текущий не показывается)"
+                   oninput="updateEditSubmitState()">
+            <div class="edit-hint">Пустое — key не меняется. Текущий key — в модалке устройства (🔓 Показать).</div>
+          </div>
+        </div>
+      </details>
+
+      <details class="edit-section" open>
+        <summary>⚙ Поведение</summary>
+        <div class="edit-section-body">
+          <div class="edit-row-v2">
+            <label id="edit-device-battery-label">Тип воркера</label>
+            <select id="edit-device-battery" onchange="updateEditSubmitState()">
+              <option value="false">🔌 Проводное (polling)</option>
+              <option value="true">🔋 Батарейное (ICMP ping)</option>
+            </select>
+            <div class="edit-hint">Смена типа перезапустит воркер устройства.</div>
+          </div>
+        </div>
+      </details>
+
+      <details class="edit-section edit-section-danger">
+        <summary>⚠️ Опасные действия</summary>
+        <div class="edit-section-body">
+          <div class="edit-danger-row">
+            <div>
+              <div class="edit-danger-title">Отключить / Включить устройство</div>
+              <div class="edit-hint">Bridge перестанет опрашивать. HA покажет unavailable через ~2 мин. Автоматизации не сломаются — сущности остаются в реестре.</div>
+            </div>
+            <button id="edit-device-toggle-btn" onclick="editDeviceToggleEnabled()"></button>
+          </div>
+
+          <div class="edit-danger-row">
+            <div>
+              <div class="edit-danger-title">Удалить устройство</div>
+              <div class="edit-hint">Удаление из конфига bridge. Discovery будет очищен, HA удалит сущности. Действие НЕОБРАТИМО.</div>
+            </div>
+            <button class="danger" id="edit-device-delete-btn" onclick="editDeviceDelete()">🗑 Удалить</button>
+          </div>
+        </div>
+      </details>
+
+      <div id="edit-device-error" style="display:none; margin-top:12px; font-size:12px; padding:10px; border-radius:6px; background:rgba(215,58,73,0.08); color:var(--red); border:1px solid rgba(215,58,73,0.25);"></div>
+
+      <details id="edit-device-raw-error" style="display:none; margin-top:8px;">
+        <summary class="muted" style="font-size:11px; cursor:pointer;">▶ Технические детали</summary>
+        <pre id="edit-device-raw-error-text" style="background:var(--bg); padding:8px; border-radius:4px; font-size:11px; overflow-x:auto; margin-top:6px; white-space:pre-wrap; word-break:break-all;"></pre>
+      </details>
+    </div>
+
+    <div class="edit-footer">
+      <span id="edit-device-changed" class="edit-changed-indicator">Изменено: 0 полей</span>
+      <div style="display:flex; gap:8px;">
+        <button onclick="closeEditDevice()">Отмена</button>
+        <button class="primary" onclick="submitEditDevice()" id="edit-device-submit" disabled>💾 Сохранить</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="db-cleanup-overlay" class="modal-overlay center-on-mobile" onclick="closeDbCleanup(event)">
+  <div class="modal small" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2>Очистить БД</h2>
+      <button class="modal-close" onclick="closeDbCleanup()">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin-top:0;">История задержек и снапшоты состояний. Хронология событий и история конфига не тронутся.</p>
+      <p class="muted" style="margin:0 0 8px 0;">Удалить данные старше периода:</p>
+      <div class="radio-row"><input type="radio" name="db-cleanup-scope" id="dbc-scope-3" value="3" checked onchange="updateDbCleanupForm()"><label for="dbc-scope-3">Последние 3 дня</label></div>
+      <div class="radio-row"><input type="radio" name="db-cleanup-scope" id="dbc-scope-7" value="7" onchange="updateDbCleanupForm()"><label for="dbc-scope-7">Последние 7 дней</label></div>
+      <div class="radio-row"><input type="radio" name="db-cleanup-scope" id="dbc-scope-30" value="30" onchange="updateDbCleanupForm()"><label for="dbc-scope-30">Последние 30 дней</label></div>
+      <div class="radio-row"><input type="radio" name="db-cleanup-scope" id="dbc-scope-custom" value="custom" onchange="updateDbCleanupForm()"><label for="dbc-scope-custom">Своё:</label></div>
+      <div id="dbc-age-fields" style="display:none; margin:4px 0 0 24px;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+          <div><label>Дней</label><input id="db-keep-days" type="number" value="3" min="0" max="3650"></div>
+          <div><label>Часов</label><input id="db-keep-hours" type="number" value="0" min="0" max="23"></div>
+        </div>
+      </div>
+      <div class="radio-row" style="margin-top:8px;">
+        <input type="radio" name="db-cleanup-scope" id="dbc-scope-all" value="all" onchange="updateDbCleanupForm()">
+        <label for="dbc-scope-all">Удалить всё</label>
+      </div>
+      <div id="db-cleanup-result" class="muted" style="margin:12px 0 0 0;"></div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeDbCleanup()">Отмена</button>
+      <button class="danger" onclick="doDbCleanup()" id="db-cleanup-btn">🗑 Удалить</button>
+    </div>
+  </div>
+</div>
+
+<div id="audit-cleanup-overlay" class="modal-overlay center-on-mobile" onclick="closeAuditCleanup(event)">
+  <div class="modal small" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2>Очистить историю конфига</h2>
+      <button class="modal-close" onclick="closeAuditCleanup()">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin-top:0;">Журнал изменений <code>devices_config.json</code> через WebUI.</p>
+      <p class="muted" style="margin:0 0 8px 0;">Удалить записи старше периода:</p>
+      <div class="radio-row"><input type="radio" name="audit-cleanup-scope" id="audc-scope-30" value="30" checked onchange="updateAuditCleanupForm()"><label for="audc-scope-30">Последние 30 дней</label></div>
+      <div class="radio-row"><input type="radio" name="audit-cleanup-scope" id="audc-scope-90" value="90" onchange="updateAuditCleanupForm()"><label for="audc-scope-90">Последние 90 дней</label></div>
+      <div class="radio-row"><input type="radio" name="audit-cleanup-scope" id="audc-scope-365" value="365" onchange="updateAuditCleanupForm()"><label for="audc-scope-365">Последний год</label></div>
+      <div class="radio-row"><input type="radio" name="audit-cleanup-scope" id="audc-scope-custom" value="custom" onchange="updateAuditCleanupForm()"><label for="audc-scope-custom">Своё:</label></div>
+      <div id="audc-age-fields" style="display:none; margin:4px 0 0 24px;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+          <div><label>Дней</label><input id="audc-keep-days" type="number" value="30" min="0" max="3650"></div>
+          <div><label>Часов</label><input id="audc-keep-hours" type="number" value="0" min="0" max="23"></div>
+        </div>
+      </div>
+      <div class="radio-row" style="margin-top:8px;">
+        <input type="radio" name="audit-cleanup-scope" id="audc-scope-all" value="all" onchange="updateAuditCleanupForm()">
+        <label for="audc-scope-all">Удалить всё</label>
+      </div>
+      <div id="audit-cleanup-result" class="muted" style="margin:12px 0 0 0;"></div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeAuditCleanup()">Отмена</button>
+      <button class="danger" onclick="doAuditCleanup()" id="audit-cleanup-btn">🗑 Удалить</button>
+    </div>
+  </div>
+</div>
+
+<div id="timeline-cleanup-overlay" class="modal-overlay center-on-mobile" onclick="closeTimelineCleanup(event)">
+  <div class="modal" style="max-width:520px;" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2>Очистить хронологию событий</h2>
+      <button class="modal-close" onclick="closeTimelineCleanup()">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin-top:0;">Таблица <code>status_events</code>. История задержек и снапшоты состояний не тронутся.</p>
+
+      <div class="radio-row">
+        <input type="radio" name="timeline-scope" id="tl-scope-all" value="all" checked onchange="updateTimelineCleanupForm()">
+        <label for="tl-scope-all">Удалить всё</label>
+      </div>
+
+      <div class="radio-row">
+        <input type="radio" name="timeline-scope" id="tl-scope-age" value="age" onchange="updateTimelineCleanupForm()">
+        <label for="tl-scope-age">Удалить старше:</label>
+      </div>
+      <div id="tl-age-fields" style="display:none; margin-left:24px;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+          <div><label>Дней</label><input id="tl-keep-days" type="number" value="3" min="0" max="365"></div>
+          <div><label>Часов</label><input id="tl-keep-hours" type="number" value="0" min="0" max="23"></div>
+        </div>
+      </div>
+
+      <div class="radio-row">
+        <input type="radio" name="timeline-scope" id="tl-scope-before" value="before" onchange="updateTimelineCleanupForm()">
+        <label for="tl-scope-before">Удалить до даты:</label>
+      </div>
+      <div id="tl-before-fields" style="display:none; margin-left:24px;">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+          <div><label>Дата</label><input id="tl-before-date" type="date"></div>
+          <div><label>Время</label><input id="tl-before-time" type="time" value="00:00"></div>
+        </div>
+      </div>
+
+      <div id="timeline-cleanup-result" class="muted" style="margin-top:12px;"></div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeTimelineCleanup()">Отмена</button>
+      <button class="danger" onclick="doTimelineCleanup()" id="timeline-cleanup-btn">🗑 Удалить</button>
+    </div>
+  </div>
+</div>
+
+
+<div id="dps-preview-overlay" class="modal-overlay top" onclick="closeDpsPreview(event)">
+  <div class="modal" style="max-width:600px;" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2>Применить изменения DP?</h2>
+      <button class="modal-close" onclick="closeDpsPreview()">×</button>
+    </div>
+    <div class="modal-body" id="dps-preview-body"></div>
+    <div class="modal-footer">
+      <button onclick="closeDpsPreview()">Отмена</button>
+      <button class="primary" id="dps-preview-apply" onclick="dpsConfirmApply()">Применить</button>
+    </div>
+  </div>
+</div>
+
+<div id="dps-fill-overlay" class="modal-overlay top" onclick="closeDpsFill(event)">
+  <div class="modal" style="max-width:520px;" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 id="dps-fill-title">Добавить DP</h2>
+      <button class="modal-close" onclick="closeDpsFill()">×</button>
+    </div>
+    <div class="modal-body" id="dps-fill-body"></div>
+    <div class="modal-footer">
+      <button onclick="closeDpsFill()">Отмена</button>
+      <button class="primary" id="dps-fill-submit" onclick="dpsFillSubmit()">Добавить</button>
+    </div>
+  </div>
+</div>
+
+<div id="ui-confirm-overlay" class="modal-overlay top center-on-mobile" onclick="closeUiConfirm(event)">
+  <div class="modal small" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2 id="ui-confirm-title">Подтверждение</h2>
+      <button class="modal-close" onclick="closeUiConfirm(null, false)">×</button>
+    </div>
+    <div class="modal-body">
+      <p id="ui-confirm-text" class="ui-confirm-text"></p>
+    </div>
+    <div class="modal-footer">
+      <button id="ui-confirm-cancel" onclick="closeUiConfirm(null, false)">Отмена</button>
+      <button id="ui-confirm-ok" class="primary" onclick="closeUiConfirm(null, true)">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="ui-prompt-overlay" class="modal-overlay top center-on-mobile" onclick="closeUiPrompt(event)">
+  <div class="modal small" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2 id="ui-prompt-title">Ввод</h2>
+      <button class="modal-close" onclick="closeUiPrompt(null, null)">×</button>
+    </div>
+    <div class="modal-body">
+      <p id="ui-prompt-text" class="ui-confirm-text"></p>
+      <div class="form-group">
+        <input id="ui-prompt-input" type="text">
+      </div>
+      <div id="ui-prompt-error" class="muted" style="font-size:12px; color:var(--red); margin-top:4px; display:none;"></div>
+    </div>
+    <div class="modal-footer">
+      <button id="ui-prompt-skip" style="display:none;" onclick="closeUiPrompt(null, undefined)">Пропустить</button>
+      <button id="ui-prompt-cancel" onclick="closeUiPrompt(null, null)">Отмена</button>
+      <button id="ui-prompt-ok" class="primary" onclick="submitUiPrompt()">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="ui-alert-overlay" class="modal-overlay top center-on-mobile" onclick="closeUiAlert(event)">
+  <div class="modal small" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2 id="ui-alert-title">Сообщение</h2>
+      <button class="modal-close" onclick="closeUiAlert(null)">×</button>
+    </div>
+    <div class="modal-body">
+      <div id="ui-alert-icon" class="ui-alert-icon"></div>
+      <p id="ui-alert-text" class="ui-confirm-text" style="text-align:center;"></p>
+    </div>
+    <div class="modal-footer">
+      <button class="primary" onclick="closeUiAlert(null)">OK</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const ANALYTICS_ENABLED = __ANALYTICS_ENABLED__;
+  const STATUS_HISTORY_ENABLED = __STATUS_HISTORY_ENABLED__;
+  const WEBUI_VERSION = "__WEBUI_VERSION__";
+  // v1.27.6: MQTT-брокер — fallback для определения подсети при импорте.
+  const MQTT_BROKER = "__MQTT_BROKER__";
+</script>
+<script src="/static/app.js?v=__WEBUI_VERSION__"></script>
+</body>
+</html>
