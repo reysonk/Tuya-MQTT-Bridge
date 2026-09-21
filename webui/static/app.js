@@ -1670,7 +1670,7 @@ function versionBadge(v) {
 }
 function typeBadge(t) {
   if (!t) return `<span class="type-badge">?</span>`;
-  const cls = ["light","switch","climate","sensor","binary_sensor"].includes(t) ? t : "";
+  const cls = ["light","switch","climate","sensor","binary_sensor","cover","fan"].includes(t) ? t : "";
   return `<span class="type-badge ${cls}">${escapeHtml(t)}</span>`;
 }
 // v1.28.57: бейдж источника DP с иконкой и тултипом (cloud/tuya-local/similar/cache).
@@ -1710,7 +1710,8 @@ function _powerBadge(d) {
 function componentBadge(c) {
   if (!c || c === "—") return `<span class="component-badge">—</span>`;
   const allowed = ["switch","sensor","binary_sensor","select","number",
-                   "preset","light","climate","button","time","lock","phase_a"];
+                   "preset","light","climate","button","time","lock","phase_a",
+                   "cover","fan"];
   const cls = allowed.includes(c) ? c : "";
   return `<span class="component-badge ${cls}">${escapeHtml(c)}</span>`;
 }
@@ -6477,9 +6478,12 @@ const HELP_TEXT = {
         <li><b>binary_sensor</b> — двери, движение, утечка, fault;</li>
         <li><b>number</b> — числовые настройки (таймеры, лимиты);</li>
         <li><b>phase_a</b> — breaker: распаковка DP 6 в напряжение, ток и мощность;</li>
-        <li><b>select</b> — Enum-настройки (например, relay_status).</li>
+        <li><b>select</b> — Enum-настройки (например, relay_status);</li>
+        <li><b>cover</b> — шторы, рольставни, ворота (положение + open/stop/close);</li>
+        <li><b>fan</b> — вентиляторы (вкл/выкл, скорость, направление).</li>
       </ul>
-      <p class="help-note">Fan и cover не поддерживаются (см. «Ограничения»).</p>`,
+      <p class="help-note">Замок (<code>component: lock</code>) добавляется к любому
+      типу устройства.</p>`,
     config: `
       <h3>Формат devices_config.json</h3>
       <p>Массив объектов-устройств.</p>
@@ -6492,7 +6496,8 @@ const HELP_TEXT = {
         <li><code>local_key</code> — локальный ключ Tuya;</li>
         <li><code>version</code> — версия протокола: <code>3.1</code>, <code>3.3</code>, <code>3.4</code>, <code>3.5</code>;</li>
         <li><code>type</code> — <code>light</code> / <code>switch</code> / <code>climate</code> /
-            <code>sensor</code> / <code>binary_sensor</code>;</li>
+            <code>sensor</code> / <code>binary_sensor</code> / <code>cover</code> /
+            <code>fan</code>;</li>
         <li><code>model</code> — необязательно, отображается в Home Assistant;</li>
         <li><code>battery_powered</code> — необязательно, <code>true</code> для батарейных;</li>
         <li><code>enabled</code> — необязательно, <code>false</code> чтобы пропустить устройство;</li>
@@ -6501,7 +6506,7 @@ const HELP_TEXT = {
       <h3>Структура dps_map</h3>
       <p>Ключ — номер DP (строка). Значение — объект:</p>
       <ul>
-        <li><code>component</code> — тип сущности Home Assistant (switch, sensor, binary_sensor, select, number, preset, light, phase_a);</li>
+        <li><code>component</code> — тип сущности Home Assistant (switch, sensor, binary_sensor, select, number, preset, light, phase_a, lock; cover — только при type=cover, fan — только при type=fan);</li>
         <li><code>name</code> — имя сущности (entity_id);</li>
         <li><code>device_class</code> — класс устройства (temperature, humidity, energy, …);</li>
         <li><code>unit</code> — единица измерения (°C, %, kWh, …);</li>
@@ -6523,7 +6528,24 @@ const HELP_TEXT = {
       в кабинете Tuya Cloud (iot.tuya.com → Project → Devices → Local key) или через WebUI
       (вкладка «Импорт»).</p>
       <p class="help-note">Конфиг общий: bridge читает и пишет, WebUI — только читает
-      (изменения отправляются командами MQTT через bridge).</p>`,
+      (изменения отправляются командами MQTT через bridge).</p>
+      <h3>Cover / Fan / Lock</h3>
+      <ul>
+        <li><b>cover</b> (<code>type=cover</code>): DP <code>control</code>
+            (<code>open</code>/<code>stop</code>/<code>close</code>),
+            <code>percent_control</code> — целевое положение 0–100,
+            <code>percent_state</code> — текущее положение. Необязательное поле
+            у DP <code>control</code>: <code>device_class</code>
+            (<code>curtain</code>, <code>blind</code>, <code>shutter</code>,
+            <code>garage</code>, <code>gate</code>…);</li>
+        <li><b>fan</b> (<code>type=fan</code>): DP <code>switch</code> (вкл/выкл),
+            <code>fan_speed</code> (со списком <code>options</code> → пресеты,
+            без него — число → проценты), <code>fan_direction</code>
+            (<code>forward</code>/<code>reverse</code>);</li>
+        <li><b>lock</b> (<code>component=lock</code> у любого типа): bool-DP,
+            обычно <code>lock_state</code>. Поле <code>inverted: true</code>
+            меняет смысл значения.</li>
+      </ul>`,
     settings: `
       <h3>main.py — параметры bridge</h3>
       <ul>
@@ -6740,7 +6762,7 @@ const HELP_TEXT = {
       </ul>
       <h3>Известные ограничения</h3>
       <ul>
-        <li>Нет fan и cover; нет управления Tuya Cloud (только локально); нет Prometheus-метрик;</li>
+        <li>Нет управления Tuya Cloud (только локально); нет Prometheus-метрик;</li>
         <li>История в SQLite хранится ~3 дня;</li>
         <li>WebUI без аутентификации (рассчитан на локальную сеть); PWA устанавливается вручную;</li>
         <li>Режим тишины — без дней недели (только часы) и влияет только на WebUI;</li>
@@ -8566,6 +8588,16 @@ const _ENUM_SENSOR_CODES_FRONT = new Set(["battery_state"]);
 const _CLIMATE_PRESET_CODES_FRONT = new Set(["mode", "preset_mode"]);
 
 function _dpsCompFromCloudType(t, code, writable, devType) {
+  // v1.29.1: cover/fan — роли DP заданы белыми списками в bridge
+  // (COVER_DP_NAMES / FAN_DP_NAMES), угадываем их по коду DP.
+  if (devType === "cover"
+      && (code === "control" || code === "percent_control" || code === "percent_state")) {
+    return "cover";
+  }
+  if (devType === "fan"
+      && (code === "switch" || code === "fan_speed" || code === "fan_direction")) {
+    return "fan";
+  }
   if (t === "Boolean") {
     return (code in _BOOL_BINARY_CODES_FRONT) ? "binary_sensor" : "switch";
   }
@@ -8858,6 +8890,7 @@ function dpsOpenPreview() {
 const _COMPS_ALLOWED = new Set([
   "switch","sensor","binary_sensor","select","number",
   "preset","light","climate","button","time","lock","phase_a",
+  "cover","fan",
 ]);
 
 // v1.27.1: пре-валидация финальной карты (зеркало bridge _validate_dps_map).
@@ -9549,7 +9582,9 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
     { v: "climate",       label: "climate (не используется в bridge)" },
     { v: "button",        label: "button (не используется в bridge)" },
     { v: "time",          label: "time (не используется в bridge)" },
-    { v: "lock",          label: "lock (не используется в bridge)" },
+    { v: "lock",          label: "lock" },
+    { v: "cover",         label: "cover (только type=cover)" },
+    { v: "fan",           label: "fan (только type=fan)" },
   ];
 
   const needDetails = _dpsComponentNeedsDetails(preComponent)

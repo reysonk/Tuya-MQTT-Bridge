@@ -55,7 +55,7 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 WEBUI_PORT = _env_int("WEBUI_PORT", 5386)
 WEBUI_HOST = os.getenv("WEBUI_HOST") or "0.0.0.0"
-WEBUI_VERSION = "1.29.0"
+WEBUI_VERSION = "1.29.1"
 
 CONFIG_FILE = "config/devices_config.json"
 LOG_FILE = "logs/bridge.log"

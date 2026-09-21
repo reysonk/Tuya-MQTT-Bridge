@@ -322,6 +322,8 @@
   .type-badge.climate { background:rgba(219,109,40,0.18); color:#db6d28; }
   .type-badge.sensor { background:rgba(56,139,253,0.18); color:#388bfd; }
   .type-badge.binary_sensor { background:rgba(163,113,247,0.18); color:#a371f7; }
+  .type-badge.cover { background:rgba(56,189,248,0.18); color:#38bdf8; }
+  .type-badge.fan { background:rgba(45,212,191,0.18); color:#2dd4bf; }
   /* v1.25.0 (fix3): цветной бейдж для component DP. */
   .component-badge { display:inline-block; padding:1px 6px; font-size:11px; border-radius:4px;
     background:var(--border); color:var(--muted); }
@@ -337,6 +339,8 @@
   .component-badge.time          { background: rgba(56,189,248,0.15); color: #38bdf8; }
   .component-badge.lock          { background: rgba(215,58,73,0.18);  color: var(--red); }
   .component-badge.phase_a       { background: rgba(210,153,34,0.18); color: #d29922; }
+  .component-badge.cover         { background: rgba(56,189,248,0.18); color: #38bdf8; }
+  .component-badge.fan           { background: rgba(45,212,191,0.18); color: #2dd4bf; }
   /* v1.25.0 (fix3): статусные кнопки баз DP. */
   .base-info-actions button.btn-success {
     background: rgba(46,160,67,0.18);

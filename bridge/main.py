@@ -135,7 +135,7 @@ _ORPHAN_SUFFIXES = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.10.19"
+DISCOVERY_VERSION = "1.10.20"
 RETAINED_DUP_WINDOW = 10
 
 # Пул команд. 32 — хватает на 40+ устройств.
@@ -220,7 +220,9 @@ DEFAULT_MAX_TEMP = 35
 HA_BRIGHT_MIN = 1
 HA_BRIGHT_MAX = 100
 
-ALLOWED_TYPES = ("light", "switch", "climate", "sensor", "binary_sensor")
+# v1.10.20: добавлены cover (шторы/рольставни/ворота) и fan (вентиляторы).
+ALLOWED_TYPES = ("light", "switch", "climate", "sensor", "binary_sensor",
+                 "cover", "fan")
 ALLOWED_VERSIONS = ("3.1", "3.2", "3.3", "3.4", "3.5")
 
 
@@ -231,6 +233,8 @@ ALLOWED_VERSIONS = ("3.1", "3.2", "3.3", "3.4", "3.5")
 COMPONENTS_ALLOWED = {
     "switch", "sensor", "binary_sensor", "select", "number",
     "preset", "light", "climate", "button", "time", "lock", "phase_a",
+    # v1.10.20
+    "cover", "fan",
 }
 
 DEVICE_CLASSES_ALLOWED = {
@@ -260,6 +264,24 @@ LIGHT_DP_NAMES = {
 
 # Обязательные DP для type=climate (жёстко не требуем, но предупреждаем).
 CLIMATE_RECOMMENDED = {"switch", "temp_set", "temp_current", "preset_mode"}
+
+# v1.10.20: допустимые DP для type=cover (шторы / рольставни / ворота).
+#   control         — команда: open / stop / close
+#   percent_control — целевое положение 0..100 (команда)
+#   percent_state   — текущее положение 0..100 (состояние)
+COVER_DP_NAMES = {"control", "percent_control", "percent_state"}
+
+# v1.10.20: device_class для cover (необязательное поле DP).
+COVER_DEVICE_CLASSES_ALLOWED = {
+    "curtain", "blind", "shade", "shutter", "garage", "gate",
+    "door", "awning", "damper", "window",
+}
+
+# v1.10.20: допустимые DP для type=fan (вентиляторы).
+#   switch        — вкл/выкл
+#   fan_speed     — скорость: enum (options) → пресеты, число → проценты
+#   fan_direction — направление: forward / reverse
+FAN_DP_NAMES = {"switch", "fan_speed", "fan_direction"}
 
 # v1.9.11: имена DP, зарезервированные bridge. Если пользователь назовёт
 # DP одним из этих name — bridge отклонит dps_map. Защита от коллизий
@@ -393,11 +415,16 @@ def _discovery_topics_for_device(dev):
         for suffix in ("voltage", "current", "power"):
             topics.add(f"{DISCOVERY_PREFIX}/sensor/{dev_name}_output_{suffix}/config")
 
-    # light / climate — свои unique_id
+    # light / climate / cover / fan — свои unique_id
     if dtype == "light":
         topics.add(f"{DISCOVERY_PREFIX}/light/{dev_name}_light/config")
     elif dtype == "climate":
         topics.add(f"{DISCOVERY_PREFIX}/climate/{dev_name}_climate/config")
+    # v1.10.20
+    elif dtype == "cover":
+        topics.add(f"{DISCOVERY_PREFIX}/cover/{dev_name}_cover/config")
+    elif dtype == "fan":
+        topics.add(f"{DISCOVERY_PREFIX}/fan/{dev_name}_fan/config")
 
     # DP-уровневые сущности
     for dp_str, info in dev.get("dps_map", {}).items():
@@ -411,6 +438,8 @@ def _discovery_topics_for_device(dev):
             topics.add(f"{DISCOVERY_PREFIX}/number/{dev_name}_{ent}/config")
         elif comp in ("sensor", "binary_sensor"):
             topics.add(f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{ent}/config")
+        elif comp == "lock":           # v1.10.20
+            topics.add(f"{DISCOVERY_PREFIX}/lock/{dev_name}_{ent}/config")
 
     return topics
 
@@ -1062,9 +1091,12 @@ def _validate_dps_map(dev_type, dps_map):
       - binary_sensor: device_class из белого списка
       - phase_a: name == "phase_a"
       - preset: name == "preset_mode"
+      - cover: name из COVER_DP_NAMES; device_class из COVER_DEVICE_CLASSES_ALLOWED
+      - fan: name из FAN_DP_NAMES
 
     Warnings (мягкие — bridge принимает, но сообщает):
       - climate без temp_set / temp_current / preset_mode
+      - cover без control/percent_control, fan без switch
     """
     if not isinstance(dps_map, dict):
         return False, "dps_map must be dict", []
@@ -1115,11 +1147,26 @@ def _validate_dps_map(dev_type, dps_map):
             if comp not in COMPONENTS_ALLOWED:
                 return False, f"dp {dp_str}: unknown component {comp!r}", warnings
 
+        # v1.10.20: cover/fan — только для своего типа устройства
+        # (иначе DP молча игнорировался бы: публикуют их publish_cover/publish_fan).
+        if comp == "cover" and dev_type != "cover":
+            return False, f"dp {dp_str}: component 'cover' допустим только при type=cover", warnings
+        if comp == "fan" and dev_type != "fan":
+            return False, f"dp {dp_str}: component 'fan' допустим только при type=fan", warnings
+
         # --- light: name из белого списка ---
         if dev_type == "light":
             if name not in LIGHT_DP_NAMES:
                 return False, f"dp {dp_str}: name {name!r} not allowed for light " \
                               f"(allowed: {sorted(LIGHT_DP_NAMES)})", warnings
+
+        # --- cover / fan: name из белого списка (v1.10.20) ---
+        if dev_type == "cover" and name not in COVER_DP_NAMES:
+            return False, f"dp {dp_str}: name {name!r} not allowed for cover " \
+                          f"(allowed: {sorted(COVER_DP_NAMES)})", warnings
+        if dev_type == "fan" and name not in FAN_DP_NAMES:
+            return False, f"dp {dp_str}: name {name!r} not allowed for fan " \
+                          f"(allowed: {sorted(FAN_DP_NAMES)})", warnings
 
         # --- уникальность (component, name) ---
         # Для light component может отсутствовать — используем "auto"
@@ -1202,6 +1249,12 @@ def _validate_dps_map(dev_type, dps_map):
             if name != "preset_mode":
                 return False, f"dp {dp_str}: preset requires name='preset_mode'", warnings
 
+        # --- cover: необязательный device_class (v1.10.20) ---
+        if dev_type == "cover":
+            dc_cov = info.get("device_class")
+            if dc_cov is not None and dc_cov not in COVER_DEVICE_CLASSES_ALLOWED:
+                return False, f"dp {dp_str}: unknown cover device_class {dc_cov!r}", warnings
+
     # --- climate: мягкие warnings ---
     if dev_type == "climate":
         names = {info.get("name") for info in dps_map.values()}
@@ -1210,6 +1263,21 @@ def _validate_dps_map(dev_type, dps_map):
             warnings.append(
                 f"climate без DP '{m_name}' — соответствующая функция HA "
                 f"будет недоступна"
+            )
+
+    # --- cover / fan: мягкие warnings (v1.10.20) ---
+    if dev_type == "cover":
+        names = {info.get("name") for info in dps_map.values()}
+        if not (names & {"control", "percent_control"}):
+            warnings.append(
+                "cover без DP 'control'/'percent_control' — управление из HA "
+                "будет недоступно (только состояние)"
+            )
+    if dev_type == "fan":
+        names = {info.get("name") for info in dps_map.values()}
+        if "switch" not in names:
+            warnings.append(
+                "fan без DP 'switch' — вкл/выкл из HA будет недоступен"
             )
 
     return True, None, warnings
@@ -1410,12 +1478,19 @@ def collect_our_unique_ids():
             ids.add(f"{name}_light")
         if dtype == "climate":
             ids.add(f"{name}_climate")
+        # v1.10.20
+        if dtype == "cover":
+            ids.add(f"{name}_cover")
+        if dtype == "fan":
+            ids.add(f"{name}_fan")
         for dp_str, info in dev.get("dps_map", {}).items():
             comp = info.get("component")
             ent = info.get("name", f"dp_{dp_str}")
             if comp in ("switch", "select", "number"):
                 ids.add(f"{name}_{ent}")
             elif comp in ("sensor", "binary_sensor"):
+                ids.add(f"{name}_{ent}")
+            elif comp == "lock":           # v1.10.20
                 ids.add(f"{name}_{ent}")
         if dev.get("dps_map", {}).get("6", {}).get("component") == "phase_a":
             for s in ("voltage", "current", "power"):
@@ -1443,6 +1518,12 @@ def on_connect(client, userdata, flags, rc, properties=None):
         client.subscribe(f"{TOPIC_PREFIX}/climate/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/select/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/number/+/+/set")
+        # v1.10.20: cover / fan / lock
+        client.subscribe(f"{TOPIC_PREFIX}/cover/+/set")
+        client.subscribe(f"{TOPIC_PREFIX}/cover/+/+/set")
+        client.subscribe(f"{TOPIC_PREFIX}/fan/+/set")
+        client.subscribe(f"{TOPIC_PREFIX}/fan/+/+/set")
+        client.subscribe(f"{TOPIC_PREFIX}/lock/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/cleanup")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/edit_config")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/delete_device")
@@ -1567,6 +1648,13 @@ def process_command(dev, component, parts, cmd):
                 handle_select_command(tuya, dev, parts, cmd)
             elif component == "number":
                 handle_number_command(tuya, dev, parts, cmd)
+            # v1.10.20
+            elif component == "cover":
+                handle_cover_command(tuya, dev, parts, cmd)
+            elif component == "fan":
+                handle_fan_command(tuya, dev, parts, cmd)
+            elif component == "lock":
+                handle_lock_command(tuya, dev, parts, cmd)
         except Exception as e:
             log.warning(f"[Tuya] Ошибка команды {name}: {e}")
             drop_device_conn(name)
@@ -2014,6 +2102,129 @@ def handle_number_command(tuya, dev, topic_parts, cmd):
         return
 
 
+# ==================== COVER / FAN / LOCK (v1.10.20) ====================
+def _to_int_percent(val):
+    """Привести значение к целому 0..100 (положение/скорость)."""
+    try:
+        n = int(round(float(val)))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, n))
+
+
+def _lock_locked(val, info):
+    """bool-DP замка → заперто? Поле `inverted: true` меняет смысл."""
+    if isinstance(val, str):
+        locked = val.strip().lower() in ("true", "1", "locked", "lock")
+    else:
+        locked = bool(val)
+    return (not locked) if info.get("inverted") else locked
+
+
+def handle_cover_command(tuya, dev, topic_parts, cmd):
+    """v1.10.20: HA cover → Tuya.
+
+    tuya/cover/<dev>/set           — OPEN / CLOSE / STOP
+    tuya/cover/<dev>/position/set  — 0..100
+    """
+    sub = topic_parts[3] if len(topic_parts) > 4 else ""
+
+    if sub == "position":
+        pos = _to_int_percent(cmd if not isinstance(cmd, dict) else cmd.get("position"))
+        if pos is None:
+            return
+        dp_str, _info = find_dp_by_name(dev, "percent_control", component="cover")
+        if dp_str is None:
+            return
+        debounced_set(tuya, dev, dp_int(dp_str), pos, window_ms=0, component="cover")
+        return
+
+    action = str(cmd).strip().strip('"').lower()
+    payload = {"open": "open", "close": "close", "stop": "stop"}.get(action)
+    if payload is None:
+        return
+    dp_str, _info = find_dp_by_name(dev, "control", component="cover")
+    if dp_str is None:
+        return
+    debounced_set(tuya, dev, dp_int(dp_str), payload, window_ms=0, component="cover")
+
+
+def handle_fan_command(tuya, dev, topic_parts, cmd):
+    """v1.10.20: HA fan → Tuya.
+
+    tuya/fan/<dev>/set             — ON / OFF
+    tuya/fan/<dev>/preset/set      — enum скорости (fan_speed с options)
+    tuya/fan/<dev>/speed/set       — 1..100 (fan_speed без options)
+    tuya/fan/<dev>/direction/set   — forward / reverse
+    """
+    sub = topic_parts[3] if len(topic_parts) > 4 else ""
+
+    if not sub:
+        if isinstance(cmd, dict):
+            return
+        val = str(cmd).upper() in ("ON", "1", "TRUE")
+        dp_str, _info = find_dp_by_name(dev, "switch", component="fan")
+        if dp_str is None:
+            return
+        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+        return
+
+    if sub == "preset":
+        dp_str, info = find_dp_by_name(dev, "fan_speed", component="fan")
+        if dp_str is None or not info.get("options"):
+            return
+        val = str(cmd).strip().strip('"')
+        smap = get_select_map(info)
+        if smap:
+            val = {v: k for k, v in smap.items()}.get(val, val)
+        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+        return
+
+    if sub == "speed":
+        dp_str, info = find_dp_by_name(dev, "fan_speed", component="fan")
+        if dp_str is None or info.get("options"):
+            return
+        val = _to_int_percent(cmd)
+        if val is None:
+            return
+        val = max(info.get("min", 1), min(info.get("max", 100), val))
+        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+        return
+
+    if sub == "direction":
+        val = str(cmd).strip().strip('"').lower()
+        if val not in ("forward", "reverse"):
+            return
+        dp_str, _info = find_dp_by_name(dev, "fan_direction", component="fan")
+        if dp_str is None:
+            return
+        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+
+
+def handle_lock_command(tuya, dev, topic_parts, cmd):
+    """v1.10.20: HA lock → Tuya.
+
+    tuya/lock/<dev>/<entity>/set — LOCK / UNLOCK
+    """
+    if len(topic_parts) < 5:
+        return
+    entity_name = topic_parts[3]
+    raw = str(cmd).strip().strip('"').upper()
+    if raw not in ("LOCK", "UNLOCK"):
+        return
+    wanted_locked = raw == "LOCK"
+
+    for dp_str, info in dev["dps_map"].items():
+        if info.get("component") != "lock" or info.get("name") != entity_name:
+            continue
+        dp = dp_int(dp_str)
+        if dp is None:
+            return
+        val = (not wanted_locked) if info.get("inverted") else wanted_locked
+        debounced_set(tuya, dev, dp, val, window_ms=0, component="lock")
+        return
+
+
 mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 mqtt_client.on_disconnect = on_disconnect
@@ -2079,6 +2290,11 @@ def _remove_discovery_and_state(dev, dp_str, old_info):
     if dev_type == "light" and not comp:
         return
 
+    # v1.10.20: cover/fan — одна сущность на устройство, отдельного discovery
+    # на DP нет. Её конфиг перепубликуется через publish_discovery(dev).
+    if dev_type in ("cover", "fan"):
+        return
+
     discovery_topic = None
     state_topic = None
 
@@ -2094,6 +2310,9 @@ def _remove_discovery_and_state(dev, dp_str, old_info):
     elif comp in ("sensor", "binary_sensor"):
         discovery_topic = f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{name}/config"
         state_topic = f"{TOPIC_PREFIX}/{dev_type}/{dev_name}/dps/{dp_str}/state"
+    elif comp == "lock":               # v1.10.20
+        discovery_topic = f"{DISCOVERY_PREFIX}/lock/{dev_name}_{name}/config"
+        state_topic = f"{TOPIC_PREFIX}/lock/{dev_name}/{name}/state"
     elif comp == "phase_a":
         # 3 отдельных сенсора
         for suffix in ("voltage", "current", "power"):
@@ -2859,6 +3078,21 @@ def _remove_discovery_for_device(dev):
             f"{TOPIC_PREFIX}/climate/{dev_name}/current/state",
             f"{TOPIC_PREFIX}/climate/{dev_name}/preset/state",
         ])
+    # v1.10.20
+    elif dtype == "cover":
+        discovery_topics.append(f"{DISCOVERY_PREFIX}/cover/{dev_name}_cover/config")
+        state_topics.extend([
+            f"{TOPIC_PREFIX}/cover/{dev_name}/state",
+            f"{TOPIC_PREFIX}/cover/{dev_name}/position/state",
+        ])
+    elif dtype == "fan":
+        discovery_topics.append(f"{DISCOVERY_PREFIX}/fan/{dev_name}_fan/config")
+        state_topics.extend([
+            f"{TOPIC_PREFIX}/fan/{dev_name}/state",
+            f"{TOPIC_PREFIX}/fan/{dev_name}/preset/state",
+            f"{TOPIC_PREFIX}/fan/{dev_name}/speed/state",
+            f"{TOPIC_PREFIX}/fan/{dev_name}/direction/state",
+        ])
 
     for dp_str, info in dps_map.items():
         comp = info.get("component")
@@ -2875,6 +3109,9 @@ def _remove_discovery_for_device(dev):
         elif comp in ("sensor", "binary_sensor"):
             discovery_topics.append(f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{ent}/config")
             state_topics.append(f"{TOPIC_PREFIX}/{dtype}/{dev_name}/dps/{dp_str}/state")
+        elif comp == "lock":           # v1.10.20
+            discovery_topics.append(f"{DISCOVERY_PREFIX}/lock/{dev_name}_{ent}/config")
+            state_topics.append(f"{TOPIC_PREFIX}/lock/{dev_name}/{ent}/state")
 
     if dps_map.get("6", {}).get("component") == "phase_a":
         for suffix in ("voltage", "current", "power"):
@@ -3373,6 +3610,9 @@ def publish_discovery(device):
         except Exception as e:
             log.warning(f"[Discovery] battery_alert {dev_name}: {e}")
 
+    # v1.10.20: lock — обычный DP-компонент, публикуется для любого типа устройства.
+    publish_locks(device, device_info)
+
     if dev_type == "light":
         publish_light(device, device_info)
     elif dev_type == "switch":
@@ -3382,6 +3622,10 @@ def publish_discovery(device):
         publish_sensors(device, device_info)
     elif dev_type == "climate":
         publish_climate(device, device_info)
+    elif dev_type == "cover":
+        publish_cover(device, device_info)
+    elif dev_type == "fan":
+        publish_fan(device, device_info)
     else:
         publish_sensors(device, device_info)
 
@@ -3552,6 +3796,153 @@ def publish_numbers(device, device_info):
         log.info(f"[Discovery] number: {device['friendly_name']} / {entity_name}")
 
 
+def publish_cover(device, device_info):
+    """v1.10.20: cover — шторы / рольставни / ворота (HA platform 'cover').
+
+    DP берутся из dps_map по именам (COVER_DP_NAMES):
+      control         — open / stop / close (команда)
+      percent_control — целевое положение 0..100 (команда)
+      percent_state   — текущее положение 0..100 (состояние)
+
+    Нужен хотя бы один из control / percent_control, иначе управление
+    из HA будет недоступно (только состояние).
+    """
+    dev_name = device["name"]
+    avail = base_availability(dev_name)
+    dps_map = device["dps_map"]
+
+    has_control = any(i.get("name") == "control" for i in dps_map.values())
+    has_pos = any(i.get("name") in ("percent_control", "percent_state")
+                  for i in dps_map.values())
+
+    # device_class — из DP (необязательно), по умолчанию curtain
+    device_class = "curtain"
+    for i in dps_map.values():
+        if i.get("name") == "control" and i.get("device_class"):
+            device_class = i["device_class"]
+            break
+
+    config = {
+        "name": device["friendly_name"],
+        "unique_id": f"{dev_name}_cover",
+        "device_class": device_class,
+        "optimistic": False,
+        "expire_after": AVAILABILITY_EXPIRE,
+        "device": device_info,
+        **avail,
+    }
+    if has_control:
+        config["command_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/set"
+        config["payload_open"] = "OPEN"
+        config["payload_close"] = "CLOSE"
+        config["payload_stop"] = "STOP"
+    if has_pos:
+        config["position_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/position/state"
+        config["set_position_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/position/set"
+        config["position_open"] = 100
+        config["position_closed"] = 0
+
+    if not (has_control or has_pos):
+        log.warning(f"[Discovery] cover {dev_name}: нет DP control/percent_* — "
+                    f"сущность без управления")
+
+    topic = f"{DISCOVERY_PREFIX}/cover/{dev_name}_cover/config"
+    mqtt_client.publish(topic, json.dumps(config), retain=True)
+    log.info(f"[Discovery] cover: {device['friendly_name']} ({device_class})")
+
+
+def publish_fan(device, device_info):
+    """v1.10.20: fan — вентиляторы (HA platform 'fan').
+
+    DP берутся из dps_map по именам (FAN_DP_NAMES):
+      switch        — вкл/выкл (command/state ON|OFF)
+      fan_speed     — enum (options) → preset_modes, число → percentage
+      fan_direction — forward / reverse
+    """
+    dev_name = device["name"]
+    avail = base_availability(dev_name)
+    dps_map = device["dps_map"]
+
+    has_switch = any(i.get("name") == "switch" for i in dps_map.values())
+    speed = None
+    for i in dps_map.values():
+        if i.get("name") == "fan_speed":
+            speed = i
+            break
+    has_dir = any(i.get("name") == "fan_direction" for i in dps_map.values())
+
+    config = {
+        "name": device["friendly_name"],
+        "unique_id": f"{dev_name}_fan",
+        "optimistic": False,
+        "expire_after": AVAILABILITY_EXPIRE,
+        "device": device_info,
+        **avail,
+    }
+    if has_switch:
+        config["command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/set"
+        config["state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/state"
+        config["payload_on"] = "ON"
+        config["payload_off"] = "OFF"
+        config["state_on"] = "ON"
+        config["state_off"] = "OFF"
+
+    if speed is not None:
+        if speed.get("options"):
+            config["preset_modes"] = list(speed["options"])
+            config["preset_mode_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/set"
+            config["preset_mode_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/state"
+        else:
+            config["percentage_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/speed/set"
+            config["percentage_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/speed/state"
+            config["speed_range_min"] = speed.get("min", 1)
+            config["speed_range_max"] = speed.get("max", 100)
+
+    if has_dir:
+        config["direction_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/direction/set"
+        config["direction_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/direction/state"
+
+    if not (has_switch or speed or has_dir):
+        log.warning(f"[Discovery] fan {dev_name}: нет DP switch/fan_speed/fan_direction")
+
+    topic = f"{DISCOVERY_PREFIX}/fan/{dev_name}_fan/config"
+    mqtt_client.publish(topic, json.dumps(config), retain=True)
+    log.info(f"[Discovery] fan: {device['friendly_name']}")
+
+
+def publish_locks(device, device_info):
+    """v1.10.20: lock — умные замки (HA platform 'lock').
+
+    DP с component='lock' (обычно name='lock_state', bool: true = заперто).
+    Поле `inverted: true` в DP инвертирует смысл значения.
+    """
+    dev_name = device["name"]
+    avail = base_availability(dev_name)
+
+    for dp_str, info in device["dps_map"].items():
+        if info.get("component") != "lock":
+            continue
+        entity_name = info.get("name", "lock")
+        unique_id = f"{dev_name}_{entity_name}"
+        config = {
+            "name": f"{device['friendly_name']} {entity_name}",
+            "unique_id": unique_id,
+            "command_topic": f"{TOPIC_PREFIX}/lock/{dev_name}/{entity_name}/set",
+            "state_topic": f"{TOPIC_PREFIX}/lock/{dev_name}/{entity_name}/state",
+            "payload_lock": "LOCK",
+            "payload_unlock": "UNLOCK",
+            "state_locked": "LOCKED",
+            "state_unlocked": "UNLOCKED",
+            "optimistic": False,
+            "expire_after": AVAILABILITY_EXPIRE,
+            "device": device_info,
+            **avail,
+        }
+        topic = f"{DISCOVERY_PREFIX}/lock/{unique_id}/config"
+        mqtt_client.publish(topic, json.dumps(config), retain=True)
+        log.info(f"[Discovery] lock: {device['friendly_name']} / {entity_name}")
+
+
 def publish_climate(device, device_info):
     dev_name = device["name"]
     unique_id = f"{dev_name}_climate"
@@ -3621,7 +4012,10 @@ def publish_sensors(device, device_info):
 
     for dp_str, info in device["dps_map"].items():
         component = info.get("component", "sensor")
-        if component in ("switch", "light", "preset", "select", "phase_a", "number"):
+        # v1.10.20: cover/fan/lock публикуются своими функциями
+        # (publish_cover/publish_fan/publish_locks) — здесь их быть не должно.
+        if component in ("switch", "light", "preset", "select", "phase_a",
+                         "number", "cover", "fan", "lock"):
             continue
         entity_name = info.get("name", f"dp_{dp_str}")
         unique_id = f"{dev_name}_{entity_name}"
@@ -3746,6 +4140,11 @@ def publish_state(device, dps):
 
     with STATE_LOCK:
         cached = dict(STATE_CACHE.get(dev_name, {}))
+
+    # v1.10.20: lock — DP-компонент, публикуется независимо от типа устройства.
+    for dp_str, info in dps_map.items():
+        if info.get("component") == "lock" and dp_str in cached:
+            _publish_lock_state(dev_name, info, cached[dp_str])
 
     if dev_type == "light":
         state = {"state": "OFF"}
@@ -3903,9 +4302,76 @@ def publish_state(device, dps):
             mqtt_client.publish(f"{TOPIC_PREFIX}/climate/{dev_name}/preset/state", preset_ha, retain=True)
         return
 
+    if dev_type == "cover":
+        control = None
+        position = None
+        for dp_str, info in dps_map.items():
+            if dp_str not in cached:
+                continue
+            name = info.get("name")
+            val = cached[dp_str]
+            if name == "control":
+                control = str(val).strip().lower()
+            elif name == "percent_state":
+                position = _to_int_percent(val)
+            elif name == "percent_control" and position is None:
+                position = _to_int_percent(val)
+
+        if control in ("open", "opening"):
+            mqtt_client.publish(f"{TOPIC_PREFIX}/cover/{dev_name}/state", "OPEN", retain=True)
+        elif control in ("close", "closing"):
+            mqtt_client.publish(f"{TOPIC_PREFIX}/cover/{dev_name}/state", "CLOSE", retain=True)
+        if position is not None:
+            mqtt_client.publish(f"{TOPIC_PREFIX}/cover/{dev_name}/position/state",
+                                str(position), retain=True)
+        return
+
+    if dev_type == "fan":
+        state = None
+        pct = None
+        preset = None
+        direction = None
+        for dp_str, info in dps_map.items():
+            if dp_str not in cached:
+                continue
+            name = info.get("name")
+            val = cached[dp_str]
+            if name == "switch":
+                state = "ON" if val else "OFF"
+            elif name == "fan_speed":
+                if info.get("options"):
+                    sval = str(val)
+                    smap = get_select_map(info)
+                    if smap:
+                        sval = {v: k for k, v in smap.items()}.get(sval, sval)
+                    preset = sval
+                else:
+                    pct = _to_int_percent(val)
+            elif name == "fan_direction":
+                direction = str(val).strip().lower()
+
+        if state is not None:
+            mqtt_client.publish(f"{TOPIC_PREFIX}/fan/{dev_name}/state", state, retain=True)
+        if preset is not None:
+            mqtt_client.publish(f"{TOPIC_PREFIX}/fan/{dev_name}/preset/state", preset, retain=True)
+        elif pct is not None:
+            mqtt_client.publish(f"{TOPIC_PREFIX}/fan/{dev_name}/speed/state", str(pct), retain=True)
+        if direction is not None:
+            mqtt_client.publish(f"{TOPIC_PREFIX}/fan/{dev_name}/direction/state",
+                                direction, retain=True)
+        return
+
     for dp_str, info in dps_map.items():
         if dp_str in cached:
             _publish_sensor_value(dev_type, dev_name, dp_str, info, cached[dp_str])
+
+
+def _publish_lock_state(dev_name, info, raw_val):
+    """v1.10.20: состояние замка → HA (LOCKED / UNLOCKED)."""
+    entity_name = info.get("name", "lock")
+    payload = "LOCKED" if _lock_locked(raw_val, info) else "UNLOCKED"
+    mqtt_client.publish(f"{TOPIC_PREFIX}/lock/{dev_name}/{entity_name}/state",
+                        payload, retain=True)
 
 
 def _publish_sensor_value(dev_type, dev_name, dp_str, info, raw_val):
