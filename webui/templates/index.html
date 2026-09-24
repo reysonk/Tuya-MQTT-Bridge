@@ -32,6 +32,8 @@
   <div class="header-row1">
     <h1 onclick="goHome()" title="На дашборд">MQTT Tuya Bridge</h1>
     <button id="nav-toggle" onclick="toggleNav()" title="Меню" aria-label="Меню">☰</button>
+    <span class="release-new" id="release-new" style="display:none;"
+          title="На GitHub доступен новый релиз — нажмите"></span>
     <button id="theme-btn" class="theme-btn" onclick="toggleTheme()" title="Переключить тему">🌙</button>
   </div>
   <nav id="main-nav">
@@ -41,20 +43,23 @@
     <a href="/tools" id="nav-tools">🛠 Инструменты</a>
   </nav>
   <div class="header-row3">
-    <span id="health-widget" class="health-widget" onclick="toggleHealthDetail()" title="Клик — детали">
-      <!-- v1.28.17: шапка — WebUI ● Bridge. Точка — статус bridge. -->
-      <span id="hw-webui">WebUI v?</span>
-      <span class="hw-sep">·</span>
-      <span id="hw-status" class="hw-dim">…</span>
-      <span class="hw-sep">·</span>
-      <span id="hw-bridge">Bridge v?</span>
-      <span class="hw-sep hw-opt">·</span>
-      <span id="hw-rest" class="hw-opt"></span>
+    <span id="health-widget" class="health-widget" onclick="toggleHealthDetail()" title="Клик — метрики и детали">
+      <!-- v1.31.15: строка 1 — [· WebUI vX ● · Bridge vY ● ·], строка 2 — метрики -->
+      <span class="hw-line1">
+        <span class="hw-sep">·</span>
+        <span id="hw-webui">WebUI v?</span>
+        <span id="hw-webui-dot" class="dot unknown" title="WebUI"></span>
+        <span class="hw-sep">·</span>
+        <span id="hw-bridge">Bridge v?</span>
+        <span id="hw-bridge-dot" class="dot unknown" title="Bridge"></span>
+        <span class="hw-sep" id="hw-line1-end">·</span>
+      </span>
+      <span id="hw-rest" class="hw-metrics"></span>
     </span>
     <div class="toolbar">
       <button id="latency-btn" onclick="doLatencyRefresh()">📡<span class="btn-label"> Ping</span><span class="btn-label-short"> Ping</span></button>
       <span id="latency-result" class="muted" style="font-size:11px;"></span>
-      <button id="help-btn" onclick="location.href='/help'"><span class="help-q">❓</span><span class="btn-label"> Справка</span><span class="btn-label-short"> ?</span></button>
+      <button id="help-btn" onclick="location.href='/help'"><span class="help-q">❓</span><span class="btn-label"> Справка</span><span class="btn-label-short"> Справка</span></button>
     </div>
   </div>
   <div id="health-detail" class="health-detail" style="display:none;"></div>
@@ -68,9 +73,11 @@
 
   <div class="card">
     <h2 class="section-title">Устройства <span class="hint">клик по строке — подробности, клик по заголовку — сортировка</span></h2>
+    <!-- v1.32.12: KPI-плитки дашборда (единый стиль с аналитикой) -->
+    <div class="analytics-kpi" id="dashboard-kpi" style="margin:12px 14px 12px 14px;"></div>
     <div class="table-toolbar">
-      <input id="device-search" type="text" placeholder="Поиск: имя, IP, тип…" oninput="onDeviceSearch(this.value)">
-      <button class="toolbar-clear" onclick="clearDeviceSearch()">×</button>
+      <input id="device-search" type="text" placeholder="Поиск: имя, IP, тип…" aria-label="Поиск по устройствам" oninput="onDeviceSearch(this.value)">
+      <button class="toolbar-clear" onclick="clearDeviceSearch()" title="Очистить" aria-label="Очистить поиск">×</button>
       <span class="toolbar-info" id="device-search-info"></span>
     </div>
     <div class="devices-table-wrap">
@@ -103,6 +110,20 @@
 </div>
 
 <div id="view-analytics" style="display:none;">
+  <!-- v1.32.12: KPI-плитки (online, средний ping, мерцания, тихие) -->
+  <div class="analytics-kpi" id="analytics-kpi"></div>
+  <!-- v1.32.12: настройка вида аналитики (сохраняется в localStorage) -->
+  <div class="an-cfg">
+    <button type="button" class="an-cfg-btn" onclick="exportLatencyCsv()" title="Скачать таблицу задержки в CSV">⬇ CSV задержки</button>
+    <button type="button" class="an-cfg-btn" onclick="toggleAnalyticsCfg()">⚙ Настроить аналитику</button>
+    <div class="an-cfg-panel" id="an-cfg-panel" style="display:none;">
+      <label><input type="checkbox" id="an-cfg-kpi" onchange="applyAnalyticsCfg(true)"> KPI-плитки</label>
+      <label><input type="checkbox" id="an-cfg-flappers" onchange="applyAnalyticsCfg(true)"> Мерцающие (24ч)</label>
+      <label><input type="checkbox" id="an-cfg-timeline" onchange="applyAnalyticsCfg(true)"> Хронология событий</label>
+      <label><input type="checkbox" id="an-cfg-charts" onchange="applyAnalyticsCfg(true)"> Графики</label>
+      <label><input type="checkbox" id="an-cfg-hidequiet" onchange="applyAnalyticsCfg(true)"> Скрывать тихие устройства</label>
+    </div>
+  </div>
   <div class="analytics-grid">
     <div class="card analytics-card">
       <div class="analytics-card-header">
@@ -162,18 +183,20 @@
       <div style="padding:0 16px 12px 16px;">
         <div class="chart-block">
           <div class="chart-subtitle">Online по часам</div>
-          <svg id="chart-activity" viewBox="0 0 800 180" preserveAspectRatio="none" style="width:100%; height:180px; display:block;"></svg>
+          <!-- v1.32.12: легенда — в шапке блока (раньше уезжала вниз в пустоту). -->
           <div class="chart-legend">
             <span class="legend-item"><span class="legend-line online"></span>online</span>
             <span class="legend-item"><span class="legend-line total"></span>total (всего устройств)</span>
           </div>
+          <svg id="chart-activity" style="width:100%; height:180px; display:block;"></svg>
         </div>
         <div class="chart-block" style="margin-top:16px;">
           <div class="chart-subtitle">Мерцания (переходы online↔offline по часам)</div>
-          <svg id="chart-flaps" viewBox="0 0 800 140" preserveAspectRatio="none" style="width:100%; height:140px; display:block;"></svg>
+          <!-- v1.32.12: легенда — в шапке блока. -->
           <div class="chart-legend">
             <span class="legend-item"><span class="legend-bar flaps"></span>переходов за час</span>
           </div>
+          <svg id="chart-flaps" style="width:100%; height:140px; display:block;"></svg>
         </div>
       </div>
     </div>
@@ -191,13 +214,23 @@
           <button class="log-source-btn" data-src="bridge" onclick="switchLogSource('bridge')">Bridge</button>
           <button class="log-source-btn" data-src="webui" onclick="switchLogSource('webui')">WebUI</button>
         </div>
-        <span id="log-level-filter" style="display:inline-flex; align-items:center; gap:8px;">
-          <span class="muted" style="font-size:12px; margin-left:8px;">Уровень:</span>
-          <button data-level="DEBUG" onclick="toggleLevel('DEBUG')">DEBUG</button>
-          <button data-level="INFO" onclick="toggleLevel('INFO')">INFO+</button>
-          <button data-level="WARNING" onclick="toggleLevel('WARNING')">WARN+</button>
-          <button data-level="ERROR" onclick="toggleLevel('ERROR')">ERROR</button>
-        </span>
+        <!-- v1.33.22: строку «Уровень: …» и A−/A+ группируем в обёртку.
+             На ПК она «растворяется» (display:contents) — вид не меняется;
+             на мобиле уровни и A−/A+ делят одну строку, а если не влезают —
+             A−/A+ переносятся вниз, и чипы уровней занимают всю ширину. -->
+        <div class="logs-levels-row">
+          <span id="log-level-filter" style="display:inline-flex; align-items:center; gap:8px;">
+            <span class="muted" style="font-size:12px; margin-left:8px;">Уровень:</span>
+            <button data-level="DEBUG" onclick="toggleLevel('DEBUG')">DEBUG</button>
+            <button data-level="INFO" onclick="toggleLevel('INFO')">INFO+</button>
+            <button data-level="WARNING" onclick="toggleLevel('WARNING')">WARN+</button>
+            <button data-level="ERROR" onclick="toggleLevel('ERROR')">ERROR</button>
+          </span>
+          <span class="log-font-ctl">
+            <button onclick="changeLogFont(-1)" class="log-font-btn" title="Мельче шрифт лога" aria-label="Мельче шрифт лога">A−</button>
+            <button onclick="changeLogFont(1)" class="log-font-btn" title="Крупнее шрифт лога" aria-label="Крупнее шрифт лога">A+</button>
+          </span>
+        </div>
         <button onclick="downloadLogs()" class="logs-download">⬇ Скачать</button>
       </div>
 
@@ -206,7 +239,7 @@
         <div class="logs-toolbar-row2-left">
           <button onclick="pauseLogs()" id="pause-btn" class="logs-pause">⏸ Пауза</button>
           <div class="logs-tb-search">
-            <input id="log-search" type="text" placeholder="Поиск..." oninput="doSearch()">
+            <input id="log-search" type="text" placeholder="Поиск..." aria-label="Поиск по логам" oninput="doSearch()">
             <button onclick="clearLogSearch()" id="find-clear-btn" title="Очистить">×</button>
             <button onclick="findPrev()" id="find-prev-btn" disabled title="Предыдущее">▲</button>
             <button onclick="findNext()" id="find-next-btn" disabled title="Следующее">▼</button>
@@ -233,9 +266,9 @@
     <div id="cloud-cache-banner" class="cloud-cache-banner" style="display:none;"></div>
     <div style="padding:16px;">
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-        <div class="form-group"><label>Access ID</label><input id="cloud-access-id" type="text"></div>
-        <div class="form-group"><label>Access Secret</label><input id="cloud-access-secret" type="password"></div>
-        <div class="form-group"><label>Region</label>
+        <div class="form-group"><label for="cloud-access-id">Access ID</label><input id="cloud-access-id" type="text"></div>
+        <div class="form-group"><label for="cloud-access-secret">Access Secret</label><input id="cloud-access-secret" type="password"></div>
+        <div class="form-group"><label for="cloud-region">Region</label>
           <select id="cloud-region">
             <option value="eu">EU</option><option value="us">US</option>
             <option value="us-e">US-E</option><option value="eu-w">EU-W</option>
@@ -259,7 +292,7 @@
     <h2 class="section-title">Локальные базы DP</h2>
     <div class="base-info">
       <div class="base-info-item">
-        <b>tinytuya devices.json:</b>
+        <b>Локальная tinytuya база:</b>
         <span id="base-tinytuya-info" class="muted">—</span>
       </div>
       <div class="base-info-item">
@@ -268,23 +301,32 @@
       </div>
       <div class="base-info-actions">
         <button onclick="updateTuyaLocalDb()" id="tuya-local-update-btn"
-                title="Скачать ~50 МБ из GitHub (make-all/tuya-local). Займёт до 2 минут.">⬇ Обновить tuya-local</button>
+                title="Скачать архив ~1.3 МБ из GitHub (make-all/tuya-local); после распаковки ≈50 МБ YAML. Обычно до 1–2 минут.">⬇ Обновить tuya-local</button>
         <button onclick="rebuildTinytuyaJson()" id="rebuild-btn"
-                title="Пробовать каждое устройство через tinytuya, сопоставить DP. Несколько минут.">🔄 Пересобрать tinytuya.json</button>
+                title="Пробовать каждое устройство через tinytuya, сопоставить DP. Несколько минут.">🔄 Пересобрать tinytuya базу</button>
         <span id="base-update-result" class="muted" style="font-size:11px;"></span>
       </div>
+    </div>
+    <!-- v1.32.8: у обновления tuya-local свой прогресс — иначе он и пересборка
+         писали в один блок и перетирали друг друга. -->
+    <div id="tuya-local-progress" style="display:none; padding:0 16px 12px 16px;">
+      <div class="muted" style="font-size:12px;" id="tuya-local-progress-text"></div>
+      <div class="rebuild-bar"><div class="rebuild-bar-fill" id="tuya-local-bar-fill" style="width:0%"></div></div>
+      <!-- v1.33.9: карточки результата обновления tuya-local (как у пересборки). -->
+      <div id="tuya-local-report" class="muted" style="display:none; font-size:12px; margin-top:8px;"></div>
     </div>
     <div id="rebuild-progress" style="display:none; padding:0 16px 12px 16px;">
       <div class="muted" style="font-size:12px;" id="rebuild-progress-text"></div>
       <div class="rebuild-bar"><div class="rebuild-bar-fill" id="rebuild-bar-fill" style="width:0%"></div></div>
+      <div id="rebuild-report" class="muted" style="display:none; font-size:12px; margin-top:8px;"></div>
     </div>
   </div>
 
   <div class="card">
     <h2 class="section-title">Устройства из Cloud <span id="cloud-count" class="muted" style="float:right; text-transform:none;"></span></h2>
     <div class="table-toolbar">
-      <input id="cloud-search" type="text" placeholder="Поиск: имя, ID, продукт…" oninput="onCloudSearch(this.value)">
-      <button class="toolbar-clear" onclick="clearCloudSearch()">×</button>
+      <input id="cloud-search" type="text" placeholder="Поиск: имя, ID, продукт…" aria-label="Поиск по устройствам Cloud" oninput="onCloudSearch(this.value)">
+      <button class="toolbar-clear" onclick="clearCloudSearch()" title="Очистить" aria-label="Очистить поиск">×</button>
       <span class="cloud-filter-btns time-btn-group">
         <button type="button" id="cf-all" class="active" onclick="setCloudFilter('all')">Все</button>
         <button type="button" id="cf-new" onclick="setCloudFilter('new')">Новые</button>
@@ -312,7 +354,7 @@
     <h2 class="section-title">Безопасный скан LAN</h2>
     <div style="padding:16px;">
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-        <div class="form-group"><label>Сеть (первые 3 октета)</label>
+        <div class="form-group"><label for="scan-subnet">Сеть (первые 3 октета)</label>
           <input id="scan-subnet" type="text" placeholder="192.168.0" value="192.168.0" oninput="updateScanHint()">
         </div>
         <div class="form-group"><label>&nbsp;</label>
@@ -335,6 +377,7 @@
       <button id="tools-view-bydev" onclick="setToolsView('bydev')">📋 По устройствам</button>
       <button id="tools-view-audit" onclick="setToolsView('audit')">📜 История конфига</button>
       <button onclick="loadConfig()" style="margin-left:auto;">🔄 Обновить</button>
+      <button id="tools-restore-btn" style="display:none;" onclick="openConfigRestore()">↩️ Откатить из бэкапа</button>
       <button id="tools-copy-raw-btn" onclick="copyConfigRaw()">📋 Копировать JSON</button>
       <button id="tools-copy-dev-btn" style="display:none;" onclick="copyConfigDevice()">📋 Копировать JSON выбранного</button>
       <button id="tools-audit-cleanup-btn" style="display:none;" onclick="openAuditCleanup()">🗑 Очистить</button>
@@ -342,6 +385,41 @@
     </div>
     <div id="tools-container">
       <div class="muted" style="padding:16px;">Загрузка…</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 class="section-title">⏳ Параметры и нормализация конфига</h2>
+    <div class="card-pad">
+      <p class="muted" style="margin-top:0; font-size:13px;">
+        <code>expire_after</code> — «время жизни» сущностей в Home Assistant: сколько секунд
+        держится последнее значение без обновлений. Применяется <b>только к батарейным</b>
+        устройствам (у проводных bridge всегда использует 120 с). Если поле не задано —
+        действует значение по умолчанию из bridge.
+      </p>
+      <div class="toolbar" style="margin-top:8px; flex-wrap:wrap;">
+        <button id="cfg-report-btn" onclick="toolConfigReport()">🔎 Проверить конфиг</button>
+        <button id="cfg-expire-clear-btn" onclick="toolExpireClear()">🧹 Очистить expire_after</button>
+        <button id="cfg-expire-fill-btn" onclick="toolExpireFill()">⏳ Проставить батарейным</button>
+      </div>
+      <div id="cfg-tools-status" class="muted" style="font-size:12px; margin-top:8px;"></div>
+      <pre id="cfg-tools-report" class="preview-raw-pre" style="display:none;"></pre>
+      <details style="margin-top:12px; border:1px solid var(--red); border-radius:6px; background:rgba(215,58,73,0.08);">
+        <summary style="cursor:pointer; padding:8px 12px; color:var(--red); font-weight:600;">
+          ⚠️ ОПАСНО: нормализовать конфиг полностью
+        </summary>
+        <div style="padding:0 12px 12px 12px;">
+          <p class="muted" style="font-size:12px;">
+            Удалит из <code>devices_config.json</code> всё, что bridge не использует:
+            лишние поля DP (например <code>min</code>/<code>max</code>/<code>step</code> у сенсоров,
+            <code>role</code>), а также <code>expire_after</code> у проводных. Поле
+            <code>values</code> сохраняется. Сначала показывается отчёт «будет удалено»,
+            запись — только после подтверждения. Делается бэкап, операция попадает
+            в «📜 Историю конфига».
+          </p>
+          <button class="danger" id="cfg-normalize-btn" onclick="openNormalizeConfig()">⚠️ Проверить и нормализовать</button>
+        </div>
+      </details>
     </div>
   </div>
 
@@ -370,6 +448,7 @@
       </p>
       <div class="toolbar" style="margin-top:8px;">
         <button id="cleanup-btn" onclick="doCleanup()">🧹 Очистить Discovery</button>
+        <button id="cleanup-orphans-btn" onclick="cleanupOrphans()" title="Удалить только «зависшие» retained-топики — живые сущности не трогаются">🧹 Очистить orphan</button>
         <span id="cleanup-result" class="muted" style="font-size:11px;"></span>
       </div>
     </div>
@@ -392,7 +471,7 @@
       <div style="display:flex; align-items:center;">
         <button class="refresh-btn" id="modal-edit-btn" onclick="editDeviceFromModal()" title="Изменить настройки">✏️</button>
         <button class="refresh-btn" id="modal-refresh-btn" onclick="refreshModal()" title="Обновить">🔄</button>
-        <button class="modal-close" onclick="closeModal()">×</button>
+        <button class="modal-close" onclick="closeModal()" title="Закрыть" aria-label="Закрыть">×</button>
       </div>
     </div>
     <div id="modal-body" class="modal-body"></div>
@@ -420,9 +499,10 @@
     </div>
     <div id="preview-errors-banner" style="display:none;"></div>
     <div id="preview-body" class="modal-body"></div>
-    <div style="display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg);">
-      <button onclick="closePreview()">Отмена</button>
-      <button onclick="probeAllInPreview()" id="preview-probe-all-btn">🔍 Probe все</button>
+    <div style="display:flex; gap:8px; align-items:center; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg);">
+      <button onclick="closePreview()" id="preview-cancel-btn">Отмена</button>
+      <span id="preview-footer-hint" class="muted" style="font-size:11px;">Закрыть окно — крестиком ✕ справа сверху</span>
+      <button onclick="probeAllInPreview()" id="preview-probe-all-btn">🔍 Опросить все</button>
       <button class="primary" onclick="confirmImport()" style="margin-left:auto;" id="preview-import-btn">📦 Импортировать всё</button>
     </div>
   </div>
@@ -440,14 +520,14 @@
         <summary>📡 Подключение</summary>
         <div class="edit-section-body">
           <div class="edit-row-v2">
-            <label id="edit-device-ip-label">IP-адрес</label>
+            <label id="edit-device-ip-label" for="edit-device-ip">IP-адрес</label>
             <input id="edit-device-ip" type="text" placeholder="192.168.1.100"
                    oninput="updateEditSubmitState()">
             <div id="edit-device-ip-error" class="edit-hint" style="color:var(--red); display:none;"></div>
           </div>
 
           <div class="edit-row-v2">
-            <label id="edit-device-version-label">Версия протокола</label>
+            <label id="edit-device-version-label" for="edit-device-version">Версия протокола</label>
             <select id="edit-device-version" onchange="updateEditSubmitState()">
               <option value="3.1">3.1</option>
               <option value="3.2">3.2</option>
@@ -458,7 +538,7 @@
           </div>
 
           <div class="edit-row-v2">
-            <label id="edit-device-key-label">Local key</label>
+            <label id="edit-device-key-label" for="edit-device-key">Local key</label>
             <input id="edit-device-key" type="text" autocomplete="new-password"
                    placeholder="введи новый key (текущий не показывается)"
                    oninput="updateEditSubmitState()">
@@ -471,12 +551,37 @@
         <summary>⚙ Поведение</summary>
         <div class="edit-section-body">
           <div class="edit-row-v2">
-            <label id="edit-device-battery-label">Тип воркера</label>
+            <label id="edit-device-type-label" for="edit-device-type">Тип устройства</label>
+            <select id="edit-device-type" onchange="updateEditSubmitState()">
+              <option value="light">light — свет</option>
+              <option value="switch">switch — выключатель / розетка</option>
+              <option value="climate">climate — термостат</option>
+              <option value="sensor">sensor — датчик</option>
+              <option value="binary_sensor">binary_sensor — бинарный датчик</option>
+              <option value="cover">cover — штора / ворота</option>
+              <option value="fan">fan — вентилятор</option>
+            </select>
+            <div class="edit-hint">Платформа Home Assistant. Смена типа пересоздаёт сущности устройства: старые Discovery-записи снимаются автоматически.</div>
+          </div>
+          <div class="edit-row-v2">
+            <label id="edit-device-battery-label" for="edit-device-battery">Тип воркера</label>
             <select id="edit-device-battery" onchange="updateEditSubmitState()">
               <option value="false">🔌 Проводное (polling)</option>
               <option value="true">🔋 Батарейное (ICMP ping)</option>
             </select>
             <div class="edit-hint">Смена типа перезапустит воркер устройства.</div>
+          </div>
+          <div class="edit-row-v2" id="edit-device-expire-row">
+            <label id="edit-device-expire-label">Время жизни (expire_after)</label>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <span id="edit-device-expire-note" class="muted" style="font-size:12px;">Не задано — применяется значение по умолчанию (bridge)</span>
+              <input type="number" id="edit-device-expire" min="1" step="1" aria-label="expire_after, секунды"
+                     style="max-width:130px; display:none;" placeholder="секунды"
+                     oninput="updateEditSubmitState()">
+              <button type="button" id="edit-device-expire-set" onclick="editDeviceExpireSet()">Задать</button>
+              <button type="button" id="edit-device-expire-reset" style="display:none;"
+                      onclick="editDeviceExpireReset()">Сбросить по умолчанию</button>
+            </div>
           </div>
         </div>
       </details>
@@ -534,8 +639,8 @@
       <div class="radio-row"><input type="radio" name="db-cleanup-scope" id="dbc-scope-custom" value="custom" onchange="updateDbCleanupForm()"><label for="dbc-scope-custom">Своё:</label></div>
       <div id="dbc-age-fields" style="display:none; margin:4px 0 0 24px;">
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <div><label>Дней</label><input id="db-keep-days" type="number" value="3" min="0" max="3650"></div>
-          <div><label>Часов</label><input id="db-keep-hours" type="number" value="0" min="0" max="23"></div>
+          <div><label for="db-keep-days">Дней</label><input id="db-keep-days" type="number" value="3" min="0" max="3650"></div>
+          <div><label for="db-keep-hours">Часов</label><input id="db-keep-hours" type="number" value="0" min="0" max="23"></div>
         </div>
       </div>
       <div class="radio-row" style="margin-top:8px;">
@@ -545,7 +650,8 @@
       <div id="db-cleanup-result" class="muted" style="margin:12px 0 0 0;"></div>
     </div>
     <div class="modal-footer">
-      <button onclick="closeDbCleanup()">Отмена</button>
+      <button onclick="closeDbCleanup()" id="db-cleanup-cancel">Закрыть</button>
+      <span id="db-cleanup-hint" class="muted" style="font-size:11px; margin-right:auto;"></span>
       <button class="danger" onclick="doDbCleanup()" id="db-cleanup-btn">🗑 Удалить</button>
     </div>
   </div>
@@ -565,8 +671,8 @@
       <div class="radio-row"><input type="radio" name="audit-cleanup-scope" id="audc-scope-custom" value="custom" onchange="updateAuditCleanupForm()"><label for="audc-scope-custom">Своё:</label></div>
       <div id="audc-age-fields" style="display:none; margin:4px 0 0 24px;">
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <div><label>Дней</label><input id="audc-keep-days" type="number" value="30" min="0" max="3650"></div>
-          <div><label>Часов</label><input id="audc-keep-hours" type="number" value="0" min="0" max="23"></div>
+          <div><label for="audc-keep-days">Дней</label><input id="audc-keep-days" type="number" value="30" min="0" max="3650"></div>
+          <div><label for="audc-keep-hours">Часов</label><input id="audc-keep-hours" type="number" value="0" min="0" max="23"></div>
         </div>
       </div>
       <div class="radio-row" style="margin-top:8px;">
@@ -576,8 +682,93 @@
       <div id="audit-cleanup-result" class="muted" style="margin:12px 0 0 0;"></div>
     </div>
     <div class="modal-footer">
-      <button onclick="closeAuditCleanup()">Отмена</button>
+      <button onclick="closeAuditCleanup()" id="audit-cleanup-cancel">Закрыть</button>
+      <span id="audit-cleanup-hint" class="muted" style="font-size:11px; margin-right:auto;"></span>
       <button class="danger" onclick="doAuditCleanup()" id="audit-cleanup-btn">🗑 Удалить</button>
+    </div>
+  </div>
+</div>
+
+<div id="cfg-restore-overlay" class="modal-overlay center-on-mobile" onclick="closeConfigRestore(event)">
+  <div class="modal small" style="max-width:400px;" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2>↩️ Откат конфига из бэкапа</h2>
+      <button class="modal-close" onclick="closeConfigRestore()">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin-top:0;">Бэкапы <code>devices_config.json</code> (создаёт bridge).
+        Текущий конфиг тоже будет сохранён — откат обратим.</p>
+      <div id="cfg-restore-list" class="restore-list"><span class="spin"></span> загрузка…</div>
+      <p class="muted" style="font-size:12px; margin:12px 0 0 0;">
+        После отката bridge перезапустит воркеры и перепубликует сущности в Home Assistant.
+        Устройства, которых нет в бэкапе, из HA пропадут.
+      </p>
+      <div id="cfg-restore-result" class="muted" style="margin:8px 0 0 0;"></div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeConfigRestore()" id="cfg-restore-cancel">Закрыть</button>
+      <span id="cfg-restore-hint" class="muted" style="font-size:11px; margin-right:auto;"></span>
+      <button class="danger" id="cfg-restore-btn" onclick="doConfigRestore()" disabled>↩️ Откатить</button>
+    </div>
+  </div>
+</div>
+
+<div id="normalize-overlay" class="modal-overlay center-on-mobile" onclick="closeNormalizeConfig(event)">
+  <div class="modal small" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2>⚠️ Нормализовать конфиг</h2>
+      <button class="modal-close" onclick="closeNormalizeConfig()">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin-top:0;">Отметь, что именно исправить в <code>devices_config.json</code>.
+        Сначала «🔍 Проверить» покажет, что будет изменено; запись — только после подтверждения.
+        Перед записью делается бэкап, операция попадает в «📜 Историю конфига».</p>
+      <div class="radio-row">
+        <input type="checkbox" id="norm-extra" checked onchange="normalizeInvalidate()">
+        <label for="norm-extra"><b>1. Исправить синтаксис</b> — убрать лишние/неизвестные поля
+          (вне белого списка) и <code>expire_after</code> у проводных. Поле <code>values</code> сохраняется.</label>
+      </div>
+      <div class="radio-row">
+        <input type="checkbox" id="norm-types" checked onchange="normalizeInvalidate()">
+        <label for="norm-types"><b>2. Исправить формат</b> — проверить и починить типы значений, если нарушены:
+          <code>bool</code>/строка/число, пробелы по краям, битый <code>dps_map</code>.</label>
+      </div>
+      <div id="normalize-result" class="muted" style="margin:12px 0 0 0;"></div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeNormalizeConfig()" id="normalize-cancel">Закрыть</button>
+      <span id="normalize-hint" class="muted" style="font-size:11px; margin-right:auto;"></span>
+      <button onclick="normalizeDryRun()" id="normalize-check-btn">🔍 Проверить</button>
+      <button class="danger" onclick="normalizeApply()" id="normalize-apply-btn" disabled>⚠️ Нормализовать</button>
+    </div>
+  </div>
+</div>
+
+<div id="rebuild-overlay" class="modal-overlay center-on-mobile" onclick="closeRebuildDialog(event)">
+  <div class="modal small" onclick="event.stopPropagation()">
+    <div class="modal-header"><h2>🔄 Пересборка tinytuya.json</h2>
+      <button class="modal-close" onclick="closeRebuildDialog()">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="margin-top:0;">
+        Для каждого выбранного устройства открывается <b>отдельное TCP-подключение</b> и
+        сопоставляются DP. У работающего bridge это нарушает правило «одно TCP на устройство» —
+        возможны кратковременные <code>914</code>. Запускайте в тихое время.
+      </p>
+      <div class="radio-row" style="align-items:flex-start;">
+        <input type="checkbox" id="rebuild-skip-battery" checked>
+        <label for="rebuild-skip-battery">Не опрашивать батарейные — они спят и не отвечают</label>
+      </div>
+      <div class="radio-row" style="align-items:flex-start;">
+        <input type="checkbox" id="rebuild-stop-first" checked>
+        <label for="rebuild-stop-first">Останавливаться на первой ответившей версии протокола</label>
+      </div>
+      <p class="muted" style="font-size:12px; margin:8px 0 0 0;">
+        База пишется атомарно; в конце — отчёт «проверено / расхождений / неоднозначных»
+        и время сбора.
+      </p>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeRebuildDialog()">Отмена</button>
+      <button class="primary" id="rebuild-start-btn" onclick="startRebuild()">🔄 Запустить</button>
     </div>
   </div>
 </div>
@@ -601,8 +792,8 @@
       </div>
       <div id="tl-age-fields" style="display:none; margin-left:24px;">
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <div><label>Дней</label><input id="tl-keep-days" type="number" value="3" min="0" max="365"></div>
-          <div><label>Часов</label><input id="tl-keep-hours" type="number" value="0" min="0" max="23"></div>
+          <div><label for="tl-keep-days">Дней</label><input id="tl-keep-days" type="number" value="3" min="0" max="365"></div>
+          <div><label for="tl-keep-hours">Часов</label><input id="tl-keep-hours" type="number" value="0" min="0" max="23"></div>
         </div>
       </div>
 
@@ -612,15 +803,16 @@
       </div>
       <div id="tl-before-fields" style="display:none; margin-left:24px;">
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <div><label>Дата</label><input id="tl-before-date" type="date"></div>
-          <div><label>Время</label><input id="tl-before-time" type="time" value="00:00"></div>
+          <div><label for="tl-before-date">Дата</label><input id="tl-before-date" type="date"></div>
+          <div><label for="tl-before-time">Время</label><input id="tl-before-time" type="time" value="00:00"></div>
         </div>
       </div>
 
       <div id="timeline-cleanup-result" class="muted" style="margin-top:12px;"></div>
     </div>
     <div class="modal-footer">
-      <button onclick="closeTimelineCleanup()">Отмена</button>
+      <button onclick="closeTimelineCleanup()" id="timeline-cleanup-cancel">Закрыть</button>
+      <span id="timeline-cleanup-hint" class="muted" style="font-size:11px; margin-right:auto;"></span>
       <button class="danger" onclick="doTimelineCleanup()" id="timeline-cleanup-btn">🗑 Удалить</button>
     </div>
   </div>
@@ -678,7 +870,7 @@
     <div class="modal-body">
       <p id="ui-prompt-text" class="ui-confirm-text"></p>
       <div class="form-group">
-        <input id="ui-prompt-input" type="text">
+        <input id="ui-prompt-input" type="text" aria-label="Введите значение" aria-labelledby="ui-prompt-text">
       </div>
       <div id="ui-prompt-error" class="muted" style="font-size:12px; color:var(--red); margin-top:4px; display:none;"></div>
     </div>
@@ -704,6 +896,12 @@
     </div>
   </div>
 </div>
+
+<footer class="site-footer">
+  Разработано <b>Reyson</b> 2026 ·
+  <a href="https://github.com/reysonk/Tuya-MQTT-Bridge" target="_blank" rel="noopener noreferrer">GitHub</a>
+  · <span class="footer-release" title="Публичный релиз">Release <b id="release-tag">__RELEASE_TAG__</b></span>
+</footer>
 
 <script>
   const ANALYTICS_ENABLED = __ANALYTICS_ENABLED__;

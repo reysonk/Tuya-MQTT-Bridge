@@ -29,12 +29,16 @@ try:
     import tinytuya
     HAS_TINYTUYA = True
 except ImportError:
+    # v1.33.13: имя должно существовать и без пакета — иначе обращение к
+    # tinytuya.* дало бы NameError (замечание инспекций IDE).
+    tinytuya = None
     HAS_TINYTUYA = False
 
 try:
     import yaml
     HAS_YAML = True
 except ImportError:
+    yaml = None
     HAS_YAML = False
 
 
@@ -55,7 +59,61 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 WEBUI_PORT = _env_int("WEBUI_PORT", 5386)
 WEBUI_HOST = os.getenv("WEBUI_HOST") or "0.0.0.0"
-WEBUI_VERSION = "1.29.1"
+WEBUI_VERSION = "1.33.29"
+# v1.32.33: публичный номер релиза (совпадает с тегом релиза на GitHub).
+# Подвал показывает «Release X», а WebUI сверяет по нему наличие новой версии.
+RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.2"
+
+# v1.32.34: проверка «есть ли релиз новее» на GitHub (публичный репозиторий, без токена;
+# GITHUB_TOKEN поддержан на случай, если репозиторий останется приватным).
+GITHUB_RELEASES_LATEST = ("https://api.github.com/repos/"
+                          "reysonk/Tuya-MQTT-Bridge/releases/latest")
+_RELEASE_CHECK = {"ts": 0, "latest": None, "newer": False, "url": "", "error": ""}
+
+
+def _ver_tuple(tag):
+    """'v1.2.3' → (1, 2, 3); нечисловые части считаются нулями."""
+    nums = []
+    # v1.32.39: отбрасываем pre-release/build-суффикс и выравниваем длину —
+    # иначе «1.2.0» > «1.2» и «1.2-rc1» давали ложное «новее».
+    base = str(tag or "").lstrip("vV").split("-")[0].split("+")[0]
+    for part in base.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        nums.append(int(digits) if digits else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums or [0])
+
+
+def check_new_release(force=False):
+    """Спрашивает GitHub не чаще раза в 6 часов: есть ли тег новее RELEASE_TAG."""
+    import urllib.request as _u
+    now = time.time()
+    if not force and (now - _RELEASE_CHECK["ts"]) < 6 * 3600:
+        return dict(_RELEASE_CHECK)
+    try:
+        req = _u.Request(GITHUB_RELEASES_LATEST, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "tuya-bridge-webui",
+        })
+        token = os.getenv("GITHUB_TOKEN")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with _u.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        tag = data.get("tag_name") or ""
+        _RELEASE_CHECK.update({
+            "ts": now, "latest": tag,
+            "newer": _ver_tuple(tag) > _ver_tuple(RELEASE_TAG),
+            "url": data.get("html_url") or "", "error": "",
+        })
+    except Exception as e:
+        # нет интернета / приватный репозиторий / лимит GitHub — молчим,
+        # v1.32.39: и СБРАСЫВАЕМ прошлый результат — иначе значок «!» висел бы
+        # до 6 часов со старой ссылкой на уже проверенный релиз.
+        _RELEASE_CHECK.update({"ts": now, "error": str(e)[:200],
+                               "latest": None, "newer": False, "url": ""})
+    return dict(_RELEASE_CHECK)
 
 CONFIG_FILE = "config/devices_config.json"
 LOG_FILE = "logs/bridge.log"
@@ -74,6 +132,8 @@ TUYA_LOCAL_DB_DIR = "webui_state/tuya-local-db"
 TUYA_LOCAL_YAML_DIR = "webui_state/tuya-local-db/custom_components/tuya_local/devices"
 TUYA_LOCAL_DB_OLD_DIR = "/app/tuya-local-db"
 TUYA_LOCAL_TARBALL_URL = "https://github.com/make-all/tuya-local/archive/refs/heads/main.tar.gz"
+# v1.33.9: сколько ждать одну попытку скачивания (сеть до GitHub бывает медленной).
+TUYA_LOCAL_DL_TIMEOUT = 180
 # v1.28.63: проиндексированная tuya-local БД {product_id: dps_map}.
 TUYA_LOCAL_INDEX_FILE = "webui_state/tuya-local-db.json"
 
@@ -98,6 +158,8 @@ LATENCY_INTERVAL = 900
 LATENCY_INITIAL_DELAY = 5
 LATENCY_PING_TIMEOUT = 1
 LATENCY_PING_COMMAND = "ping"
+# v1.33.6: один замер часто врёт (сеть/спящий стек) — берём среднее из N проб.
+LATENCY_PING_SAMPLES = 5
 
 LATENCY_RETRY_COUNT = 3
 LATENCY_RETRY_DELAY = 10
@@ -112,6 +174,9 @@ EDIT_TIMEOUT_WAIT = 20
 DELETE_TIMEOUT_WAIT = 20
 PROBE_TIMEOUT_PER_VERSION = 1.5
 PROBE_VERSIONS = ("3.3", "3.4", "3.5", "3.1")
+
+# v1.31.19: предел тела запроса — защита от «заявленного» гигабайта и мусорных POST.
+MAX_BODY_BYTES = 1024 * 1024
 
 SSE_MAX_SUBSCRIBERS = 50
 SSE_IDLE_TIMEOUT = 180   # v1.22.1: 60 → 180 (реже reconnect)
@@ -498,6 +563,40 @@ def _dp_candidates_for(candidates, dp):
     return res or None
 
 
+# v1.30.0: локальная база мэппингов (tinytuya_devices.json) — кэш по mtime.
+_LOCALDB_CACHE = {"mtime": None, "devices": {}}
+_LOCALDB_LOCK = threading.Lock()
+
+
+def _get_localdb_mapping(tuya_id):
+    """Mapping устройства из локальной базы (tinytuya_devices.json).
+
+    База собирается вручную (Инструменты → Пересборка): облачный mapping
+    через tinytuya + локальный probe. Используется как источник, когда
+    Cloud и tuya-local ничего не дали.
+    """
+    if not tuya_id:
+        return {}
+    try:
+        with _LOCALDB_LOCK:
+            mtime = (os.path.getmtime(TINYTUYA_DEVICES_FILE)
+                     if os.path.exists(TINYTUYA_DEVICES_FILE) else None)
+            if _LOCALDB_CACHE["mtime"] != mtime:
+                _LOCALDB_CACHE["devices"] = load_tinytuya_devices_json()
+                _LOCALDB_CACHE["mtime"] = mtime
+            data = _LOCALDB_CACHE["devices"]
+    except Exception as e:
+        log.debug(f"[LocalDB] {tuya_id}: {e}")
+        return {}
+    dev = data.get(tuya_id)
+    if not isinstance(dev, dict):
+        return {}
+    m = dev.get("mapping")
+    if not isinstance(m, dict):
+        return {}
+    return {str(k): (dict(v) if isinstance(v, dict) else v) for k, v in m.items()}
+
+
 def _enrich_dps_map_from_cache(dps_map, cache, tuya_id, friendly_name, product_id="",
                                exclude_name="", dev_type="", writable=None):
     """Дополнить dps_map DP из Cloud/tuya-local/similar + кандидаты источников.
@@ -536,17 +635,35 @@ def _enrich_dps_map_from_cache(dps_map, cache, tuya_id, friendly_name, product_i
             candidates["similar"] = {
                 str(k): (dict(v) if isinstance(v, dict) else v) for k, v in sim_map.items()
             }
+    # v1.30.0: локальная база мэппингов (tinytuya_devices.json). Записи базы по
+    # форме совпадают с облачными (code/type/values/name), поэтому component и
+    # мету выводим тем же конвертером, что и для Cloud, а источник помечаем.
+    ldb_map = _get_localdb_mapping(tuya_id)
+    if ldb_map:
+        _ldb_cnd = {}
+        for _dp, _m in ldb_map.items():
+            e = _cloud_entry(str(_dp), _m, writable, dev_type)
+            if not e:
+                continue
+            e["_dps_source"] = "local_db"
+            e["_name_source"] = "local_db"
+            e["_dps_source_reason"] = "взято из локальной базы (tinytuya_devices.json)"
+            _ldb_cnd[str(_dp)] = e
+        if _ldb_cnd:
+            candidates["local_db"] = _ldb_cnd
 
     # --- сборка результата по приоритету ---
     out = dict(dps_map or {})
     added = 0
     chosen = ("cloud" if "cloud" in candidates else
               "tuya_local" if "tuya_local" in candidates else
+              "local_db" if "local_db" in candidates else
               "similar" if "similar" in candidates else None)
     if chosen:
         _reason = {
             "cloud": None,
             "tuya_local": f"Cloud молчал, product_id={product_id} найден в tuya-local",
+            "local_db": "Cloud и tuya-local молчали — взято из локальной базы (tinytuya_devices.json)",
             "similar": f"product_id={product_id} совпал с '{sim_name}'",
         }[chosen]
         for dp_str, info in candidates[chosen].items():
@@ -566,7 +683,9 @@ def _enrich_dps_map_from_cache(dps_map, cache, tuya_id, friendly_name, product_i
         log.debug(f"[CloudDPS] {friendly_name}: +{added} DP из {chosen}")
 
     # --- аннотация существующих DP (тип/значения/кандидаты из Cloud) ---
-    if cloud_map:
+    # v1.31.16: кандидаты нужны и когда облако молчит — иначе в «Кэше состояния»
+    # нечего подставлять для DP без имени (локальная база / tuya-local / similar).
+    if cloud_map or candidates:
         for _dp in list(out.keys()):
             _info = out.get(_dp)
             if not isinstance(_info, dict):
@@ -646,7 +765,9 @@ STATE = {"bridge_status": "unknown", "uptime": 0, "version": "?", "devices": {},
          # v1.28.3: CPU/RAM bridge (публикует bridge 1.9.3+)
          "bridge_cpu_pct": None, "bridge_rss_mb": None,
          # v1.28.27: режим пинга bridge (для warning про CAP_NET_RAW).
-         "bridge_ping_mode": None}
+         "bridge_ping_mode": None,
+         # v1.33.8: отклик на команду + окно защиты от «эха» (bridge 1.12.19+).
+         "bridge_cmd_ack": None}
 STATE_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
 
@@ -659,8 +780,13 @@ PENDING_LOCK = threading.Lock()
 REBUILD_STATE = {
     "running": False, "current": 0, "total": 0, "device": "",
     "errors": [], "started_at": 0, "finished_at": 0, "ok": None,
+    # v1.31.0: отчёт качества сопоставления (verified/mismatch/ambiguous + fetched_at)
+    "report": None,
 }
 REBUILD_LOCK = threading.Lock()
+# v1.32.2: расширенный скан — только один за раз (каждый вызов плодит пул потоков).
+SCAN_EXTENDED_LOCK = threading.Lock()
+SCAN_EXTENDED_STATE = {"running": False}
 
 LATENCY_REFRESH_STATE = {
     "running": False, "current": 0, "total": 0, "device": "",
@@ -672,12 +798,32 @@ LATENCY_REFRESH_STATE_LOCK = threading.Lock()
 TUYA_LOCAL_STATE = {
     "running": False, "phase": "", "current": 0, "total": 0,
     "message": "", "started_at": 0, "finished_at": 0, "ok": None, "error": "",
+    "mb_done": 0,   # v1.32.28: сколько МБ уже скачано (фаза 1/2)
+    "mb_total": 0,  # v1.33.3: ожидаемый размер (Content-Length), 0 — неизвестен
+    # v1.33.9: номер попытки скачивания (чтобы «МБ» не выглядели зависшими)
+    # и отчёт по завершении (карточки в UI).
+    "attempt": 0, "attempts": 0,
+    "dl_stats": None,
+    "report": None,
 }
 TUYA_LOCAL_STATE_LOCK = threading.Lock()
 
 
 QUIET_LOCK = threading.Lock()
+# v1.31.19: отдельный лок для read-modify-write правок тихих часов —
+# quiet_save() сам берёт QUIET_LOCK, поэтому вложенный захват недопустим.
+QUIET_EDIT_LOCK = threading.Lock()
 QUIET_CONFIG = {}  # {name: {"windows": [{"from": "HH:MM", "to": "HH:MM"}, ...]}}
+
+
+def quiet_windows_of(name):
+    """v1.33.18: окна тишины устройства — читаем под локом.
+
+    Раньше /api/status брал QUIET_CONFIG без блокировки, а quiet_save()
+    пересобирает словарь под QUIET_LOCK — чтение могло поймать半 состояние.
+    """
+    with QUIET_LOCK:
+        return list((QUIET_CONFIG.get(name, {}) or {}).get("windows", []))
 
 
 
@@ -895,9 +1041,25 @@ def quiet_save(new_config):
         with QUIET_LOCK:
             QUIET_CONFIG = dict(new_config)
         log.info(f"[Quiet] Сохранено {len(new_config)} устройств")
+        quiet_publish_to_bridge()
         return True, None
     except Exception as e:
         return False, str(e)
+
+
+def quiet_publish_to_bridge():
+    """v1.32.6: отдать тихие часы мосту (retain).
+
+    Мост по ним не шумит WARNING'ами про 905/offline: устройство в окне тишины
+    выключено намеренно. Retain — чтобы конфиг дошёл и после перезапуска моста.
+    """
+    try:
+        with QUIET_LOCK:
+            cfg = {k: dict(v) for k, v in QUIET_CONFIG.items() if isinstance(v, dict)}
+        _mqtt.publish(f"{TOPIC_PREFIX}/bridge/quiet_config",
+                      json.dumps(cfg, ensure_ascii=False), qos=1, retain=True)
+    except Exception as e:
+        log.warning(f"[Quiet] публикация в bridge: {e}")
 
 
 def load_device_meta():
@@ -907,12 +1069,18 @@ def load_device_meta():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             devices = json.load(f)
         for d in devices:
+            # v1.32.1: запись без name раньше роняла загрузку всей DEVICE_META
+            # (KeyError ловился снаружи) — остальные устройства не обновлялись.
+            _name = d.get("name") if isinstance(d, dict) else None
+            if not _name:
+                log.warning("[Meta] запись без name в конфиге — пропущена")
+                continue
             # v1.27.7b: грузим ВСЕ устройства, включая enabled=false.
             # Фильтрация «кого опрашивать» — забота bridge (1.8.6+).
             # WebUI должен знать про отключённые, чтобы показать их
             # в серой секции «⛔ Отключённые» и отдать enabled в /api/status.
             meta = {
-                "friendly_name": d.get("friendly_name", d["name"]),
+                "friendly_name": d.get("friendly_name", _name),
                 "type": d.get("type", "unknown"),
                 "model": d.get("model", ""),
                 "ip": d.get("ip", ""),
@@ -922,6 +1090,9 @@ def load_device_meta():
                 "tuya_id": d.get("id", ""),
                 "local_key": d.get("local_key", ""),
                 "product_id": d.get("product_id", ""),  # v1.28.33.fixup3
+                # v1.30.1: expire_after — нужен ✏️ (показывать текущее значение
+                # и «По умолчанию» только когда поле реально есть в конфиге).
+                "expire_after": d.get("expire_after"),
                 "dps_map": copy.deepcopy(d.get("dps_map", {})),
             }
             if d.get("type") == "climate":
@@ -933,7 +1104,7 @@ def load_device_meta():
             # v1.28.67: 6_voltage/6_current/6_power НЕ добавляем в dps_map —
             # bridge сам публикует их как phase_a/voltage|current|power и
             # менять их нельзя (это производные от DP 6 = phase_a).
-            new_meta[d["name"]] = meta
+            new_meta[_name] = meta
         with DEVICE_META_LOCK:
             DEVICE_META = new_meta
         log.info(f"[Config] Загружено {len(new_meta)} устройств из {CONFIG_FILE}")
@@ -1300,6 +1471,60 @@ def db_query_avg_latency(dev, period_seconds=86400):
         except: return None
 
 
+# v1.33.24: перцентили задержки — медиана и 95-й для таблицы аналитики.
+def _lat_pct(vals, p):
+    """Перцентиль по ОТСОРТИРОВАННОМУ списку (линейная интерполяция).
+
+    Без math: k = (n-1) * p/100, значение интерполируется между k и k+1.
+    """
+    n = len(vals)
+    if n == 0: return None
+    if n == 1: return float(vals[0])
+    k = (n - 1) * p / 100.0
+    lo = int(k)
+    hi = lo + 1 if lo + 1 < n else lo
+    if hi == lo: return float(vals[lo])
+    frac = k - lo
+    return vals[lo] * (1 - frac) + vals[hi] * frac
+
+
+def db_query_latency_stats(dev, period_seconds=86400):
+    """v1.33.24: avg + медиана + p95 + max по latency_history за период.
+
+    В SQLite нет MEDIAN/PERCENTILE, поэтому берём ms одного устройства и считаем
+    в питоне. Это замена db_query_avg_latency в /api/analytics — число запросов
+    не выросло (по-прежнему один на устройство), а полей стало больше.
+    period_seconds: 0/None → всё время.
+    """
+    if not STATUS_HISTORY_ENABLED: return None
+    with _db_lock:
+        try:
+            if not period_seconds or period_seconds <= 0:
+                cur = _db_conn.execute(
+                    "SELECT ms FROM latency_history WHERE dev=?", (dev,))
+            else:
+                cutoff = int(time.time()) - int(period_seconds)
+                cur = _db_conn.execute(
+                    "SELECT ms FROM latency_history WHERE dev=? AND ts>=?",
+                    (dev, cutoff))
+            rows = cur.fetchall()
+        except Exception:
+            return None
+    vals = sorted(r[0] for r in rows if r[0] is not None)
+    total = len(rows)
+    if not vals:
+        return {"avg": None, "median": None, "p95": None, "max": None,
+                "count": total, "timeouts": total}
+    return {
+        "avg": int(round(sum(vals) / len(vals))),
+        "median": int(round(_lat_pct(vals, 50))),
+        "p95": int(round(_lat_pct(vals, 95))),
+        "max": int(vals[-1]),
+        "count": total,
+        "timeouts": total - len(vals),
+    }
+
+
 # ==================== ICMP PING ====================
 _PING_MODE = [None]
 
@@ -1402,6 +1627,24 @@ def measure_latency(ip):
     return None
 
 
+def measure_latency_avg(ip, samples=None):
+    """v1.33.6: среднее из `samples` ICMP-проб (по умолчанию 5).
+
+    Один замер часто врёт (например 213 мс вместо типичных 5-15 мс), из-за
+    чего устройство «выглядит за 4000 км». Считаем среднее по успешным
+    пробам, как `ping` в Windows. Все пробы провалились → None.
+    """
+    n = int(samples or LATENCY_PING_SAMPLES)
+    vals = []
+    for _ in range(max(1, n)):
+        ms = measure_latency(ip)
+        if ms is not None:
+            vals.append(ms)
+    if not vals:
+        return None
+    return int(round(sum(vals) / len(vals)))
+
+
 # ==================== LATENCY WORKER ====================
 def _do_latency_round():
     with STATE_LOCK:
@@ -1439,7 +1682,7 @@ def _do_latency_round():
             first_pass[dev] = None
             done += 1
             continue
-        ms = measure_latency(ip)
+        ms = measure_latency_avg(ip)
         first_pass[dev] = ms
         if ms is None:
             timeouts.append((dev, ip))
@@ -1460,7 +1703,7 @@ def _do_latency_round():
         for attempt in range(LATENCY_RETRY_COUNT - 1):
             if STOP_EVENT.wait(LATENCY_RETRY_DELAY):
                 return dev, None
-            ms = measure_latency(ip)
+            ms = measure_latency_avg(ip)
             if ms is not None:
                 log.info(f"[Ping] {dev} ({ip}): успех с retry #{attempt+1}")
                 return dev, ms
@@ -1633,10 +1876,27 @@ def _probe_tuya_6668(ip, timeout=TUYA_PROBE_TIMEOUT):
     return result
 
 
-def detect_version(ip, dev_id, local_key, timeout=PROBE_TIMEOUT_PER_VERSION):
+def detect_version(ip, dev_id, local_key, timeout=PROBE_TIMEOUT_PER_VERSION,
+                   stop_first=False, name=""):
+    """Определить версию протокола, перебрав версии из PROBE_VERSIONS.
+
+    v1.29.2: возвращаем СПИСОК версий, на которых устройство ответило
+    (бывает, что работают несколько — тогда выбор за пользователем),
+    и dps первой ответившей.
+
+    v1.31.0: stop_first=True — остановиться на первой ответившей версии
+    (в пересборке это экономит до 3 TCP-подключений на устройство; правило №1).
+
+    Возвращает: (versions: list[str], dps: dict)
+    """
     if not HAS_TINYTUYA:
-        return None, {}
+        return [], {}
+    # v1.31.7: в логах пишем и имя устройства — по одному ID в логах не разобраться
+    _tag = f"{name} ({dev_id}@{ip})" if name else f"{dev_id}@{ip}"
+    found = []
+    dps = {}
     for v in PROBE_VERSIONS:
+        r = None   # v1.33.13: страховка от «r не присвоена» (замечание IDE)
         try:
             d = tinytuya.Device(dev_id, ip, local_key)
             d.set_version(float(v))
@@ -1648,13 +1908,20 @@ def detect_version(ip, dev_id, local_key, timeout=PROBE_TIMEOUT_PER_VERSION):
                 try: d.close()
                 except: pass
             if r and isinstance(r, dict) and "dps" in r:
-                log.info(f"[Probe] {dev_id}@{ip}: version={v} (dps={len(r['dps'])})")
-                return v, r.get("dps", {})
+                found.append(v)
+                if not dps:
+                    dps = r.get("dps", {})
+                log.info(f"[Probe] {_tag}: version={v} (dps={len(r['dps'])})")
+                if stop_first:
+                    break
         except Exception as e:
-            log.debug(f"[Probe] {dev_id}@{ip} v={v}: {e}")
+            log.debug(f"[Probe] {_tag} v={v}: {e}")
             continue
-    log.warning(f"[Probe] {dev_id}@{ip}: ни одна версия не ответила")
-    return None, {}
+    if found:
+        log.info(f"[Probe] {_tag}: отвечают версии {found}")
+    else:
+        log.warning(f"[Probe] {_tag}: ни одна версия не ответила")
+    return found, dps
 
 
 # ==================== DP MATCHING ====================
@@ -1695,7 +1962,18 @@ def _heuristic_pick(candidates):
     return best
 
 
-def match_dps_to_codes(local_dps, cloud_status_meta, cloud_current_values):
+def match_dps_to_codes(local_dps, cloud_status_meta, cloud_current_values,
+                       cloud_dp_mapping=None):
+    """Сопоставить локальные DP с облачными code.
+
+    v1.30.0: приоритет — облачный mapping (в нём ЕСТЬ номера DP, и он
+    авторитетнее любых догадок). Сопоставление по значениям остаётся
+    только как проверка/фолбэк для DP, которых в облачном mapping нет.
+
+    Неоднозначные DP (несколько равных кандидатов) больше не «угадываются»
+    молча: запись помечается `_ambiguous` + `_candidates`, а несовпадение
+    значения в облаке — `_mismatch` (видно в RAW-блоке результата опроса).
+    """
     result = {}
     used_codes = set()
     if not isinstance(local_dps, dict) or not cloud_status_meta:
@@ -1708,13 +1986,37 @@ def match_dps_to_codes(local_dps, cloud_status_meta, cloud_current_values):
         if code and code not in meta_by_code:
             meta_by_code[code] = meta
 
+    # --- 1) привязка по облачному mapping (номера DP — источник истины) ---
+    if isinstance(cloud_dp_mapping, dict):
+        for dp_id, m in cloud_dp_mapping.items():
+            dp_s = str(dp_id)
+            code = (m or {}).get("code") if isinstance(m, dict) else None
+            if not code:
+                continue
+            meta = meta_by_code.get(code) or m
+            if dp_s in local_dps and code in cloud_current_values:
+                # проверка значениями: не совпало — не блокируем, но помечаем
+                if not _values_match(local_dps[dp_s],
+                                     cloud_current_values.get(code),
+                                     meta.get("type", "")):
+                    e = dict(meta)
+                    e["_mismatch"] = True
+                    result[dp_s] = e
+                    used_codes.add(code)
+                    continue
+            result[dp_s] = dict(meta)
+            used_codes.add(code)
+
     def dp_sort_key(k):
         try: return (0, int(k))
         except Exception: return (1, str(k))
 
+    # --- 2) остальные DP — по совпадению значений ---
     dp_ids = sorted(local_dps.keys(), key=dp_sort_key)
     pending = []
     for dp_id in dp_ids:
+        if str(dp_id) in result:
+            continue
         local_val = local_dps[dp_id]
         candidates = []
         for code, meta in meta_by_code.items():
@@ -1726,18 +2028,22 @@ def match_dps_to_codes(local_dps, cloud_status_meta, cloud_current_values):
             if _values_match(local_val, cloud_val, meta.get("type", "")):
                 candidates.append(meta)
         if len(candidates) == 1:
-            result[dp_id] = candidates[0]
+            result[str(dp_id)] = candidates[0]
             used_codes.add(candidates[0]["code"])
         elif len(candidates) > 1:
             pending.append((dp_id, candidates))
 
+    # --- 3) неоднозначные: выбираем, но помечаем (не «угадываем молча») ---
     for dp_id, candidates in pending:
         candidates = [c for c in candidates if c.get("code") not in used_codes]
         if not candidates:
             continue
         best = _heuristic_pick(candidates)
         if best:
-            result[dp_id] = best
+            e = dict(best)
+            e["_ambiguous"] = True
+            e["_candidates"] = [c.get("code") for c in candidates]
+            result[str(dp_id)] = e
             used_codes.add(best["code"])
     return result
 
@@ -1962,19 +2268,16 @@ _mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
 def _on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         for t in [
-            f"{TOPIC_PREFIX}/bridge/status", f"{TOPIC_PREFIX}/bridge/uptime",
-            f"{TOPIC_PREFIX}/bridge/version", f"{TOPIC_PREFIX}/+/status",
-            # v1.28.3: CPU/RAM bridge (bridge 1.9.3+)
-            f"{TOPIC_PREFIX}/bridge/cpu_pct", f"{TOPIC_PREFIX}/bridge/rss_mb",
-            # v1.28.27: режим пинга bridge (для warning про CAP_NET_RAW).
-            f"{TOPIC_PREFIX}/bridge/ping_mode",
-            f"{TOPIC_PREFIX}/+/last_seen", f"{TOPIC_PREFIX}/+/cache_snapshot",
+            # v1.30.1: всё, что bridge публикует под bridge/ — status/uptime/
+            # version/cpu_pct/rss_mb/ping_mode и любые *_result. Дикая карта
+            # вместо перечисления: раньше новая команда (config_report,
+            # expire_*, config_normalize) не была подписана, ответ приходил
+            # «в пустоту», и UI показывал timeout при живом bridge.
+            f"{TOPIC_PREFIX}/bridge/#",
+            f"{TOPIC_PREFIX}/+/status",
             # v1.28.6: battery_alert / battery_last_up (bridge 1.9.4+)
             f"{TOPIC_PREFIX}/+/battery_alert", f"{TOPIC_PREFIX}/+/battery_last_up",
-            f"{TOPIC_PREFIX}/bridge/edit_config_result",
-            f"{TOPIC_PREFIX}/bridge/import_devices_result",
-            f"{TOPIC_PREFIX}/bridge/scan_network_result",
-            f"{TOPIC_PREFIX}/bridge/delete_device_result",
+            f"{TOPIC_PREFIX}/+/last_seen", f"{TOPIC_PREFIX}/+/cache_snapshot",
         ]:
             client.subscribe(t)
         log.info("[MQTT] Подключён, подписки OK")
@@ -2055,8 +2358,18 @@ def _on_message(client, userdata, msg):
                     STATE["bridge_ping_mode"] = json.loads(payload)
             except Exception:
                 pass
-        elif key in ("edit_config_result", "import_devices_result",
-                     "scan_network_result", "delete_device_result"):
+        elif key == "cmd_ack":
+            # v1.33.8: статистика отклика «команда → отчёт» и текущее окно
+            # защиты от «эха» (bridge 1.12.19+).
+            try:
+                with STATE_LOCK:
+                    STATE["bridge_cmd_ack"] = json.loads(payload)
+            except Exception:
+                pass
+        elif key.endswith("_result"):
+            # v1.30.1: раньше здесь был жёсткий список топиков, и ответ новой
+            # команды не разбирался (UI ловил timeout). Любой ответ bridge несёт
+            # request_id; неизвестный id _resolve_pending просто игнорирует.
             try: _resolve_pending(json.loads(payload))
             except: pass
         return
@@ -2412,6 +2725,9 @@ def load_tinytuya_devices_json():
 
 # ==================== CLOUD CACHE ====================
 CLOUD_CACHE_LOCK = threading.Lock()
+# v1.32.1: разобранный кэш по mtime файла — иначе /api/status перечитывал
+# tuya_cloud_cache.json на каждое устройство (N чтений файла за один опрос).
+_CLOUD_CACHE_MEM = {"mtime": None, "data": None}
 
 
 def save_cloud_cache(devices, fetched_at=None, access_id="", region="eu"):
@@ -2433,6 +2749,8 @@ def save_cloud_cache(devices, fetched_at=None, access_id="", region="eu"):
             except Exception:
                 pass
             log.info(f"[CloudCache] Сохранено {len(devices)} устройств")
+            _CLOUD_CACHE_MEM["mtime"] = None   # v1.32.1: сбросить разобранный кэш
+            _CLOUD_CACHE_MEM["data"] = None
             return True
         except Exception as e:
             log.warning(f"[CloudCache] save: {e}")
@@ -2440,17 +2758,31 @@ def save_cloud_cache(devices, fetched_at=None, access_id="", region="eu"):
 
 
 def load_cloud_cache():
+    """v1.32.1: кэш разбирается один раз на версию файла (по mtime).
+
+    Раньше функция вызывалась из enrich на каждое устройство и каждый раз
+    читала и парсила весь tuya_cloud_cache.json — на 40 устройств это 40 чтений
+    файла за один `/api/status`.
+    """
     with CLOUD_CACHE_LOCK:
         try:
             if not os.path.exists(TUYA_CLOUD_CACHE_FILE):
+                _CLOUD_CACHE_MEM["mtime"] = None
+                _CLOUD_CACHE_MEM["data"] = None
                 return None
+            mtime = os.path.getmtime(TUYA_CLOUD_CACHE_FILE)
+            if _CLOUD_CACHE_MEM["mtime"] == mtime:
+                return _CLOUD_CACHE_MEM["data"]
             with open(TUYA_CLOUD_CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
-                return None
-            devices = data.get("devices")
-            if not isinstance(devices, list) or not devices:
-                return None
+                data = None
+            else:
+                devices = data.get("devices")
+                if not isinstance(devices, list) or not devices:
+                    data = None
+            _CLOUD_CACHE_MEM["mtime"] = mtime
+            _CLOUD_CACHE_MEM["data"] = data
             return data
         except Exception as e:
             log.warning(f"[CloudCache] load: {e}")
@@ -2486,7 +2818,9 @@ def mapping_to_dps_map(mapping, category="", writable_codes=None, dev_type=None)
     # v1.28.34: единое правило component (вариант C) — dev_type и
     # writable_codes (Cloud functions) приходят от вызывающего.
     if dev_type is None:
-        dev_type = guess_type_from_category(category)
+        # v1.29.2: guess_type_from_category может вернуть "" (тип не определён) —
+        # для генерации dps_map берём безопасный "switch".
+        dev_type = guess_type_from_category(category) or "switch"
     for dp_key, m in mapping.items():
         if not isinstance(m, dict): continue
         code = m.get("code", "")
@@ -2496,27 +2830,27 @@ def mapping_to_dps_map(mapping, category="", writable_codes=None, dev_type=None)
         entry = {}
         if dtype == "Boolean":
             if code in ("switch_led", "switch", "switch_1"):
-                entry["component"] = "switch"; entry["name"] = code
+                entry["name"] = code
             elif code.startswith("switch_") and code != "switch_led":
-                entry["component"] = "switch"; entry["name"] = code
+                entry["name"] = code
             elif code == "switch_backlight":
-                entry["component"] = "switch"; entry["name"] = "backlight"
+                entry["name"] = "backlight"
             elif code == "switch_prepayment":
-                entry["component"] = "switch"; entry["name"] = "prepayment"
+                entry["name"] = "prepayment"
             elif code in ("doorcontact_state",):
-                entry["component"] = "binary_sensor"; entry["name"] = "door"; entry["device_class"] = "door"
+                entry["name"] = "door"; entry["device_class"] = "door"
             elif code in ("pir",):
-                entry["component"] = "binary_sensor"; entry["name"] = "motion"; entry["device_class"] = "motion"
+                entry["name"] = "motion"; entry["device_class"] = "motion"
             elif code in ("watersensor_state",):
-                entry["component"] = "binary_sensor"; entry["name"] = "moisture"; entry["device_class"] = "moisture"
+                entry["name"] = "moisture"; entry["device_class"] = "moisture"
             elif code in ("fault", "problema"):
-                entry["component"] = "binary_sensor"; entry["name"] = "fault"; entry["device_class"] = "problem"
+                entry["name"] = "fault"; entry["device_class"] = "problem"
             else:
-                entry["component"] = "switch"; entry["name"] = code
+                entry["name"] = code
             # v1.28.34: единое правило (вариант C).
             entry["component"] = cloud_dp_component("Boolean", code)
         elif dtype == "Integer":
-            entry["component"] = "sensor"; entry["name"] = code
+            entry["name"] = code
             if "min" in values: entry["min"] = values["min"]
             if "max" in values: entry["max"] = values["max"]
             if "scale" in values and values["scale"]: entry["scale"] = values["scale"]
@@ -2534,17 +2868,17 @@ def mapping_to_dps_map(mapping, category="", writable_codes=None, dev_type=None)
         elif dtype == "Enum":
             rng = values.get("range", [])
             if code == "relay_status":
-                entry["component"] = "select"; entry["name"] = "relay_status"; entry["options"] = list(rng)
+                entry["name"] = "relay_status"; entry["options"] = list(rng)
             elif code in ("mode", "preset_mode"):
-                entry["component"] = "preset"; entry["name"] = "preset_mode"; entry["options"] = list(rng)
+                entry["name"] = "preset_mode"; entry["options"] = list(rng)
             elif code == "work_mode":
-                entry["component"] = "select"; entry["name"] = "work_mode"; entry["options"] = list(rng)
+                entry["name"] = "work_mode"; entry["options"] = list(rng)
             elif code in ("watersensor_state",):
-                entry["component"] = "binary_sensor"; entry["name"] = "moisture"; entry["device_class"] = "moisture"
+                entry["name"] = "moisture"; entry["device_class"] = "moisture"
             elif code in ("battery_state",):
-                entry["component"] = "sensor"; entry["name"] = "battery_state"
+                entry["name"] = "battery_state"
             else:
-                entry["component"] = "sensor"; entry["name"] = code
+                entry["name"] = code
             # v1.28.34: единое правило (вариант C).
             entry["component"] = cloud_dp_component("Enum", code, dev_type=dev_type)
         elif dtype == "Json":
@@ -2565,6 +2899,12 @@ def mapping_to_dps_map(mapping, category="", writable_codes=None, dev_type=None)
 
 
 def guess_type_from_category(category, product_name=""):
+    """Тип устройства по категории Tuya (и имени продукта — как fallback).
+
+    v1.29.2: если категория неизвестна и имя ничего не подсказало —
+    возвращаем "" (тип не определён), а не молчаливый "switch".
+    Вызывающий код сам решает, что записать в конфиг.
+    """
     c = (category or "").lower().strip(); pn = (product_name or "").lower()
     if c in CATEGORY_TO_TYPE: return CATEGORY_TO_TYPE[c]
     if any(x in pn for x in ("light", "lamp", "strip", "bulb")): return "light"
@@ -2572,10 +2912,65 @@ def guess_type_from_category(category, product_name=""):
     if any(x in pn for x in ("switch", "breaker", "plug", "socket")): return "switch"
     if any(x in pn for x in ("sensor", "temp", "humid")): return "sensor"
     if any(x in pn for x in ("door", "motion", "leak")): return "binary_sensor"
-    return "switch"
+    return ""
 
 
 # ==================== TUYA-LOCAL DB ====================
+def _remote_content_length(url, timeout=10):
+    """v1.33.3: размер файла по URL (Content-Length) для честного процента.
+
+    0 — если узнать не удалось (тогда полоса остаётся indeterminate).
+    """
+    try:
+        r = subprocess.run(["curl", "-fsSIL", "--max-time", str(timeout), url],
+                           capture_output=True, text=True, timeout=timeout + 5)
+        for line in reversed((r.stdout or "").splitlines()):
+            if line.lower().startswith("content-length:"):
+                try:
+                    n = int(line.split(":", 1)[1].strip())
+                    return n if n > 0 else 0
+                except ValueError:
+                    return 0
+    except Exception as e:
+        log.debug(f"[tuya-local] content-length: {e}")
+    return 0
+
+
+def _download_with_progress(cmd, dest, timeout_s):
+    """v1.33.3: скачать файл, следя за его размером (МБ → TUYA_LOCAL_STATE).
+
+    Работает и для curl, и для wget-фолбэка. Раньше wget запускался «немо»
+    (subprocess.run), из-за чего счётчик «скачано МБ» залипал на последнем
+    значении от curl до конца фазы.
+
+    Возвращает (returncode, stderr).
+    """
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return 127, f"{cmd[0]}: not found"
+    deadline = time.time() + timeout_s
+    while proc.poll() is None:
+        if time.time() > deadline:
+            proc.kill()
+            break
+        try:
+            _mb = round(os.path.getsize(dest) / (1024 * 1024), 1)
+            with TUYA_LOCAL_STATE_LOCK:
+                TUYA_LOCAL_STATE["mb_done"] = _mb
+        except OSError:
+            pass
+        time.sleep(0.4)
+    err = ""
+    try:
+        _, err = proc.communicate(timeout=5)   # reap + закрыть пайпы
+    except Exception:
+        pass
+    rc = proc.returncode
+    return (rc if rc is not None else -1), (err or "")
+
+
 def download_tuya_local_db(max_retries=3):
     if os.path.isdir(TUYA_LOCAL_DB_OLD_DIR) and not os.path.isdir(TUYA_LOCAL_DB_DIR):
         try:
@@ -2597,19 +2992,48 @@ def download_tuya_local_db(max_retries=3):
 
     tarball_path = os.path.join(TUYA_LOCAL_DB_DIR, "_tuya-local.tar.gz")
     last_err = None
+    # v1.33.3: ожидаемый размер (для процента скачивания) + сброс счётчика.
+    _mb_total = _remote_content_length(TUYA_LOCAL_TARBALL_URL)
+    with TUYA_LOCAL_STATE_LOCK:
+        TUYA_LOCAL_STATE["mb_total"] = _mb_total
+        TUYA_LOCAL_STATE["mb_done"] = 0
+        TUYA_LOCAL_STATE["attempts"] = max_retries
+    _dl_t0 = time.time()
     for attempt in range(1, max_retries + 1):
         try:
             log.info(f"[tuya-local] Скачивание (попытка {attempt}/{max_retries})...")
-            r = subprocess.run(["curl", "-fsSL", "-o", tarball_path, TUYA_LOCAL_TARBALL_URL],
-                               capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                r = subprocess.run(["wget", "-q", "-O", tarball_path, TUYA_LOCAL_TARBALL_URL],
-                                   capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                last_err = f"curl/wget: {r.stderr[:200]}"
+            # v1.33.9: показываем номер попытки. Раньше при падении загрузки
+            # монитор размера останавливался, и «скачано N МБ» замирало на всё
+            # время повторов — выглядело как зависание.
+            with TUYA_LOCAL_STATE_LOCK:
+                TUYA_LOCAL_STATE["mb_done"] = 0
+                TUYA_LOCAL_STATE["attempt"] = attempt
+                TUYA_LOCAL_STATE["message"] = (
+                    f"Фаза 1/2: скачивание tuya-local "
+                    f"(попытка {attempt}/{max_retries})…")
+            # v1.32.28 + v1.33.3: прогресс в МБ ведём для ЛЮБОГО скачивателя.
+            # v1.33.9: curl сам повторяет транзиентные сбои и быстро отваливается,
+            # если GitHub недоступен (--connect-timeout), — не висим 2 минуты.
+            _curl = ["curl", "-fsSL", "--connect-timeout", "15",
+                     "--retry", "2", "--retry-delay", "2",
+                     "-o", tarball_path, TUYA_LOCAL_TARBALL_URL]
+            _rc, _err = _download_with_progress(_curl, tarball_path,
+                                                TUYA_LOCAL_DL_TIMEOUT)
+            if _rc != 0:
+                # fallback: wget, если curl не смог (тоже с прогрессом)
+                _rc, _err = _download_with_progress(
+                    ["wget", "-q", "-O", tarball_path, TUYA_LOCAL_TARBALL_URL],
+                    tarball_path, TUYA_LOCAL_DL_TIMEOUT)
+            if _rc != 0:
+                last_err = f"curl/wget rc={_rc}: {_err[:200]}"
                 log.warning(f"[tuya-local] {last_err}")
                 time.sleep(2)
                 continue
+            _mb = 0.0
+            try:
+                _mb = round(os.path.getsize(tarball_path) / (1024 * 1024), 1)
+            except OSError:
+                pass
             r = subprocess.run(["tar", "-xzf", tarball_path, "-C", TUYA_LOCAL_DB_DIR, "--strip-components=1"],
                                capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
@@ -2618,11 +3042,20 @@ def download_tuya_local_db(max_retries=3):
                 continue
             if os.path.isdir(TUYA_LOCAL_YAML_DIR):
                 files = [f for f in os.listdir(TUYA_LOCAL_YAML_DIR) if f.endswith(".yaml")]
-                log.info(f"[tuya-local] OK: {len(files)} YAML-файлов")
+                log.info(f"[tuya-local] OK: {len(files)} YAML-файлов (попытка {attempt})")
                 _prune_tuya_local_db()   # v1.28.64: оставить только devices/*.yaml
-                _build_tuya_local_db()   # индекс в JSON
+                # v1.33.9: индекс строит фаза 2 — с прогрессом. Раньше он
+                # собирался ЗДЕСЬ ЖЕ, и работа шла дважды: фаза 2 «молчала», а
+                # импорт занимал вдвое больше времени.
                 try: os.unlink(tarball_path)
                 except: pass
+                with TUYA_LOCAL_STATE_LOCK:
+                    TUYA_LOCAL_STATE["dl_stats"] = {
+                        "attempts_used": attempt,
+                        "download_mb": _mb,
+                        "download_sec": round(time.time() - _dl_t0, 1),
+                        "yaml_files": len(files),
+                    }
                 return True, None
             last_err = "yaml dir not found after extract"
         except Exception as e:
@@ -2682,6 +3115,11 @@ def _build_tuya_local_db(progress=None):
 
     progress(i, total) — v1.28.65: колбэк прогресса импорта.
     """
+    # v1.33.13: без pyyaml строить нечего — раньше каждый файл молча падал
+    # во внутренний except, и получалась пустая БД (замечание инспекций IDE).
+    if not HAS_YAML:
+        log.warning("[tuya-local] pyyaml не установлен — индекс не строится")
+        return None
     global _TL_DB, _TL_DB_BUILDING
     with _TL_DB_LOCK:
         if _TL_DB_BUILDING:
@@ -2776,15 +3214,22 @@ def _tuya_local_update_worker():
 
     _set(running=True, phase="download", current=0, total=0,
          message="Фаза 1/2: скачивание tuya-local…",
+         mb_done=0, mb_total=0, attempt=0, attempts=0,
+         dl_stats=None, report=None,
          started_at=int(time.time()), finished_at=0, ok=None, error="")
+    _t_start = int(time.time())
     ok, err = download_tuya_local_db(max_retries=3)
     if not ok:
         _set(running=False, phase="", current=0, total=0,
              message="Ошибка скачивания", finished_at=int(time.time()),
              ok=False, error=err or "download failed")
         return
+    with TUYA_LOCAL_STATE_LOCK:
+        _dl = dict(TUYA_LOCAL_STATE.get("dl_stats") or {})
+    # v1.33.9: фаза 2 называет число файлов — видно, что идёт импорт.
     _set(phase="import", current=0, total=0,
-         message="Фаза 2/2: импорт (индекс)…", ok=None, error="")
+         message=f"Фаза 2/2: импорт (индекс), YAML: {_dl.get('yaml_files', '?')}…",
+         ok=None, error="")
     try:
         _build_tuya_local_db(
             progress=lambda i, t: _set(current=i, total=t))
@@ -2794,8 +3239,19 @@ def _tuya_local_update_worker():
         return
     with _TL_DB_LOCK:
         n = len(_TL_DB) if isinstance(_TL_DB, dict) else 0
+    # v1.33.9: отчёт для карточек в UI (как у пересборки tinytuya).
+    _report = {
+        "yaml_files": _dl.get("yaml_files", 0),
+        "product_ids": n,
+        "download_mb": _dl.get("download_mb", 0),
+        "download_sec": _dl.get("download_sec", 0),
+        "attempts_used": _dl.get("attempts_used", 0),
+        "total_sec": int(time.time()) - _t_start,
+        "fetched_at": int(time.time()),
+    }
     _set(running=False, phase="done", current=1, total=1,
-         message=f"Готово: {n} product_id", finished_at=int(time.time()), ok=True)
+         message=f"Готово: {n} product_id", finished_at=int(time.time()),
+         ok=True, report=_report)
 
 
 def parse_tuya_local_yaml(yaml_data):
@@ -2846,7 +3302,7 @@ def merge_dps_maps(base, override):
 
 
 # ==================== REBUILD tinytuya_devices.json ====================
-def _rebuild_tinytuya_json_worker(device_names):
+def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=True):
     with REBUILD_LOCK:
         REBUILD_STATE["running"] = True
         REBUILD_STATE["current"] = 0
@@ -2856,6 +3312,7 @@ def _rebuild_tinytuya_json_worker(device_names):
         REBUILD_STATE["started_at"] = int(time.time())
         REBUILD_STATE["finished_at"] = 0
         REBUILD_STATE["ok"] = None
+        REBUILD_STATE["report"] = None
 
     # v1.28.22: читаем Cloud-кэш ОДИН раз, а не в цикле по устройствам.
     # Раньше load_cloud_cache() вызывался внутри for-цикла — 40 устройств
@@ -2878,6 +3335,8 @@ def _rebuild_tinytuya_json_worker(device_names):
     config_by_name = {d.get("name"): d for d in config_devices if d.get("name")}
     results = []
     errors = []
+    report = []
+    skipped_battery = []
 
     for idx, name in enumerate(device_names, 1):
         if STOP_EVENT.is_set():
@@ -2890,6 +3349,31 @@ def _rebuild_tinytuya_json_worker(device_names):
         if not cfg:
             errors.append(f"{name}: нет в {CONFIG_FILE}")
             continue
+        # v1.31.0: батарейные спят и на probe не отвечают — не тратим TCP
+        # (правило №1). Но прежнюю базу для них сохраняем: она — единственный
+        # источник маппинга для спящих устройств.
+        if skip_battery and cfg.get("battery_powered"):
+            skipped_battery.append(name)
+            _b_ex = existing_by_id.get(cfg.get("id", ""))
+            _b_map = ((_b_ex or {}).get("mapping") or {}) if _b_ex else {}
+            if _b_map:
+                results.append({
+                    "id": cfg.get("id", ""), "name": cfg.get("friendly_name", name),
+                    "key": cfg.get("local_key", ""),
+                    "product_id": cfg.get("product_id", "") or cfg.get("model", ""),
+                    "product_name": cfg.get("model", ""),
+                    "category": cfg.get("category", ""),
+                    "ip": cfg.get("ip", ""),
+                    "version": cfg.get("version", "3.3"),
+                    "mapping": _b_map,
+                    "_source": "existing",
+                })
+            report.append({"name": name, "status": "battery_skipped",
+                           "versions": [], "dps": 0, "matched": len(_b_map),
+                           "verified": 0, "mismatch": 0, "ambiguous": 0,
+                           "kept_existing": len(_b_map),
+                           "source": "existing" if _b_map else ""})
+            continue
         dev_id = cfg.get("id", "")
         ip = cfg.get("ip", "")
         local_key = cfg.get("local_key", "")
@@ -2899,23 +3383,35 @@ def _rebuild_tinytuya_json_worker(device_names):
             continue
 
         try:
-            version, local_dps = detect_version(ip, dev_id, local_key)
+            versions, local_dps = detect_version(ip, dev_id, local_key,
+                                                 stop_first=stop_first,
+                                                 name=cfg.get("friendly_name", name))
         except Exception as e:
             errors.append(f"{name}: probe: {e}")
             continue
-        if not version:
+        existing = existing_by_id.get(dev_id)
+        existing_mapping = (existing or {}).get("mapping", {}) if existing else {}
+        item = {"name": name, "status": "ok", "versions": versions,
+                "dps": len(local_dps or {}), "matched": 0, "verified": 0,
+                "mismatch": 0, "ambiguous": 0, "kept_existing": 0, "source": ""}
+        if not versions:
             errors.append(f"{name}: probe не ответил")
-            existing = existing_by_id.get(dev_id)
-            if existing and existing.get("mapping"):
+            item["status"] = "probe_failed"
+            if existing_mapping:
+                # живое устройство не ответило (спит) — оставляем прежнюю базу
                 results.append({
                     "id": dev_id, "name": cfg.get("friendly_name", name),
                     "key": local_key, "product_id": product_id,
                     "product_name": cfg.get("model", ""),
                     "category": cfg.get("category", ""),
                     "ip": ip, "version": cfg.get("version", "3.3"),
-                    "mapping": existing["mapping"],
+                    "mapping": existing_mapping,
                     "_source": "existing",
                 })
+                item["matched"] = len(existing_mapping)
+                item["kept_existing"] = len(existing_mapping)
+                item["source"] = "existing"
+            report.append(item)
             continue
 
         matched = {}
@@ -2950,16 +3446,23 @@ def _rebuild_tinytuya_json_worker(device_names):
                     break
         if cloud_status_meta and cloud_current_values:
             try:
-                matched = match_dps_to_codes(local_dps, cloud_status_meta, cloud_current_values)
+                matched = match_dps_to_codes(local_dps, cloud_status_meta,
+                                             cloud_current_values,
+                                             cloud_dp_mapping=_cm)
             except Exception as e:
                 errors.append(f"{name}: match: {e}")
 
-        existing = existing_by_id.get(dev_id)
-        existing_mapping = (existing or {}).get("mapping", {}) if existing else {}
-        if existing_mapping:
-            for dp, m in existing_mapping.items():
-                if dp not in matched:
-                    matched[dp] = m
+        # v1.31.0: метрики качества — до того, как пометки матчера срезаются
+        # в чистую схему базы (code/type/values/name).
+        for _m in matched.values():
+            if not isinstance(_m, dict):
+                continue
+            if _m.get("_ambiguous"):
+                item["ambiguous"] += 1
+            elif _m.get("_mismatch"):
+                item["mismatch"] += 1
+            else:
+                item["verified"] += 1
 
         mapping = {}
         for dp, m in matched.items():
@@ -2971,6 +3474,14 @@ def _rebuild_tinytuya_json_worker(device_names):
                 "values": m.get("values", {}),
                 "name": m.get("name", ""),
             }
+
+        # v1.31.0: устройство на probe отдаёт все свои DP, поэтому прежняя
+        # база берётся ТОЛЬКО для DP, которых сейчас не было (иначе старая
+        # ошибочная привязка жила бы вечно).
+        for dp, m in existing_mapping.items():
+            if dp not in mapping and str(dp) not in (local_dps or {}):
+                mapping[dp] = m
+                item["kept_existing"] += 1
 
         if not mapping and product_id:
             tl_map = lookup_tuya_local(product_id)
@@ -2985,8 +3496,13 @@ def _rebuild_tinytuya_json_worker(device_names):
 
         if not mapping:
             errors.append(f"{name}: mapping пуст (нет Cloud-кэша и tuya-local)")
+            item["status"] = "empty"
+            report.append(item)
             continue
 
+        item["matched"] = len(mapping)
+        if not item["source"]:
+            item["source"] = "cloud" if matched else "existing"
         results.append({
             "id": dev_id,
             "name": cfg.get("friendly_name", name),
@@ -2995,28 +3511,95 @@ def _rebuild_tinytuya_json_worker(device_names):
             "product_name": cfg.get("model", ""),
             "category": cfg.get("category", ""),
             "ip": ip,
-            "version": version or cfg.get("version", "3.3"),
+            "version": (versions[0] if versions else cfg.get("version", "3.3")),
             "mapping": mapping,
             "_source": "rebuild",
         })
+        report.append(item)
 
         time.sleep(0.05)
 
-    try:
-        os.makedirs(os.path.dirname(TINYTUYA_DEVICES_FILE) or ".", exist_ok=True)
-        with open(TINYTUYA_DEVICES_FILE, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        log.info(f"[Rebuild] tinytuya_devices.json: {len(results)} устройств")
-    except Exception as e:
-        errors.append(f"save: {e}")
-        log.error(f"[Rebuild] save: {e}")
+    # --- запись базы: атомарно (tmp + os.replace), v1.31.0 ---
+    saved = True
+    if not results and existing_by_id:
+        # v1.31.1: fail-safe — не затираем непустую базу пустой. Так бывает,
+        # если сеть отвалилась и ни одно устройство не ответило: терять
+        # единственный источник маппинга нельзя, лучше оставить прежнюю базу
+        # и сказать об этом в отчёте.
+        saved = False
+        errors.append("база не перезаписана: ни одно устройство не дало данных")
+        log.warning("[Rebuild] ни одного устройства — прежняя база оставлена как есть")
+    if saved:
+        try:
+            os.makedirs(os.path.dirname(TINYTUYA_DEVICES_FILE) or ".", exist_ok=True)
+            _tmp = TINYTUYA_DEVICES_FILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            os.replace(_tmp, TINYTUYA_DEVICES_FILE)
+            log.info(f"[Rebuild] {TINYTUYA_DEVICES_FILE}: {len(results)} устройств")
+        except Exception as e:
+            saved = False
+            errors.append(f"save: {e}")
+            log.error(f"[Rebuild] save: {e}")
+            try:
+                os.unlink(TINYTUYA_DEVICES_FILE + ".tmp")
+            except Exception:
+                pass
 
+    # v1.32.29: что именно изменилось в базе относительно прежней (плитки отчёта).
+    def _rb_key(entry):
+        # v1.32.35: в базе карта DP лежит в поле "mapping" (не "dps_map") —
+        # из-за этого «обновлено» всегда было 0, а всё попадало в «без изменений».
+        try:
+            e = entry or {}
+            return json.dumps(e.get("mapping") or e.get("dps_map") or {},
+                              sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return ""
+    _added = _updated = _unchanged = 0
+    for _e in results:
+        _id = (_e or {}).get("id", "")
+        if not _id:
+            continue
+        _old = existing_by_id.get(_id)
+        if not _old:
+            _added += 1
+        elif _rb_key(_old) != _rb_key(_e):
+            _updated += 1
+        else:
+            _unchanged += 1
+    _new_ids = {(e or {}).get("id", "") for e in results}
+    _removed = sum(1 for _id in existing_by_id if _id and _id not in _new_ids)
+
+    summary = {
+        "devices": len(results),
+        "added": _added,
+        "updated": _updated,
+        "unchanged": _unchanged,
+        "removed": _removed,
+        "probed_ok": sum(1 for r in report if r["status"] == "ok"),
+        "probe_failed": sum(1 for r in report if r["status"] == "probe_failed"),
+        "empty": sum(1 for r in report if r["status"] == "empty"),
+        "battery_skipped": len(skipped_battery),
+        "verified": sum(r["verified"] for r in report),
+        "mismatch": sum(r["mismatch"] for r in report),
+        "ambiguous": sum(r["ambiguous"] for r in report),
+        "kept_existing": sum(r["kept_existing"] for r in report),
+        "errors": len(errors),
+        "stop_first": bool(stop_first),
+        "skip_battery": bool(skip_battery),
+        "fetched_at": int(time.time()),
+    }
     with REBUILD_LOCK:
         REBUILD_STATE["running"] = False
         REBUILD_STATE["finished_at"] = int(time.time())
-        REBUILD_STATE["ok"] = len(errors) == 0 or len(results) > 0
+        REBUILD_STATE["ok"] = saved and (len(errors) == 0 or len(results) > 0)
         REBUILD_STATE["errors"] = errors
-    log.info(f"[Rebuild] Завершено: {len(results)} ok, {len(errors)} ошибок")
+        REBUILD_STATE["report"] = {"summary": summary, "devices": report}
+    log.info(f"[Rebuild] Готово: {len(results)} в базе, ошибок {len(errors)}; "
+             f"verified={summary['verified']} mismatch={summary['mismatch']} "
+             f"ambiguous={summary['ambiguous']} kept={summary['kept_existing']} "
+             f"battery_skipped={summary['battery_skipped']}")
 
 
 # ==================== HTML ====================
@@ -3299,7 +3882,6 @@ def collect_health():
         "devices": {"total": total, "online": online},
         "quiet": {"total": quiet_total, "now": quiet_now},
         "db": db,
-        "last_flush_sec": None,
     }
 
 
@@ -3310,6 +3892,8 @@ def render_html():
             .replace("__ANALYTICS_ENABLED__", analytics_js)
             .replace("__STATUS_HISTORY_ENABLED__", status_js)
             .replace("__WEBUI_VERSION__", WEBUI_VERSION)
+            # v1.32.33: публичный номер релиза — для подвала и сверки с GitHub.
+            .replace("__RELEASE_TAG__", RELEASE_TAG)
             # v1.27.6: подсеть MQTT — fallback для пресета IP-префикса.
             .replace("__MQTT_BROKER__", MQTT_BROKER or ""))
 
@@ -3321,6 +3905,15 @@ def _qs_int(qs, key, default):
         return int(qs.get(key, [str(default)])[0])
     except (TypeError, ValueError):
         return default
+
+
+class _BodyError(Exception):
+    """v1.31.19: некорректное тело запроса (тип или размер) → JSON-ошибка, а не молчание."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
 class WebUIHandler(BaseHTTPRequestHandler):
@@ -3428,11 +4021,40 @@ class WebUIHandler(BaseHTTPRequestHandler):
             pass
 
     def _read_body(self):
+        """v1.31.19: тело — только JSON, с ограничением размера и типа.
+
+        Content-Length заявлен клиентом: без лимита поток висит на `1e9`,
+        а без проверки Content-Type cross-site POST с `text/plain` проходит
+        без CORS-preflight. Оба случая закрыты здесь.
+        """
         try:
             cl = int(self.headers.get("Content-Length", 0))
-            if cl == 0: return None
-            return json.loads(self.rfile.read(cl).decode("utf-8"))
-        except Exception: return None
+        except (TypeError, ValueError):
+            raise _BodyError(400, "invalid Content-Length")
+        if cl <= 0:
+            return None
+        if cl > MAX_BODY_BYTES:
+            # v1.31.19: тело не читаем (может быть огромным) — отвечаем и закрываем.
+            self.close_connection = True
+            raise _BodyError(413, f"body too large (max {MAX_BODY_BYTES} bytes)")
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            # v1.31.19: иначе cross-site POST с text/plain проходит без preflight.
+            # Тело (оно в пределах лимита) вычитываем, чтобы при закрытии не ушёл RST
+            # и клиент гарантированно получил 415.
+            try:
+                self.rfile.read(cl)
+            except Exception:
+                pass
+            raise _BodyError(415, "Content-Type must be application/json")
+        try:
+            raw = self.rfile.read(cl)
+        except Exception:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise _BodyError(400, "invalid JSON body")
 
     @staticmethod
     def _parse_dev_path(path, suffix):
@@ -3477,6 +4099,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self._send_html(200, render_html())
             return
 
+        if path == "/api/update/check":
+            # v1.32.34: есть ли на GitHub релиз новее текущего (кэш 6 часов).
+            self._send_json(200, {"ok": True, "current": RELEASE_TAG,
+                                  **check_new_release()})
+            return
+
         if path == "/healthz":
             with STATE_LOCK: st = STATE["bridge_status"]
             payload = {"status": "ok" if st == "online" else "unhealthy", "bridge": st,
@@ -3502,63 +4130,83 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     # v1.28.27: режим пинга bridge + время старта (для grace).
                     "ping_mode": STATE.get("bridge_ping_mode"),
                     "bridge_started_at": STATE.get("bridge_started_at", 0),
+                    # v1.33.8: отклик на команду / окно защиты от «эха».
+                    "cmd_ack": STATE.get("bridge_cmd_ack"),
                     "devices": [],
                 }
                 # v1.27.7c: union STATE и DEVICE_META — иначе
                 # отключённые (enabled:false) не видны: bridge 1.8.4
                 # их не шлёт в MQTT → нет в STATE → нет в ответе.
-                _all_names = set(STATE["devices"].keys()) | set(meta_snap.keys())
-                for name in sorted(_all_names):
-                    info = STATE["devices"].get(name, {})
-                    m = meta_snap.get(name, {})
-                    # v1.25.0 (fix #cloud_dps): дополняем dps_map из Cloud-mapping
-                    # теми DP, что bridge прислал в cache, но их нет в config.
-                    _dps_map_full = _enrich_dps_map_from_cache(
-                        m.get("dps_map", {}),
-                        info.get("cache", {}),
-                        m.get("tuya_id", ""),
-                        m.get("friendly_name", name),
-                        m.get("product_id", ""),   # v1.28.33.fixup5b
-                        name,                          # exclude_name
-                        m.get("type", ""),             # v1.28.34: dev_type
-                        _get_cloud_writable(m.get("tuya_id", ""),
-                                            m.get("friendly_name", name)),  # v1.28.34
-                    )
-                    # v1.28.19: вычисляем причину один раз (был 3x вызов
-                    # get_device_meta + is_quiet_now на каждое устройство).
-                    _lat_reason = _ping_hidden_reason(name)
-                    status["devices"].append({
-                        "name": name, "friendly_name": m.get("friendly_name", name),
-                        "type": m.get("type", "unknown"), "model": m.get("model", ""),
-                        "ip": m.get("ip", ""), "version": m.get("version", ""),
-                        "battery_powered": m.get("battery_powered", False),
-                        # v1.27.7: enabled — для UI-отображения (серые
-                        # строки, свёрнутая секция «Отключённые»).
-                        "enabled": bool(m.get("enabled", True)),
-                        "tuya_id": m.get("tuya_id", ""),
-                        "local_key_present": bool(m.get("local_key")),
-                        "dps_map": _dps_map_full,
-                        "presets": m.get("presets", []), "preset_map": m.get("preset_map", {}),
-                        "min_temp": m.get("min_temp"), "max_temp": m.get("max_temp"), "temp_step": m.get("temp_step"),
-                        "status": info.get("status", "unknown"),
-                        "last_seen": info.get("last_seen"),
-                        # v1.28.6: battery_alert / battery_last_up
-                        # (для батарейных; для остальных None).
-                        "battery_alert": info.get("battery_alert"),
-                        "battery_last_up": info.get("battery_last_up"),
-                        # v1.28.2: latency_hidden — не измеряется (battery/
-                        # disabled/quiet). latency_ms = None чтобы не залипало
-                        # старое значение timeout.
-                        "latency_ms": (None if _lat_reason
-                                       else info.get("latency_ms")),
-                        "latency_ts": info.get("latency_ts"),
-                        "latency_hidden": _lat_reason is not None,
-                        "latency_reason": _lat_reason,
-                        "cache": info.get("cache", {}), "history": [],
-                        "quiet": is_quiet_now(name),
-                        "quiet_until": quiet_until_ts(name),
-                        "quiet_windows": (QUIET_CONFIG.get(name, {}) or {}).get("windows", []),
-                    })
+                # v1.32.5: копируем и вложенный cache — MQTT-поток обновляет его
+                # на месте, а раньше на время enrich нас защищал STATE_LOCK
+                # (иначе возможен «dictionary changed size during iteration»).
+                _devs_snap = {}
+                for _n, _v in STATE["devices"].items():
+                    _vv = dict(_v)
+                    _c = _v.get("cache")
+                    if isinstance(_c, dict):
+                        _vv["cache"] = dict(_c)
+                    _devs_snap[_n] = _vv
+                _all_names = set(_devs_snap) | set(meta_snap.keys())
+            # v1.32.2: тяжёлые enrich/quiet считаем ВНЕ STATE_LOCK. Раньше лок
+            # держался на весь цикл (файлы, вложенные локи) — MQTT-поток ждал
+            # и статусы устройств «залипали».
+            for name in sorted(_all_names):
+                info = _devs_snap.get(name, {})
+                m = meta_snap.get(name, {})
+                # v1.25.0 (fix #cloud_dps): дополняем dps_map из Cloud-mapping
+                # теми DP, что bridge прислал в cache, но их нет в config.
+                _dps_map_full = _enrich_dps_map_from_cache(
+                    m.get("dps_map", {}),
+                    info.get("cache", {}),
+                    m.get("tuya_id", ""),
+                    m.get("friendly_name", name),
+                    m.get("product_id", ""),   # v1.28.33.fixup5b
+                    name,                          # exclude_name
+                    m.get("type", ""),             # v1.28.34: dev_type
+                    _get_cloud_writable(m.get("tuya_id", ""),
+                                        m.get("friendly_name", name)),  # v1.28.34
+                )
+                # v1.28.19: вычисляем причину один раз (был 3x вызов
+                # get_device_meta + is_quiet_now на каждое устройство).
+                _lat_reason = _ping_hidden_reason(name)
+                status["devices"].append({
+                    "name": name, "friendly_name": m.get("friendly_name", name),
+                    "type": m.get("type", "unknown"), "model": m.get("model", ""),
+                    "ip": m.get("ip", ""), "version": m.get("version", ""),
+                    "battery_powered": m.get("battery_powered", False),
+                    # v1.27.7: enabled — для UI-отображения (серые
+                    # строки, свёрнутая секция «Отключённые»).
+                    "enabled": bool(m.get("enabled", True)),
+                    # v1.31.1: expire_after — ✏️ показывает текущее значение
+                    # и «Сбросить по умолчанию» только когда поле задано.
+                    "expire_after": m.get("expire_after"),
+                    "tuya_id": m.get("tuya_id", ""),
+                    "local_key_present": bool(m.get("local_key")),
+                    "dps_map": _dps_map_full,
+                    "presets": m.get("presets", []), "preset_map": m.get("preset_map", {}),
+                    "min_temp": m.get("min_temp"), "max_temp": m.get("max_temp"), "temp_step": m.get("temp_step"),
+                    "status": info.get("status", "unknown"),
+                    "last_seen": info.get("last_seen"),
+                    # v1.28.6: battery_alert / battery_last_up
+                    # (для батарейных; для остальных None).
+                    "battery_alert": info.get("battery_alert"),
+                    "battery_last_up": info.get("battery_last_up"),
+                    # v1.28.2: latency_hidden — не измеряется (battery/
+                    # disabled/quiet). latency_ms = None чтобы не залипало
+                    # старое значение timeout.
+                    "latency_ms": (None if _lat_reason
+                                   else info.get("latency_ms")),
+                    "latency_ts": info.get("latency_ts"),
+                    "latency_hidden": _lat_reason is not None,
+                    "latency_reason": _lat_reason,
+                    # v1.32.2: поле "history" убрано — его никто не читал
+                    # (историю подтягивает сам UI из своего кэша).
+                    "cache": info.get("cache", {}),
+                    "quiet": is_quiet_now(name),
+                    "quiet_until": quiet_until_ts(name),
+                    "quiet_windows": quiet_windows_of(name),
+                })
             # v1.22.1: безопасный sort по friendly_name (str + fallback)
             status["devices"].sort(
                 key=lambda d: str(d.get("friendly_name") or d.get("name") or "").lower())
@@ -3620,6 +4268,28 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     log.warning(f"[Base] tuya-local info: {e}")
             self._send_json(200, result)
+            return
+
+        if path == "/api/config/backups":
+            # v1.12.0: список бэкапов формирует bridge — папка backup/
+            # смонтирована только ему (WebUI видит config:ro).
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/config_backups", {},
+                                timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response",
+                                      "backups": []})
+                return
+            self._send_json(200, res)
+            return
+
+        if path == "/api/config/report":
+            # v1.11.0: отчёт по конфигу строит bridge (единый белый список).
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/config_report", {},
+                                timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response"})
+                return
+            self._send_json(200, res)
             return
 
         if path == "/api/base/rebuild/progress":
@@ -3727,16 +4397,20 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     continue
                 # v1.28.27: N+1 запрос — терпимо для SQLite, но при
                 # 100+ устройствах стоит перейти на один GROUP BY.
-                avg_data = db_query_avg_latency(name, latency_seconds)
+                # v1.33.24: один запрос отдаёт avg + медиану + p95 (см. ниже).
+                st = db_query_latency_stats(name, latency_seconds) or {}
                 latency.append({
                     "name": name,
                     "friendly_name": m.get("friendly_name", name),
                     "ip": m.get("ip", ""),
                     "latency_ms": info.get("latency_ms"),
                     "latency_ts": info.get("latency_ts"),
-                    "avg_ms_24h": (avg_data or {}).get("avg"),
-                    "latency_count": (avg_data or {}).get("count", 0),
-                    "latency_timeouts": (avg_data or {}).get("timeouts", 0),
+                    "avg_ms_24h": st.get("avg"),
+                    "median_ms_24h": st.get("median"),
+                    "p95_ms_24h": st.get("p95"),
+                    "max_ms_24h": st.get("max"),
+                    "latency_count": st.get("count", 0),
+                    "latency_timeouts": st.get("timeouts", 0),
                 })
             # v1.21.0: quiet hours — исключаем устройства в окне/grace
             def _is_quiet_or_grace(n):
@@ -3805,14 +4479,36 @@ class WebUIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
-        body = self._read_body()
+        try:
+            body = self._read_body()
+        except _BodyError as e:
+            # v1.31.19: отдаём JSON-ошибку, а не рвём соединение.
+            self._send_json(e.status, {"ok": False, "error": e.message})
+            return
+        if body is not None and not isinstance(body, dict):
+            # v1.31.19: все POST-эндпоинты принимают JSON-объект.
+            self._send_json(400, {"ok": False, "error": "body must be a JSON object"})
+            return
+
+        if path == "/api/cleanup/orphans":
+            # v1.12.2: удаляем только «зависшие» retained-топики (живые не трогаем)
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/cleanup_orphans", {},
+                                timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response"})
+                return
+            self._send_json(200, res)
+            return
 
         if path == "/api/cleanup":
-            try:
-                _mqtt.publish(f"{TOPIC_PREFIX}/bridge/cleanup", "1", qos=1, retain=False)
-                self._send_json(200, {"ok": True})
-            except Exception as e:
-                self._send_json(500, {"ok": False, "error": str(e)})
+            # v1.12.1: ждём подтверждение от bridge (removed/republished) —
+            # очистка занимает ~5-8 секунд, поэтому не «отправлено», а результат.
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/cleanup", {},
+                                timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response"})
+                return
+            self._send_json(200, res)
             return
 
         if path == "/api/latency/refresh":
@@ -3825,6 +4521,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 if TUYA_LOCAL_STATE["running"]:
                     self._send_json(200, {"ok": False, "error": "уже запущено"})
                     return
+                # v1.32.2: флаг под тем же локом, что и проверка — гонка запуска.
+                TUYA_LOCAL_STATE["running"] = True
             threading.Thread(target=_tuya_local_update_worker, daemon=True,
                              name="tuya-local-update").start()
             self._send_json(200, {"ok": True, "message": "обновление запущено"})
@@ -3845,9 +4543,22 @@ class WebUIHandler(BaseHTTPRequestHandler):
             if not names:
                 self._send_json(400, {"ok": False, "error": "нет устройств в конфиге"})
                 return
-            threading.Thread(target=_rebuild_tinytuya_json_worker, args=(names,),
+            # v1.31.0: параметры пересборки приходят из UI.
+            #  stop_first   — не перебирать все версии (меньше TCP);
+            #  skip_battery — не опрашивать спящие батарейные (правило №1).
+            _stop_first = bool(body.get("stop_first", True)) if body else True
+            _skip_batt = bool(body.get("skip_battery", True)) if body else True
+            # v1.32.2: флаг «уже запущено» ставим ДО старта потока (и после всех
+            # ранних выходов) — иначе два быстрых POST успевали оба пройти проверку.
+            with REBUILD_LOCK:
+                REBUILD_STATE["running"] = True
+            threading.Thread(target=_rebuild_tinytuya_json_worker,
+                             args=(names, _stop_first, _skip_batt),
                              daemon=True, name="tinytuya-rebuild").start()
-            self._send_json(200, {"ok": True, "message": "пересборка запущена", "total": len(names)})
+            self._send_json(200, {"ok": True, "message": "пересборка запущена",
+                                  "total": len(names),
+                                  "stop_first": _stop_first,
+                                  "skip_battery": _skip_batt})
             return
 
         if path == "/api/cloud/cache":
@@ -3882,11 +4593,15 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": False, "error": f"IP {ip} уже есть в конфиге — probe пропущен"})
                 return
             try:
-                version, dps = detect_version(ip, dev_id, local_key)
-                if version:
-                    self._send_json(200, {"ok": True, "version": version, "dps_count": len(dps)})
+                versions, dps = detect_version(
+                ip, dev_id, local_key,
+                name=(body.get("name") or body.get("friendly_name") or ""))
+                if versions:
+                    self._send_json(200, {"ok": True, "version": versions[0],
+                                          "versions": versions,
+                                          "dps_count": len(dps)})
                 else:
-                    self._send_json(200, {"ok": False, "error": "ни одна версия не ответила"})
+                    self._send_json(200, {"ok": False, "error": "ни одна версия не ответила (устройство спит?) — выберите версию вручную"})
             except Exception as e:
                 self._send_json(500, {"ok": False, "error": str(e)})
             return
@@ -3900,8 +4615,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
             local_key = (body.get("local_key") or "").strip()
             cloud_status_meta = body.get("cloud_status_meta") or []
             cloud_current_values = body.get("cloud_current_values") or {}
+            cloud_mapping = body.get("cloud_mapping") or {}
             if not dev_id or not ip or not local_key:
                 self._send_json(400, {"ok": False, "error": "id, ip, local_key required"})
+                return
+            # v1.31.19: карта облака тоже ограничена — иначе произвольный JSON гоняется
+            # по алгоритму сопоставления (комментарий ниже обещал проверку размеров).
+            if not isinstance(cloud_mapping, dict) or len(cloud_mapping) > 1000:
+                self._send_json(400, {"ok": False, "error": "cloud_mapping must be a dict (max 1000 entries)"})
                 return
 
             known_ips = get_known_ips()
@@ -3910,13 +4631,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                version, dps = detect_version(ip, dev_id, local_key)
+                versions, dps = detect_version(ip, dev_id, local_key)
             except Exception as e:
                 self._send_json(500, {"ok": False, "error": f"probe: {e}"})
                 return
-            if not version:
-                self._send_json(200, {"ok": False, "error": "ни одна версия не ответила"})
+            if not versions:
+                self._send_json(200, {"ok": False, "error": "ни одна версия не ответила (устройство спит?) — выберите версию вручную"})
                 return
+            version = versions[0]
 
             dp_to_code = {}
             try:
@@ -3927,7 +4649,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         and 0 < len(cloud_status_meta) <= 500
                         and 0 < len(cloud_current_values) <= 500):
                     dp_to_code = match_dps_to_codes(
-                        dps, cloud_status_meta, cloud_current_values)
+                        dps, cloud_status_meta, cloud_current_values,
+                        cloud_dp_mapping=cloud_mapping)
                 else:
                     log.warning("[ProbeMatch] cloud_status_meta/current_values "
                                 "некорректны или слишком велики — пропуск")
@@ -3943,9 +4666,102 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 "dp_to_code": {dp: {
                     "code": m.get("code", ""), "type": m.get("type", ""),
                     "values": m.get("values", {}), "name": m.get("name", ""),
+                    # v1.30.0: пометки матчера — видны в RAW-блоке опроса.
+                    **({"ambiguous": True, "candidates": m.get("_candidates")}
+                       if m.get("_ambiguous") else {}),
+                    **({"value_mismatch": True} if m.get("_mismatch") else {}),
                 } for dp, m in dp_to_code.items()},
                 "dps_map": dps_map,
+                "versions": versions,
+                "dps": dps,
             })
+            return
+
+        # v1.11.0: инструменты конфига (отчёт / expire_after / нормализация).
+        # Всё меняет bridge — WebUI только просит и пишет запись в аудит.
+        if path == "/api/config/expire_clear":
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/expire_clear", {},
+                                timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response"})
+                return
+            _names = res.get("cleared") or []
+            if res.get("ok"):
+                audit_log("expire_clear", changes={"cleared": len(_names)},
+                          extra={"names": _names})
+                # конфиг изменил bridge — перечитываем мету, иначе ✏️ покажет старое
+                try:
+                    load_device_meta()
+                except Exception as e:
+                    log.warning(f"[CfgCmd] reload meta: {e}")
+            self._send_json(200, res)
+            return
+
+        if path == "/api/config/expire_fill":
+            _value = body.get("value") if body else None
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/expire_fill",
+                                {"value": _value}, timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response"})
+                return
+            _names = res.get("changed") or []
+            if res.get("ok"):
+                audit_log("expire_fill",
+                          changes={"value": res.get("value"),
+                                   "changed": len(_names)},
+                          extra={"names": _names})
+                try:
+                    load_device_meta()
+                except Exception as e:
+                    log.warning(f"[CfgCmd] reload meta: {e}")
+            self._send_json(200, res)
+            return
+
+        if path == "/api/config/normalize":
+            _dry = bool(body.get("dry_run")) if body else False
+            # v1.33.5: галки из модалки — что именно исправлять.
+            _req = {"dry_run": _dry}
+            if body:
+                if "remove_extra" in body:
+                    _req["remove_extra"] = bool(body.get("remove_extra"))
+                if "fix_types" in body:
+                    _req["fix_types"] = bool(body.get("fix_types"))
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/config_normalize",
+                                _req, timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response"})
+                return
+            if res.get("ok") and not _dry:
+                audit_log("normalize",
+                          changes={"removed": res.get("removed", 0),
+                                   "fixes": res.get("fixes", {})})
+                try:
+                    load_device_meta()
+                except Exception as e:
+                    log.warning(f"[CfgCmd] reload meta: {e}")
+            self._send_json(200, res)
+            return
+
+        if path == "/api/config/restore":
+            _backup = body.get("backup") if body else None
+            res = _send_request(f"{TOPIC_PREFIX}/bridge/restore_config",
+                                {"backup": _backup}, timeout=EDIT_TIMEOUT_WAIT)
+            if not isinstance(res, dict):
+                self._send_json(200, {"ok": False, "error": "bad response"})
+                return
+            if res.get("ok"):
+                audit_log("restore",
+                          changes={"backup": res.get("backup"),
+                                   "devices": res.get("devices")},
+                          extra={"removed": res.get("removed")})
+                # bridge перезапустил воркеры и перепубликовал Discovery —
+                # перечитываем мету, чтобы UI показывал новый конфиг
+                try:
+                    load_device_meta()
+                    load_cloud_cache()
+                except Exception as e:
+                    log.warning(f"[Restore] reload: {e}")
+            self._send_json(200, res)
             return
 
         if path == "/api/config/audit/cleanup":
@@ -3971,14 +4787,24 @@ class WebUIHandler(BaseHTTPRequestHandler):
             if not body:
                 self._send_json(400, {"ok": False, "error": "body required"})
                 return
-            days = int(body.get("keep_days", 0))
-            hours = int(body.get("keep_hours", 0))
+            try:
+                days = int(body.get("keep_days", 0))
+                hours = int(body.get("keep_hours", 0))
+            except (TypeError, ValueError):
+                # v1.31.19: битые keep_days/keep_hours → 400, а не обрыв соединения.
+                self._send_json(400, {"ok": False, "error": "keep_days/keep_hours must be integers"})
+                return
             keep_s = days * 86400 + hours * 3600
             scope = (body.get("scope") or "all").strip()
             purge_all = bool(body.get("purge_all"))
             if scope == "all" and purge_all:
                 try:
                     n = db_cleanup_by_period(0)   # cutoff = now → удалить всё
+                    # v1.32.1: чистим и буферы в памяти — иначе накопленные события
+                    # вернутся в базу следующим db_flush() и «удалить всё» не удалит всё.
+                    with _db_lock:
+                        _status_buffer.clear()
+                        _latency_buffer.clear()
                     threading.Thread(target=db_vacuum, daemon=True).start()
                     self._send_json(200, {"ok": True, "deleted": n, "scope": "purge_all"})
                 except Exception as e:
@@ -4048,13 +4874,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     self._send_json(400, {"ok": False, "error": f"from == to: {f_}"})
                     return
                 parsed.append({"from": f_, "to": t_})
-            with QUIET_LOCK:
-                new_cfg = dict(QUIET_CONFIG)
-            if parsed:
-                new_cfg[dev] = {"windows": parsed}
-            else:
-                new_cfg.pop(dev, None)
-            ok, err = quiet_save(new_cfg)
+            with QUIET_EDIT_LOCK:
+                with QUIET_LOCK:
+                    new_cfg = dict(QUIET_CONFIG)
+                if parsed:
+                    new_cfg[dev] = {"windows": parsed}
+                else:
+                    new_cfg.pop(dev, None)
+                ok, err = quiet_save(new_cfg)
             if ok:
                 self._send_json(200, {"ok": True, "windows": parsed})
             else:
@@ -4170,11 +4997,21 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     subnet):
                 self._send_json(400, {"ok": False, "error": f"invalid subnet: {subnet}"})
                 return
+            # v1.32.2: расширенный скан идёт 20–40 с и плодит пул потоков — не даём
+            # запускать его параллельно (раньше каждый POST создавал свой пул).
+            with SCAN_EXTENDED_LOCK:
+                if SCAN_EXTENDED_STATE["running"]:
+                    self._send_json(200, {"ok": False, "error": "скан уже выполняется"})
+                    return
+                SCAN_EXTENDED_STATE["running"] = True
             try:
                 hosts = _scan_extended(subnet)
                 self._send_json(200, {"ok": True, "hosts": hosts, "subnet": subnet})
             except Exception as e:
                 self._send_json(500, {"ok": False, "error": str(e)})
+            finally:
+                with SCAN_EXTENDED_LOCK:
+                    SCAN_EXTENDED_STATE["running"] = False
             return
 
         if path == "/api/scan/bridge":
@@ -4228,7 +5065,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                         log.info(f"[Cloud] {d.get('name','?')}: tuya-local обогатил {len(tl_map)} DP")
                 d["dps_map_generated"] = dps_map
                 d["type_guess"] = guess_type_from_category(d.get("category", ""), d.get("product_name", ""))
-                d["version_guess"] = "3.3"
+                # v1.29.2: version_guess убран — облако версию протокола не отдаёт,
+                # а подставлять константу «3.3» как факт было враньём.
+                # Версия определяется пробой (🔍) или задаётся вручную.
                 enriched.append(d)
             save_cloud_cache(enriched, access_id=aid, region=region)
             # v1.25.0 (fix #cloud_dps): Cloud-кэш обновился —
@@ -4420,6 +5259,9 @@ def main():
         _mqtt.connect(MQTT_BROKER, MQTT_PORT, 60)
         _mqtt.loop_start()
         log.info(f"[MQTT] {MQTT_BROKER}:{MQTT_PORT}")
+        # v1.32.6: сразу отдаём мосту тихие часы (retain) — чтобы он не шумел
+        # про ожидаемую недоступность устройств в окне тишины.
+        quiet_publish_to_bridge()
     except Exception as e:
         log.warning(f"[MQTT] connect: {e}")
     try:

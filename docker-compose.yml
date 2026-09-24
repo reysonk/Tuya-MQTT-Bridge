@@ -34,6 +34,10 @@ services:
       - TOPIC_PREFIX=${TOPIC_PREFIX:-tuya}
       - DISCOVERY_PREFIX=${DISCOVERY_PREFIX:-homeassistant}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Дебаунс (склейка) быстрых команд switch/light: 0 = выключено (как раньше),
+      # 600 = включить защиту от спама кликов.
+      - SWITCH_DEBOUNCE_MS=${SWITCH_DEBOUNCE_MS:-0}
+      - SWITCH_DEBOUNCE_MAX_MS=${SWITCH_DEBOUNCE_MAX_MS:-1200}
     healthcheck:
       test: ["CMD-SHELL", "grep -q 'main.py' /proc/1/cmdline && test -f /app/state/state_cache.json"]
       interval: 30s

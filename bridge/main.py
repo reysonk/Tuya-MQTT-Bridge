@@ -75,9 +75,10 @@ OFFLINE_TIMEOUT = 120
 BATTERY_PING_INTERVAL = 0.5            # как часто пингуем (сек)
 BATTERY_PING_TIMEOUT = 1.0             # таймаут ICMP
 
-BATTERY_UPDATEDPS_COUNT = 5            # сколько раз за окно UP
+BATTERY_UPDATEDPS_COUNT = 6            # сколько раз за окно UP
 BATTERY_UPDATEDPS_INTERVAL = 1         # пауза между вызовами (сек)
-BATTERY_UPDATEDPS_TIMEOUT = 3          # socket timeout для updatedps
+BATTERY_UPDATEDPS_FAST = 0.3           # v1.12.33: пауза первых быстрых попыток (сек)
+BATTERY_UPDATEDPS_TIMEOUT = 1.5        # socket timeout для updatedps/status
 
 # v1.9.6: BATTERY_OFFLINE_AFTER_DOWN удалена — после 1.9.4
 # offline для батарейных НЕ публикуется, HA полагается на expire_after.
@@ -119,7 +120,7 @@ _ORPHAN_SUFFIXES = (
     "_battery_alert", "_battery_last_seen", "_battery_percentage", "_battery",
     "_moisture", "_door", "_motion", "_fault",
     # типы устройств
-    "_light", "_climate",
+    "_light", "_climate", "_cover", "_fan",
     # switch / select
     "_switch_1", "_switch_2", "_switch_3", "_switch_4", "_switch",
     "_backlight", "_prepayment",
@@ -135,12 +136,11 @@ _ORPHAN_SUFFIXES = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.10.20"
+DISCOVERY_VERSION = "1.12.37"
 RETAINED_DUP_WINDOW = 10
 
-# Пул команд. 32 — хватает на 40+ устройств.
-# Команды на ОДНО устройство сериализуются per-device lock'ом.
-CMD_POOL_SIZE = 32
+# v1.12.32: пул команд — per-device (DEVICE_EXECS, команды и повторы отдельно),
+# глобального CMD_POOL_SIZE больше нет.
 
 LOG_LEVEL = os.getenv("LOG_LEVEL") or "INFO"
 
@@ -149,6 +149,12 @@ MAX_CONSECUTIVE_904 = 3
 # Rate limit: только для стримовых DP.
 MIN_CMD_INTERVAL_STREAM = 0.15
 MIN_CMD_INTERVAL_SWITCH = 0.0
+
+# v1.12.23: дебаунс быстрых команд switch/light (реализация — SwitchDebouncer ниже).
+# 0 мс = выключено (поведение как раньше). Первая команда серии уходит сразу,
+# хвост склеивается в одну финальную; SWITCH_DEBOUNCE_MAX_MS ограничивает «залипон».
+SWITCH_DEBOUNCE_MS = _env_int("SWITCH_DEBOUNCE_MS", 0)
+SWITCH_DEBOUNCE_MAX_MS = _env_int("SWITCH_DEBOUNCE_MAX_MS", 1200)
 
 # Fix 1.8.2: окно сброса счётчиков 914/905.
 # Если между событиями прошло > REPEAT_RESET_SECONDS — счётчик сбрасывается.
@@ -196,7 +202,7 @@ BACKUP_DIR = "backup"
 #     unique_id изменится (например, изменился dps_map).
 #     ОПАСНО включать на продакшене без бэкапа автоматизаций HA.
 ENABLED_FALSE_REMOVES_DISCOVERY = False
-BACKUP_KEEP = 5
+BACKUP_KEEP = 20
 
 SCAN_WORKERS = 32
 SCAN_TIMEOUT = 0.3
@@ -204,10 +210,12 @@ SCAN_PORT = 6668
 
 CONFIG_FILE = "config/devices_config.json"
 
-DEBUG_CACHE_RECEIVE = 0
-DEBUG_CACHE_STATUS = 0
-DEBUG_RAW_DP = 0
-DEBUG_MQTT_CMD = 0
+# v1.12.25: отладочные флаги выведены в env (0 = выключено).
+# Включать точечно на время диагностики: LOG_LEVEL=DEBUG сам по себе их не включает.
+DEBUG_CACHE_RECEIVE = _env_int("DEBUG_CACHE_RECEIVE", 0)
+DEBUG_CACHE_STATUS = _env_int("DEBUG_CACHE_STATUS", 0)
+DEBUG_RAW_DP = _env_int("DEBUG_RAW_DP", 0)
+DEBUG_MQTT_CMD = _env_int("DEBUG_MQTT_CMD", 0)
 
 DEFAULT_BRIGHT_MIN = 10
 DEFAULT_BRIGHT_MAX = 1000
@@ -307,6 +315,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("tuya-bridge")
 
+# v1.12.11: при LOG_LEVEL=DEBUG не топим лог трафиком библиотек — paho пишет
+# каждый MQTT-пакет, tinytuya — каждый обмен с устройством. Наши DEBUG-строки
+# (в т.ч. по тихим часам) при этом остаются.
+if logging.getLogger().level <= logging.DEBUG:
+    for _lib in ("paho", "paho.mqtt", "paho.mqtt.client", "tinytuya"):
+        logging.getLogger(_lib).setLevel(logging.INFO)
+
 try:
     _log_dir = os.path.dirname(LOG_FILE)
     if _log_dir:
@@ -317,7 +332,9 @@ try:
         backupCount=LOG_FILE_BACKUPS,
         encoding="utf-8",
     )
-    _file_handler.setLevel(logging.DEBUG)
+    # v1.12.7: уровень файла не задаём — root-логгер стоит на INFO (LOG_LEVEL),
+    # поэтому DEBUG-записи до хендлера всё равно не доходили (мёртвая настройка).
+    # Нужен подробный файл — запусти с LOG_LEVEL=DEBUG.
     _file_handler.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -325,6 +342,17 @@ try:
     logging.getLogger().addHandler(_file_handler)
 except Exception as e:
     log.warning(f"[Log] Не удалось открыть файловый лог {LOG_FILE}: {e}")
+
+def _thread_excepthook(args):
+    """v1.12.7: необработанное исключение в потоке не должно исчезать молча —
+    иначе WebUI получает таймаут, а в логе нет причины."""
+    name = args.thread.name if args.thread else "?"
+    log.error(f"[Thread] {name}: необработанная ошибка: "
+              f"{args.exc_type.__name__}: {args.exc_value}",
+              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+threading.excepthook = _thread_excepthook
 
 # ==================== КОНФИГ ====================
 _config_dir = os.path.dirname(CONFIG_FILE)
@@ -335,13 +363,53 @@ if not os.path.exists(CONFIG_FILE):
     log.error(f"[Config] Файл {CONFIG_FILE} не найден")
     sys.exit(1)
 
-with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-    ALL_DEVICES = json.load(f)
+# v1.12.7: валидация конфига на старте — иначе битый JSON или запись без name
+# давали сырой traceback и crash-loop контейнера вместо понятного сообщения.
+try:
+    with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+        ALL_DEVICES = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    log.error(f"[Config] Не удалось прочитать {CONFIG_FILE}: {e}")
+    sys.exit(1)
 
-DEVICES = [d for d in ALL_DEVICES if d.get("enabled", True)]
+if not isinstance(ALL_DEVICES, list):
+    log.error(f"[Config] {CONFIG_FILE}: ожидался список устройств, "
+              f"получено {type(ALL_DEVICES).__name__}")
+    sys.exit(1)
+# v1.12.15: к структурной проверке добавлены обязательные поля и зарезервированное
+# имя: устройство без id раньше роняло воркер KeyError'ом, а name "bridge"
+# конфликтовал со служебными топиками tuya/bridge/*.
+_broken = [i for i, d in enumerate(ALL_DEVICES)
+           if not isinstance(d, dict) or not d.get("name")
+           or not d.get("id") or d.get("name") == "bridge"]
+if _broken:
+    # v1.12.9: мусорные записи больше НЕ роняют мост (раньше был exit(1), и одна
+    # лишняя запись в конфиге мешала старту) — просто пропускаем их с предупреждением.
+    log.warning(f"[Config] {CONFIG_FILE}: пропускаю записи без имени или не-объекты "
+                f"(индексы {_broken[:10]})")
+    _skip = set(_broken)
+    ALL_DEVICES = [d for i, d in enumerate(ALL_DEVICES) if i not in _skip]
+    if not ALL_DEVICES:
+        log.error(f"[Config] {CONFIG_FILE}: после отсева мусора не осталось устройств")
+        sys.exit(1)
+_names = [d["name"] for d in ALL_DEVICES]
+_dups = sorted({n for n in _names if _names.count(n) > 1})
+if _dups:
+    log.warning(f"[Config] Дубли имён в конфиге: {_dups} — в работе останется "
+                f"последнее из них")
+
+# v1.12.15: дубли имён схлопываем (оставляем последнее) — иначе поднимались бы два
+# воркера с одним именем, и _worker_alive/_wait_worker_exit перестают их различать.
+_by_name = {}
+for _d in ALL_DEVICES:
+    _by_name[_d["name"]] = _d
+DEVICES = [d for d in _by_name.values() if d.get("enabled", True)]
 DEVICE_INDEX = {d["name"]: d for d in DEVICES}
 
 DEVICES_LOCK = threading.RLock()
+# v1.12.12: старт воркера — только под этим локом (иначе reconcile/retry/edit
+# могли поднять два воркера на одно устройство — правило №1).
+WORKER_START_LOCK = threading.Lock()
 
 STATE_CACHE = {d["name"]: {} for d in DEVICES}
 BATTERY_LAST_UP = {}   # v1.10.0: {name: unix_ts} — persist battery last UP
@@ -367,6 +435,24 @@ def request_worker_restart(name):
 def consume_restart_flag(name):
     with RESTART_FLAGS_LOCK:
         return RESTART_FLAGS.pop(name, False)
+
+
+# v1.12.13: STOP-флаг — воркер должен ВЫЙТИ, а не переподключиться.
+# Нужен для отката конфига и TCP-валидации edit_config: restart-флаг давал
+# только реконнект, из-за чего воркер выживал и старая конфигурация применялась
+# не полностью (устройство продолжало опрашиваться по старому IP).
+STOP_FLAGS = {}
+STOP_FLAGS_LOCK = threading.Lock()
+
+
+def request_worker_stop(name):
+    with STOP_FLAGS_LOCK:
+        STOP_FLAGS[name] = True
+
+
+def consume_stop_flag(name):
+    with STOP_FLAGS_LOCK:
+        return STOP_FLAGS.pop(name, False)
 
 
 def request_status(name):
@@ -426,20 +512,37 @@ def _discovery_topics_for_device(dev):
     elif dtype == "fan":
         topics.add(f"{DISCOVERY_PREFIX}/fan/{dev_name}_fan/config")
 
-    # DP-уровневые сущности
+    # DP-уровневые сущности.
+    # v1.12.37: набор компонентов зависит от type — publish_discovery
+    # вызывает DP-публикаторы не для всех типов:
+    #   switch     -> switch/select/number/sensor/binary_sensor;
+    #   sensor и др. (else) -> publish_sensors, только sensor/binary_sensor;
+    #   light/climate/cover/fan -> только своя одиночная сущность, DP не
+    #                              публикуются отдельными топиками.
+    # Раньше DP-цикл шёл для всех типов, и «ожидаемые» включали, например,
+    # sensor/<climate>_temp_current/config, которых мост не публикует —
+    # отсюда расхождение «ожидалось» vs фактически retained (C2).
+    if dtype == "switch":
+        dp_components = ("switch", "select", "number",
+                         "sensor", "binary_sensor")
+    elif dtype in ("light", "climate", "cover", "fan"):
+        dp_components = ()
+    else:
+        dp_components = ("sensor", "binary_sensor")
     for dp_str, info in dev.get("dps_map", {}).items():
         comp = info.get("component")
         ent = info.get("name", f"dp_{dp_str}")
-        if comp == "switch":
-            topics.add(f"{DISCOVERY_PREFIX}/switch/{dev_name}_{ent}/config")
-        elif comp == "select":
-            topics.add(f"{DISCOVERY_PREFIX}/select/{dev_name}_{ent}/config")
-        elif comp == "number":
-            topics.add(f"{DISCOVERY_PREFIX}/number/{dev_name}_{ent}/config")
-        elif comp in ("sensor", "binary_sensor"):
-            topics.add(f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{ent}/config")
-        elif comp == "lock":           # v1.10.20
+        if comp == "lock":             # v1.10.20: lock — для любого типа
             topics.add(f"{DISCOVERY_PREFIX}/lock/{dev_name}_{ent}/config")
+        elif comp in dp_components:
+            if comp == "switch":
+                topics.add(f"{DISCOVERY_PREFIX}/switch/{dev_name}_{ent}/config")
+            elif comp == "select":
+                topics.add(f"{DISCOVERY_PREFIX}/select/{dev_name}_{ent}/config")
+            elif comp == "number":
+                topics.add(f"{DISCOVERY_PREFIX}/number/{dev_name}_{ent}/config")
+            else:                       # sensor / binary_sensor
+                topics.add(f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{ent}/config")
 
     return topics
 
@@ -621,7 +724,9 @@ def _filter_orphan_by_suffix(topics, all_dev_names):
         # удаления чужих retained.
         prefix_matched = False
         for dev_name in known_names_sorted:
-            if unique_id.startswith(dev_name):
+            # v1.12.12: только «<имя>_» — иначе фильтр мог удалить ЧУЖОЙ retained,
+            # unique_id которого просто начинается с имени нашего устройства.
+            if unique_id.startswith(dev_name + "_"):
                 prefix_matched = True
                 break
         if not prefix_matched:
@@ -664,7 +769,6 @@ def sync_discovery_registry(scan_on_first=False):
     # v1.10.9: orphan cleanup — retained, которых нет ни в actual,
     # ни в old (реестре). Ловит топики удалённых устройств, которые
     # bridge не почистил (см. шапку модуля).
-    orphan = set()
     if scan_on_first and CLEANUP_ORPHAN_RETAINED:
         log.info("[Discovery] Scanning ALL retained for orphan cleanup...")
         try:
@@ -692,7 +796,8 @@ def sync_discovery_registry(scan_on_first=False):
         except Exception as e:
             log.warning(f"[Discovery] orphan scan failed: {e}")
 
-    to_remove = (old - actual) | orphan
+    # v1.12.7: orphan уже удалены выше — второй раз не публикуем.
+    to_remove = old - actual
     if to_remove:
         log.info(f"[Discovery] Устаревших retained: {len(to_remove)} — удаляю")
         for topic in sorted(to_remove):
@@ -988,6 +1093,13 @@ def get_kelvin_bounds(info):
 
 
 def get_select_map(info):
+    """v1.12.8: карта `map` — это **Tuya → HA** (ключ — значение от устройства,
+    значение — метка для HA; см. `docs/devices_config.json`: `relay_status`
+    с `options: ["off","on","last"]` и `map: {"off":"power_off"}`).
+
+    Команды идут в обратную сторону (HA-метка → Tuya), поэтому в обработчиках
+    команд карта разворачивается (`rev`), а в публикации состояния — нет.
+    """
     return info.get("map", {})
 
 
@@ -1160,6 +1272,17 @@ def _validate_dps_map(dev_type, dps_map):
                 return False, f"dp {dp_str}: name {name!r} not allowed for light " \
                               f"(allowed: {sorted(LIGHT_DP_NAMES)})", warnings
 
+        # v1.12.7: границы цветовой температуры — иначе деление на
+        # (kelvin_max - kelvin_min) в handle_light_command падало ZeroDivisionError.
+        if name == "temp_value":
+            _kmin, _kmax = get_kelvin_bounds(info)
+            if (isinstance(_kmin, bool) or not isinstance(_kmin, (int, float))
+                    or isinstance(_kmax, bool) or not isinstance(_kmax, (int, float))):
+                return False, f"dp {dp_str}: kelvin_min/kelvin_max must be numbers", warnings
+            if _kmin >= _kmax:
+                return False, (f"dp {dp_str}: kelvin_min ({_kmin}) must be < "
+                               f"kelvin_max ({_kmax})"), warnings
+
         # --- cover / fan: name из белого списка (v1.10.20) ---
         if dev_type == "cover" and name not in COVER_DP_NAMES:
             return False, f"dp {dp_str}: name {name!r} not allowed for cover " \
@@ -1291,6 +1414,12 @@ def _backup_config():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = os.path.basename(CONFIG_FILE)
         dst = os.path.join(BACKUP_DIR, f"{base}.bak.{ts}")
+        # v1.11.0: массовые операции могут уложиться в одну секунду —
+        # не теряем бэкап из-за совпадения имени (точность имени до секунды).
+        _dup = 1
+        while os.path.exists(dst):
+            _dup += 1
+            dst = os.path.join(BACKUP_DIR, f"{base}.bak.{ts}_{_dup}")
         shutil.copy2(CONFIG_FILE, dst)
         log.info(f"[Backup] Создан {dst}")
         _cleanup_backups()
@@ -1305,10 +1434,11 @@ def _cleanup_backups():
         if not os.path.isdir(BACKUP_DIR):
             return
         base = os.path.basename(CONFIG_FILE)
-        files = sorted(
-            [f for f in os.listdir(BACKUP_DIR) if f.startswith(base + ".bak.")],
-            reverse=True,
-        )
+        # v1.12.7: сортировка по имени ломалась на суффиксе коллизии (_10 «старее» _9),
+        # поэтому порядок — по времени файла, имя только как tie-break.
+        files = [f for f in os.listdir(BACKUP_DIR) if f.startswith(base + ".bak.")]
+        files.sort(key=lambda f: (os.path.getmtime(os.path.join(BACKUP_DIR, f)), f),
+                   reverse=True)
         for old in files[BACKUP_KEEP:]:
             try:
                 os.unlink(os.path.join(BACKUP_DIR, old))
@@ -1461,6 +1591,41 @@ mqtt_client.reconnect_delay_set(min_delay=1, max_delay=60)
 
 CLEANUP_MODE = {"active": False, "count": 0}
 
+# v1.12.10: тихие часы (приходят из WebUI топиком bridge/quiet_config).
+# Устройство в окне тишины обычно физически выключено — его недоступность
+# ожидаема, поэтому 905/offline для таких устройств уходят в DEBUG.
+QUIET_LOCK = threading.Lock()
+QUIET_CONFIG = {}
+
+
+def _quiet_hm_to_min(value):
+    try:
+        h, m = str(value).split(":")
+        return (int(h) % 24) * 60 + (int(m) % 60)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _is_quiet_now(name):
+    """True, если устройство сейчас в окне тишины (локальное время контейнера)."""
+    with QUIET_LOCK:
+        wins = (QUIET_CONFIG.get(name) or {}).get("windows") or []
+    if not wins:
+        return False
+    now = datetime.now()
+    nm = now.hour * 60 + now.minute
+    for w in wins:
+        f = _quiet_hm_to_min((w or {}).get("from"))
+        t = _quiet_hm_to_min((w or {}).get("to"))
+        if f is None or t is None:
+            continue
+        if f <= t:
+            if f <= nm < t:
+                return True
+        elif nm >= f or nm < t:     # окно через полночь
+            return True
+    return False
+
 
 def collect_our_unique_ids():
     ids = set()
@@ -1483,7 +1648,10 @@ def collect_our_unique_ids():
             ids.add(f"{name}_cover")
         if dtype == "fan":
             ids.add(f"{name}_fan")
-        for dp_str, info in dev.get("dps_map", {}).items():
+        for dp_str, info in (dev.get("dps_map") or {}).items():
+            if not isinstance(info, dict):
+                # v1.12.12: битый dps_map не должен ронять мост на импорте модуля.
+                continue
             comp = info.get("component")
             ent = info.get("name", f"dp_{dp_str}")
             if comp in ("switch", "select", "number"):
@@ -1495,6 +1663,10 @@ def collect_our_unique_ids():
         if dev.get("dps_map", {}).get("6", {}).get("component") == "phase_a":
             for s in ("voltage", "current", "power"):
                 ids.add(f"{name}_output_{s}")
+        # v1.12.12: батарейные топики — тоже «наши», иначе cleanup/orphan их не видят.
+        if dev.get("battery_powered"):
+            ids.add(f"{name}_battery_alert")
+            ids.add(f"{name}_battery_last_seen")
     return ids
 
 
@@ -1525,10 +1697,20 @@ def on_connect(client, userdata, flags, rc, properties=None):
         client.subscribe(f"{TOPIC_PREFIX}/fan/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/lock/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/cleanup")
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/cleanup_orphans")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/edit_config")
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/quiet_config")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/delete_device")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/import_devices")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/scan_network")
+        # v1.11.0: инструменты конфига (отчёт / expire_after / нормализация)
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/config_report")
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/expire_clear")
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/expire_fill")
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/config_normalize")
+        # v1.12.0: откат конфига из бэкапа
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/config_backups")
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/restore_config")
         client.subscribe(f"{DISCOVERY_PREFIX}/#", qos=1)
         log.info("[MQTT] Подписка на команды и Discovery")
     else:
@@ -1544,22 +1726,87 @@ LAST_CMD_LOCK = threading.Lock()
 
 
 def is_duplicate_retained(topic, payload, window=RETAINED_DUP_WINDOW):
-    key = (topic, payload)
+    """v1.12.7: дубль — повтор ТОЙ ЖЕ команды, а не возврат к прежнему значению.
+
+    Раньше ключом была пара (topic, payload), поэтому последовательность
+    ON→OFF→ON в пределах окна гасила третий ON как «дубль» — быстрые нажатия
+    назад к прежнему значению терялись. Теперь помним последнюю команду по
+    топику: совпало значение и оно свежее — дубль.
+    """
     now = time.time()
     with LAST_CMD_LOCK:
-        last = LAST_CMD.get(key)
-        LAST_CMD[key] = now
-        stale = [k for k, t in LAST_CMD.items() if now - t > window]
+        last = LAST_CMD.get(topic)
+        LAST_CMD[topic] = (payload, now)
+        stale = [k for k, (_, t) in LAST_CMD.items() if now - t > window]
         for k in stale:
             LAST_CMD.pop(k, None)
-    return last is not None and (now - last) < window
+    if not last:
+        return False
+    last_payload, last_ts = last
+    return last_payload == payload and (now - last_ts) < window
 
 
-CMD_POOL = ThreadPoolExecutor(max_workers=CMD_POOL_SIZE, thread_name_prefix="cmd")
+# v1.12.31: у КАЖДОГО устройства — свой однопоточный исполнитель (своя очередь).
+# «Зависшая» команда/повтор одного прибора больше не занимает общий поток и не
+# вытесняет команды других (раньше общий CMD_POOL на 32 потока мог забиться
+# повторами — и новые команды, например включение, не отправлялись).
+DEVICE_EXECS = {}
+DEVICE_EXECS_LOCK = threading.Lock()
+
+
+def get_device_exec(dev_name):
+    with DEVICE_EXECS_LOCK:
+        ex = DEVICE_EXECS.get(dev_name)
+        if ex is None:
+            ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dev-" + dev_name)
+            DEVICE_EXECS[dev_name] = ex
+        return ex
+
+
+# v1.12.31: у повторов — ОТДЕЛЬНЫЙ маленький пул на устройство, чтобы [Retry]
+# не занимал очередь обычных команд этого же прибора.
+DEVICE_RETRY_EXECS = {}
+
+
+def get_device_retry_exec(dev_name):
+    with DEVICE_EXECS_LOCK:
+        ex = DEVICE_RETRY_EXECS.get(dev_name)
+        if ex is None:
+            ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="retry-" + dev_name)
+            DEVICE_RETRY_EXECS[dev_name] = ex
+        return ex
+
+
+def submit_device_command(dev, component, parts, cmd):
+    """Поставить команду в очередь КОНКРЕТНОГО устройства."""
+    name = dev["name"]
+    try:
+        get_device_exec(name).submit(process_command, dev, component, parts, cmd)
+    except Exception as e:
+        log.debug(f"[Cmd] {name}: submit: {e}")
+
+
+def drop_device_exec(dev_name):
+    """Закрыть исполнители устройства (удаление/переимпорт конфига)."""
+    with DEVICE_EXECS_LOCK:
+        ex = DEVICE_EXECS.pop(dev_name, None)
+        rex = DEVICE_RETRY_EXECS.pop(dev_name, None)
+    for x in (ex, rex):
+        if x:
+            try:
+                x.shutdown(wait=False)
+            except Exception:
+                pass
 
 
 def on_message(client, userdata, msg):
     topic = msg.topic
+
+    if ORPHAN_MODE["active"] and topic.startswith(DISCOVERY_PREFIX + "/"):
+        parts = topic.split("/")
+        if len(parts) >= 3 and parts[2] in OUR_IDS:
+            ORPHAN_MODE["topics"].append(topic)
+        return
 
     if CLEANUP_MODE["active"] and topic.startswith(DISCOVERY_PREFIX + "/"):
         parts = topic.split("/")
@@ -1568,9 +1815,35 @@ def on_message(client, userdata, msg):
             CLEANUP_MODE["count"] += 1
         return
 
+    if topic == f"{TOPIC_PREFIX}/bridge/quiet_config":
+        # v1.12.10: тихие часы из WebUI (retained) — чтобы не шуметь в лог
+        # про ожидаемую недоступность выключенных по расписанию устройств.
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        try:
+            data = json.loads(payload_str) if payload_str else {}
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        with QUIET_LOCK:
+            QUIET_CONFIG.clear()
+            if isinstance(data, dict):
+                for _n, _cfg in data.items():
+                    if isinstance(_cfg, dict):
+                        QUIET_CONFIG[_n] = _cfg
+        log.info(f"[Quiet] Тихие часы получены: {len(QUIET_CONFIG)} устройств")
+        return
+
+    if topic == f"{TOPIC_PREFIX}/bridge/cleanup_orphans":
+        log.info("[MQTT] Получена команда cleanup_orphans")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_cleanup_orphans, args=(payload_str,),
+                         daemon=True, name="cleanup-orphans").start()
+        return
+
     if topic == f"{TOPIC_PREFIX}/bridge/cleanup":
         log.info("[MQTT] Получена команда cleanup")
-        threading.Thread(target=_handle_cleanup_command, daemon=True, name="cleanup-cmd").start()
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_cleanup_command, args=(payload_str,),
+                         daemon=True, name="cleanup-cmd").start()
         return
 
     if topic == f"{TOPIC_PREFIX}/bridge/edit_config":
@@ -1601,6 +1874,50 @@ def on_message(client, userdata, msg):
                          daemon=True, name="scan-network").start()
         return
 
+    # v1.11.0: инструменты конфига
+    if topic == f"{TOPIC_PREFIX}/bridge/config_report":
+        log.info("[MQTT] Получена команда config_report")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_config_report, args=(payload_str,),
+                         daemon=True, name="config-report").start()
+        return
+
+    if topic == f"{TOPIC_PREFIX}/bridge/expire_clear":
+        log.info("[MQTT] Получена команда expire_clear")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_expire_clear, args=(payload_str,),
+                         daemon=True, name="expire-clear").start()
+        return
+
+    if topic == f"{TOPIC_PREFIX}/bridge/expire_fill":
+        log.info("[MQTT] Получена команда expire_fill")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_expire_fill, args=(payload_str,),
+                         daemon=True, name="expire-fill").start()
+        return
+
+    if topic == f"{TOPIC_PREFIX}/bridge/config_normalize":
+        log.info("[MQTT] Получена команда config_normalize")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_config_normalize, args=(payload_str,),
+                         daemon=True, name="config-normalize").start()
+        return
+
+    # v1.12.0: откат конфига из бэкапа
+    if topic == f"{TOPIC_PREFIX}/bridge/config_backups":
+        log.info("[MQTT] Получена команда config_backups")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_config_backups, args=(payload_str,),
+                         daemon=True, name="config-backups").start()
+        return
+
+    if topic == f"{TOPIC_PREFIX}/bridge/restore_config":
+        log.info("[MQTT] Получена команда restore_config")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_restore_config, args=(payload_str,),
+                         daemon=True, name="restore-config").start()
+        return
+
     if not topic.endswith("/set"):
         return
 
@@ -1625,7 +1942,115 @@ def on_message(client, userdata, msg):
         return
 
     cmd = parse_payload(payload)
-    CMD_POOL.submit(process_command, dev, component, parts, cmd)
+    # v1.12.27: публикуем состояние сразу (до очереди устройства и device-лока),
+    # чтобы HA не ждал, пока освободится «зависшая» предыдущая команда прибора.
+    # В Tuya команда уходит по очереди, а HA уже видит целевое состояние.
+    try:
+        optimistic_prepublish(dev, component, parts, cmd)
+    except Exception as e:
+        log.debug(f"[Set] {dev_name}: prepublish: {e}")
+    # v1.12.22: при спаме кликов HA шлёт серию switch/light-команд. Первую
+    # отправляем сразу (без задержки), остальные в окне склеиваем в одну финальную
+    # (см. SwitchDebouncer). По умолчанию выключено (SWITCH_DEBOUNCE_MS=0).
+    if SWITCH_DEBOUNCER.window > 0 and component in _DEBOUNCE_COMPONENTS:
+        entity = parts[3] if len(parts) > 4 else ""
+        if SWITCH_DEBOUNCER.offer(f"{dev_name}/{component}/{entity}", cmd,
+                                  (dev, component, parts)):
+            return
+    # v1.12.31: команда уходит в очередь конкретного устройства (свой пул).
+    submit_device_command(dev, component, parts, cmd)
+
+
+# ==================== v1.12.22: ДЕБАУНС SWITCH/LIGHT ====================
+# Идея: при спаме кликов HA шлёт серию ON/OFF. Отправляем ПЕРВУЮ команду сразу
+# (без задержки — иначе UX был бы хуже нынешнего), а остальные в окне склеиваем
+# и отправляем одной финальной. Жёсткий потолок (SWITCH_DEBOUNCE_MAX_MS) не даёт
+# «залипону» превысить привычный. Пары «устройство/сущность» независимы.
+# Пары «устройство/сущность» независимы. Значения SWITCH_DEBOUNCE_MS /
+# SWITCH_DEBOUNCE_MAX_MS объявлены в начале файла (блок констант).
+_DEBOUNCE_COMPONENTS = ("switch", "light")
+
+
+def _merge_payload(old, new):
+    """Склейка команд: dict'ы (свет) мержим по ключам, иначе берём последнюю."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        merged = dict(old)
+        merged.update(new)
+        return merged
+    return new
+
+
+class SwitchDebouncer:
+    """Склейка быстрых команд: ведущий край сразу + хвост одной командой."""
+
+    def __init__(self, window_ms, max_ms):
+        self.window = max(0, int(window_ms)) / 1000.0
+        self.max_delay = max(self.window, int(max_ms) / 1000.0)
+        self._lock = threading.Lock()
+        self._items = {}        # key -> {payload, meta, first, n}
+        self._last_sent = {}    # key -> ts последней отправки
+
+    def offer(self, key, payload, meta, now=None):
+        """True — команду поглотили (уйдёт позже), False — отправляй сейчас."""
+        if self.window <= 0:
+            return False
+        now = time.time() if now is None else now
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                # Хвост серии (после недавней отправки) — копим.
+                if now - self._last_sent.get(key, 0.0) <= self.window:
+                    self._items[key] = {"payload": payload, "meta": meta,
+                                        "first": now, "n": 1}
+                    return True
+                self._last_sent[key] = now
+                return False
+            item["payload"] = _merge_payload(item["payload"], payload)
+            item["meta"] = meta
+            item["n"] += 1
+            return True
+
+    def due(self, now=None):
+        """Что пора отправить: [(key, payload, meta, n, waited_sec), ...]."""
+        now = time.time() if now is None else now
+        out = []
+        with self._lock:
+            for key, item in list(self._items.items()):
+                if (item["first"] + self.window - now) <= 0 or \
+                   (item["first"] + self.max_delay - now) <= 0:
+                    out.append((key, item["payload"], item["meta"], item["n"],
+                                now - item["first"]))
+                    self._last_sent[key] = now
+                    self._items.pop(key, None)
+        return out
+
+    def pending(self):
+        with self._lock:
+            return len(self._items)
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+            self._last_sent.clear()
+
+
+SWITCH_DEBOUNCER = SwitchDebouncer(SWITCH_DEBOUNCE_MS, SWITCH_DEBOUNCE_MAX_MS)
+
+
+def debounce_worker():
+    """v1.12.22: раз в 50 мс отправляет склеенные команды (лог — INFO)."""
+    log.info(f"[Debounce] склейка switch/light включена: окно "
+             f"{SWITCH_DEBOUNCE_MS} мс, потолок {SWITCH_DEBOUNCE_MAX_MS} мс")
+    while not STOP_EVENT.is_set():
+        for key, payload, meta, n, waited in SWITCH_DEBOUNCER.due():
+            dev, component, parts = meta
+            ms = int(waited * 1000)
+            if n >= 2:
+                log.info(f"[Debounce] {key}: склеено {n} команд -> {payload} ({ms} мс)")
+            else:
+                log.info(f"[Debounce] {key}: отложенная команда -> {payload} ({ms} мс)")
+            submit_device_command(dev, component, parts, payload)
+        STOP_EVENT.wait(0.05)
 
 
 def process_command(dev, component, parts, cmd):
@@ -1679,14 +2104,310 @@ def _cache_update(dev_name, updates):
     return changed
 
 
+# ==================== ЗАЩИТА ОТ «ЭХА» КОМАНД (v1.12.6) ====================
+# Устройство отвечает на status() ДО того, как применит команду, и присылает
+# старое значение — оно и «залипало» в HA. В коротком окне после команды побеждает
+# отправленное значение, дальше — всегда правда устройства (никаких «догадок»,
+# поэтому залипнуть надолго нечему).
+CMD_GUARD = {}
+CMD_GUARD_LOCK = threading.Lock()
+CMD_GUARD_SEC = 1.2
+# v1.12.19: окно защиты от «эха» подстраивается под РЕАЛЬНЫЙ отклик прибора
+# (команда → отчёт с нужным значением), а не под средний ICMP-пинг: локальная
+# сеть обычно 3–15 мс, но прибор может «думать» сотни мс, поэтому нужен хвост
+# (p90), а не среднее. Пока нет статистики — прежние 1.2 с.
+CMD_GUARD_MIN_SEC = 0.6        # короче — риск поймать «эхо» старого состояния
+CMD_GUARD_MAX_SEC = 3.0        # длиннее — можно проглотить реальное переключение
+CMD_GUARD_ACK_K = 1.5          # окно = p90(ack) × K
+CMD_GUARD_ACK_MIN_N = 5        # меньше проб — оставляем дефолт 1.2 с
+CMD_ACK_MAX_MS = 10000         # «отклик» длиннее 10 с — это уже не отклик
+CMD_ACK_MAXLEN = 50            # храним последние 50 проб на устройство
+CMD_ACK = {}                   # {name: [ms, ...]}  v1.12.19
+CMD_ACK_LOCK = threading.Lock()
+CMD_ACK_LAST_PUB = [0.0]       # throttle публикации retained-статистики
+CMD_ACK_LAST_PUB_LOCK = threading.Lock()
+CMD_ACK_LOG_SIG = [""]         # лог только при смене набора скорректированных окон
+
+# v1.12.29: авто-повтор команды, если прибор не подтвердил её за окно.
+# Наблюдали: люстра применила OFF только через 46 с (устройство «зависло»), при
+# этом HA и switch_2 уже показали off (оптимистичная публикация). Переотправляем
+# команду, пока не придёт отчёт с ожидаемым значением или не кончатся попытки.
+CMD_RETRY_AFTER_SEC = 2.5      # через сколько секунд без подтверждения переотправлять
+CMD_RETRY_MAX = 3              # максимум переотправок на команду
+CMD_RETRY_SWEEP_SEC = 0.5      # период проверки
+CMD_PENDING = {}               # {dev_name: {dp_str: {"v": val, "ts": t, "tries": n}}}
+CMD_PENDING_LOCK = threading.Lock()
+# v1.12.30: переотправляем только «ключевые» DP (вкл/выкл, режим), а не настройки
+# яркости/цвета/температуры — иначе на каждую подстройку Adaptive Lighting летят
+# лишние повторы и лог шумит.
+_NO_RETRY_NAMES = {"bright_value", "temp_value", "colour_data", "temp_set"}
+
+
+def _pending_mark(dev, updates):
+    name = dev["name"]
+    dps_map = dev.get("dps_map") or {}
+    now = time.time()
+    with CMD_PENDING_LOCK:
+        d = CMD_PENDING.setdefault(name, {})
+        for dp, v in updates.items():
+            info = dps_map.get(str(dp))
+            if not info:                       # неизвестный/стримовый DP — не повторяем
+                continue
+            if info.get("name") in _NO_RETRY_NAMES:
+                continue
+            d[str(dp)] = {"v": v, "ts": now, "tries": 0}
+
+
+def _pending_clear(dev_name, dp):
+    with CMD_PENDING_LOCK:
+        d = CMD_PENDING.get(dev_name)
+        if not d:
+            return
+        d.pop(str(dp), None)
+        if not d:
+            CMD_PENDING.pop(dev_name, None)
+
+
+def _val_eq(a, b):
+    """Сравнить значения DP с приведением типов (True/1/"1", 0/False/"off")."""
+    def norm(x):
+        if isinstance(x, bool):
+            return 1 if x else 0
+        if isinstance(x, (int, float)):
+            return x
+        s = str(x).strip().lower()
+        if s in ("true", "on", "yes"):
+            return 1
+        if s in ("false", "off", "no"):
+            return 0
+        try:
+            return float(s)
+        except ValueError:
+            return s
+    return norm(a) == norm(b)
+
+
+def _cmd_guard_mark(dev_name, updates):
+    now = time.time()
+    with CMD_GUARD_LOCK:
+        g = CMD_GUARD.setdefault(dev_name, {})
+        for dp, v in updates.items():
+            g[str(dp)] = {"v": v, "ts": now}
+
+
+def _percentile(vals, p):
+    """v1.12.19: перцентиль простым методом (список небольшой, ≤50)."""
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    k = int(round((p / 100.0) * (len(s) - 1)))
+    return float(s[max(0, min(len(s) - 1, k))])
+
+
+def _cmd_ack_record(dev_name, ms):
+    """v1.12.19: запомнить реальный отклик прибора на команду (мс).
+
+    Пишем только правдоподобные значения: отрицательные и «отклики» длиннее
+    CMD_ACK_MAX_MS отбрасываем (это уже не подтверждение команды, а обычный
+    отчёт прибора).
+    """
+    try:
+        ms = float(ms)
+    except (TypeError, ValueError):
+        return
+    if ms < 0 or ms > CMD_ACK_MAX_MS:
+        return
+    with CMD_ACK_LOCK:
+        lst = CMD_ACK.get(dev_name)
+        if lst is None:
+            lst = []
+            CMD_ACK[dev_name] = lst
+        lst.append(ms)
+        if len(lst) > CMD_ACK_MAXLEN:
+            del lst[0:len(lst) - CMD_ACK_MAXLEN]
+    _publish_cmd_ack_stats()
+
+
+def cmd_guard_sec(dev_name):
+    """v1.12.19: окно защиты от «эха» для конкретного устройства (сек).
+
+    Нет статистики (<5 проб) → CMD_GUARD_SEC (1.2 с). Иначе p90 отклика × 1.5,
+    зажатый в [CMD_GUARD_MIN_SEC, CMD_GUARD_MAX_SEC]. Медленному прибору окно
+    больше, шустрому — меньше (не «одно на всех»).
+    """
+    with CMD_ACK_LOCK:
+        vals = list(CMD_ACK.get(dev_name) or [])
+    if len(vals) < CMD_GUARD_ACK_MIN_N:
+        return CMD_GUARD_SEC
+    p90 = _percentile(vals, 90) / 1000.0
+    return max(CMD_GUARD_MIN_SEC, min(CMD_GUARD_MAX_SEC, p90 * CMD_GUARD_ACK_K))
+
+
+def _publish_cmd_ack_stats(force=False):
+    """v1.12.19: retained-топик tuya/bridge/cmd_ack со статистикой отклика.
+
+    WebUI показывает это в таблице задержки, а окно защиты — уже применено
+    мостом. Публикуем не чаще раза в 30 с.
+    """
+    now = time.time()
+    with CMD_ACK_LAST_PUB_LOCK:
+        if not force and (now - CMD_ACK_LAST_PUB[0]) < 30:
+            return
+        CMD_ACK_LAST_PUB[0] = now
+    with CMD_ACK_LOCK:
+        data = {k: list(v) for k, v in CMD_ACK.items()}
+    devs = {}
+    for name, vals in data.items():
+        if not vals:
+            continue
+        devs[name] = {
+            "n": len(vals),
+            "p50": int(round(_percentile(vals, 50))),
+            "p90": int(round(_percentile(vals, 90))),
+            "last": int(round(vals[-1])),
+            "guard": round(cmd_guard_sec(name), 2),
+        }
+    # лог — только когда набор скорректированных окон изменился (без спама)
+    _adj = {n: d["guard"] for n, d in devs.items()
+            if d["n"] >= CMD_GUARD_ACK_MIN_N and abs(d["guard"] - CMD_GUARD_SEC) > 0.05}
+    sig = ",".join(f"{n}={g}" for n, g in sorted(_adj.items()))
+    if sig != CMD_ACK_LOG_SIG[0]:
+        with CMD_ACK_LOCK:
+            CMD_ACK_LOG_SIG[0] = sig
+        if sig:
+            log.info(f"[CmdAck] окно защиты от «эха» подстроено: {sig}")
+        else:
+            log.info("[CmdAck] окно защиты от «эха» — по умолчанию (1.2 с)")
+    payload = json.dumps({
+        "ts": int(now),
+        "default_sec": CMD_GUARD_SEC,
+        "min_sec": CMD_GUARD_MIN_SEC,
+        "max_sec": CMD_GUARD_MAX_SEC,
+        "min_samples": CMD_GUARD_ACK_MIN_N,
+        "devices": devs,
+    }, ensure_ascii=False)
+    try:
+        mqtt_client.publish(f"{TOPIC_PREFIX}/bridge/cmd_ack", payload,
+                            qos=1, retain=True)
+    except Exception as e:
+        log.debug(f"[CmdAck] publish: {e}")
+
+
+def _cmd_guard_filter(dev_name, dps):
+    """В окне после команды отбросить отчёты, противоречащие отправленному значению.
+
+    v1.12.19: окно — персональное (cmd_guard_sec), а совпавшее значение
+    заодно даёт замер реального отклика «команда → отчёт».
+    """
+    if not dps:
+        return dps
+    now = time.time()
+    guard = cmd_guard_sec(dev_name)
+    acks = []
+    with CMD_GUARD_LOCK:
+        g = CMD_GUARD.get(dev_name)
+        if not g:
+            return dps
+        out = {}
+        for dp, v in dps.items():
+            rec = g.get(str(dp))
+            if rec:
+                if (now - rec["ts"]) < guard:
+                    if not _val_eq(v, rec["v"]):
+                        continue                    # старое значение — не публикуем
+                    # значение совпало → это реальный отклик прибора
+                    acks.append((now - rec["ts"]) * 1000.0)
+                    _pending_clear(dev_name, dp)    # v1.12.29: подтверждено
+                else:
+                    _pending_clear(dev_name, dp)    # v1.12.29: окно вышло — правда прибора
+                g.pop(str(dp), None)            # окно вышло или значение совпало
+            out[dp] = v
+        if not g:
+            CMD_GUARD.pop(dev_name, None)
+    for ms in acks:
+        _cmd_ack_record(dev_name, ms)
+    return out
+
+
 def optimistic_update_many(dev, updates: dict):
     if not updates:
         return
     _cache_update(dev["name"], updates)
+    # v1.12.3: публикуем состояние в MQTT СРАЗУ после команды, а не ждём
+    # следующего status(). После команды Tuya часто отдаёт 914/905 на status()
+    # (устройство занято), и тогда HA видел старое состояние до следующего
+    # успешного опроса (до POLL_INTERVAL = 15 с).
+    # v1.12.7: guard помечаем ДО публикации — иначе отчёт устройства, пришедший
+    # между publish и mark, не фильтруется и перезаписывает свежее значение старым.
+    _cmd_guard_mark(dev["name"], updates)
+    _pending_mark(dev, updates)   # v1.12.29: ждём подтверждения прибора
+    try:
+        publish_state(dev, {str(k): v for k, v in updates.items()})
+    except Exception as e:
+        log.warning(f"[Set] {dev['name']}: публикация состояния: {e}")
 
 
 def optimistic_update(dev, dp, value):
     optimistic_update_many(dev, {str(dp): value})
+
+
+def _retry_send(dev_name, dp, v, attempt):
+    """v1.12.29/31: переотправить команду прибору (не дожидаясь лока)."""
+    with DEVICES_LOCK:
+        dev = DEVICE_INDEX.get(dev_name)
+    if not dev:
+        return False
+    lock = get_device_cmd_lock(dev_name)
+    if not lock.acquire(timeout=0.2):
+        return False          # прибор занят командой — попробуем на след. проходе
+    try:
+        with DEVICES_LOCK:
+            if dev_name not in DEVICE_INDEX:
+                return False
+        try:
+            tuya = get_device_conn(dev)
+            dp_i = int(dp) if str(dp).lstrip("-").isdigit() else dp
+            tuya.set_value(dp_i, v)
+            return True
+        except Exception as e:
+            log.debug(f"[Retry] {dev_name} dp={dp}: повтор #{attempt} не удался: {e}")
+            drop_device_conn(dev_name)
+            return False
+    finally:
+        lock.release()
+
+
+def cmd_retry_worker():
+    """v1.12.29: переотправка команд, которые прибор не подтвердил."""
+    while not STOP_EVENT.is_set():
+        STOP_EVENT.wait(CMD_RETRY_SWEEP_SEC)
+        if STOP_EVENT.is_set():
+            break
+        now = time.time()
+        due = []
+        with CMD_PENDING_LOCK:
+            for dev_name, dps in list(CMD_PENDING.items()):
+                for dp, rec in list(dps.items()):
+                    age = now - rec["ts"]
+                    if rec["tries"] < CMD_RETRY_MAX and age >= CMD_RETRY_AFTER_SEC:
+                        rec["tries"] += 1
+                        rec["ts"] = now
+                        due.append((dev_name, dp, rec["v"], rec["tries"]))
+                    elif rec["tries"] >= CMD_RETRY_MAX and age >= CMD_RETRY_AFTER_SEC * 3:
+                        dps.pop(dp, None)          # сдались — дальше правда прибора
+                if not dps:
+                    CMD_PENDING.pop(dev_name, None)
+        for dev_name, dp, v, tries in due:
+            # v1.12.30: первый повтор — INFO, дальше DEBUG (меньше шума в логе).
+            msg = f"[Retry] {dev_name} dp={dp}: прибор не подтвердил, повтор #{tries}"
+            if tries == 1:
+                log.info(msg)
+            else:
+                log.debug(msg)
+            try:
+                get_device_retry_exec(dev_name).submit(_retry_send, dev_name, dp, v, tries)
+            except Exception as e:
+                log.debug(f"[Retry] submit: {e}")
 
 
 # ==================== ДЕБАУНС ====================
@@ -1699,12 +2420,21 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
         window_ms = DEBOUNCE_BY_TYPE.get(dp_type, 0) if dp_type else 0
 
     if window_ms <= 0:
+        # v1.12.24: публикуем состояние (optimistic) ДО блокирующей команды.
+        # Было set_value -> optimistic_update: HA видел переключение лишь спустя
+        # время отклика прибора, и при медленном/зависшем устройстве это 5-12 с
+        # (наблюдали lyustra_kabinet, vykliuchatel_kabinet). Автоматизации,
+        # читающие состояние, работали по устаревшим данным ("switch_2 не
+        # синхронизировался"). optimistic_update сам метит окно защиты от «эха»
+        # ДО публикации (v1.12.7), порядок mark->publish сохранён; при ошибке
+        # правду прибора вернёт request_status.
+        optimistic_update(dev, dp, value)
         try:
             tuya.set_value(dp, value)
-            optimistic_update(dev, dp, value)
         except Exception as e:
             log.warning(f"[Set] {dev['name']} dp={dp}: {e}")
             drop_device_conn(dev["name"])
+            request_status(dev["name"])
             return
         request_status(dev["name"])
         return
@@ -1735,8 +2465,9 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
                 wait_device_rate_limit(dev_name, component)
                 try:
                     d = get_device_conn(dev)
-                    d.set_value(dp, value)
+                    # v1.12.26: публикуем ДО блокирующей команды (см. debounced_set)
                     optimistic_update(dev, dp, value)
+                    d.set_value(dp, value)
                 except Exception as e:
                     log.warning(f"[Debounce] {dev_name} dp={dp}: {e}")
                     drop_device_conn(dev_name)
@@ -1928,13 +2659,16 @@ def state_cache_worker():
 
 
 # ==================== КОМАНДЫ ====================
-def handle_light_command(tuya, dev, cmd):
-    if not isinstance(cmd, dict):
-        return
+def light_cache(dev, cmd):
+    """v1.12.27: маппинг HA-команды света в DP Tuya (payload/cache/dp_types).
 
+    Вынесено из handle_light_command, чтобы публиковать состояние ДО device-лока
+    (см. optimistic_prepublish)."""
     payload = {}
     cache = {}
     dp_types = {}
+    if not isinstance(cmd, dict):
+        return payload, cache, dp_types
 
     dp_state, _ = find_dp_by_name(dev, "switch_led")
     if dp_state is not None and "state" in cmd:
@@ -1959,7 +2693,14 @@ def handle_light_command(tuya, dev, cmd):
             kelvin = float(kelvin)
         except (TypeError, ValueError):
             kelvin = kmin
-        val = max(0, min(1000, int((kelvin - kmin) * 1000 / (kmax - kmin))))
+        if kmax <= kmin:
+            # v1.12.7: битые границы (kelvin_min >= kelvin_max) — иначе деление
+            # на ноль ломало команду и рвало соединение с устройством.
+            log.warning(f"[Tuya] {dev['name']}: kelvin_min >= kelvin_max "
+                        f"({kmin}/{kmax}) — беру середину диапазона")
+            val = 500
+        else:
+            val = max(0, min(1000, int((kelvin - kmin) * 1000 / (kmax - kmin))))
         payload[int(dp_temp)] = val
         cache[dp_temp] = val
         dp_types[int(dp_temp)] = "temp_value"
@@ -1976,6 +2717,12 @@ def handle_light_command(tuya, dev, cmd):
         cache[dp_color] = hex_val
         dp_types[int(dp_color)] = "colour_data"
 
+    return payload, cache, dp_types
+
+
+def handle_light_command(tuya, dev, cmd):
+    payload, cache, dp_types = light_cache(dev, cmd)
+
     if not payload:
         return
 
@@ -1984,25 +2731,27 @@ def handle_light_command(tuya, dev, cmd):
         debounced_set(tuya, dev, dp, val, dp_type=dp_types.get(dp), component="light")
         return
 
+    # v1.12.26: публикуем состояние ДО блокирующей команды (как в debounced_set).
+    # Иначе на multi-DP (state + brightness + color_temp) HA ждал реального отчёта
+    # устройства — наблюдали 24 с на включение люстры с яркостью/цветом.
+    optimistic_update_many(dev, cache)
     try:
         tuya.set_multiple_values(payload)
-        optimistic_update_many(dev, cache)
     except Exception as e:
         log.warning(f"[Light] set_multiple_values failed: {e}; fallback")
-        success_cache = {}
         for dp, v in payload.items():
             try:
                 tuya.set_value(dp, v)
-                success_cache[dp] = v
             except Exception as ee:
                 log.warning(f"[Light] set_value({dp}) failed: {ee}")
-        if success_cache:
-            optimistic_update_many(dev, success_cache)
 
 
-def handle_switch_command(tuya, dev, topic_parts, cmd):
+def switch_dp_val(dev, topic_parts, cmd):
+    """v1.12.27: маппинг HA-команды switch в (DP, значение) Tuya.
+
+    Вынесено из handle_switch_command — для публикации до device-лока."""
     if len(topic_parts) < 5:
-        return
+        return None, None
     entity_name = topic_parts[3]
 
     if isinstance(cmd, str):
@@ -2012,14 +2761,40 @@ def handle_switch_command(tuya, dev, topic_parts, cmd):
     elif isinstance(cmd, dict) and "state" in cmd:
         val = str(cmd["state"]).upper() in ("ON", "1", "TRUE")
     else:
-        return
+        return None, None
 
     for dp_str, info in dev["dps_map"].items():
         if info.get("component") == "switch" and info.get("name") == entity_name:
             dp = dp_int(dp_str)
             if dp is None:
-                return
-            debounced_set(tuya, dev, dp, val, window_ms=0, component="switch")
+                return None, None
+            return dp, val
+    return None, None
+
+
+def handle_switch_command(tuya, dev, topic_parts, cmd):
+    dp, val = switch_dp_val(dev, topic_parts, cmd)
+    if dp is None:
+        return
+    debounced_set(tuya, dev, dp, val, window_ms=0, component="switch")
+
+
+def optimistic_prepublish(dev, component, parts, cmd):
+    """v1.12.27: optimistic-публикация состояния ДО очереди и device-лока.
+
+    Раньше publish шёл уже под per-device lock: если предыдущая команда к Tuya
+    «зависла» (905/долгий ack), следующая команда ждала лок и НЕ публиковала
+    состояние — HA показывал старое (наблюдали разово ~19 с). Теперь состояние
+    уходит в MQTT сразу, а отправка в Tuya идёт по очереди.
+    """
+    if component == "light":
+        _payload, cache, _dt = light_cache(dev, cmd)
+        if cache:
+            optimistic_update_many(dev, cache)
+    elif component == "switch":
+        dp, val = switch_dp_val(dev, parts, cmd)
+        if dp is not None:
+            optimistic_update(dev, dp, val)
             return
 
 
@@ -2241,7 +3016,69 @@ def cleanup_discovery():
     STOP_EVENT.wait(DISCOVERY_CLEANUP_WAIT)
 
 
-def _handle_cleanup_command():
+# ==================== ORPHAN CLEANUP (v1.12.2) ====================
+# «Зависшие» retained-топики: наши сущности, которых больше нет в конфиге
+# (удалили DP, устройство, переименовали) — HA держит их как фантомы.
+# В отличие от полной очистки, живые топики не трогаем: HA ничего не теряет.
+ORPHAN_MODE = {"active": False, "topics": []}
+
+
+def _expected_discovery_topics():
+    """Топики, которые bridge должен иметь сейчас по конфигу.
+
+    v1.12.7: идём по ALL_DEVICES, а не DEVICES — retained-конфиги выключенных
+    (enabled:false) иначе не попадают в «ожидаемые» и cleanup_orphans удаляет
+    их, хотя soft-disable обязан их сохранять (v1.8.6/v1.10.15).
+    """
+    out = set()
+    with DEVICES_LOCK:
+        devs = list(ALL_DEVICES)
+    for d in devs:
+        try:
+            out |= set(_discovery_topics_for_device(d))
+        except Exception as e:
+            log.debug(f"[Orphan] {d.get('name')}: {e}")
+    return out
+
+
+def _handle_cleanup_orphans(payload_str=""):
+    req_id = _extract_request_id(payload_str)
+    expected = _expected_discovery_topics()
+    log.info(f"[Orphan] Слушаем retained Discovery (ожидаем {len(expected)} топиков)...")
+    ORPHAN_MODE["active"] = True
+    ORPHAN_MODE["topics"] = []
+    try:
+        for _ in range(50):
+            if STOP_EVENT.is_set():
+                break
+            time.sleep(0.1)
+    finally:
+        ORPHAN_MODE["active"] = False
+    seen = list(ORPHAN_MODE["topics"])
+    ORPHAN_MODE["topics"] = []
+
+    removed = 0
+    kept = 0
+    for t in seen:
+        if t in expected:
+            kept += 1
+            continue
+        try:
+            mqtt_client.publish(t, payload=None, qos=1, retain=True)
+            removed += 1
+            log.info(f"[Orphan] удалён: {t}")
+        except Exception as e:
+            log.warning(f"[Orphan] {t}: {e}")
+    log.info(f"[Orphan] Готово: просмотрено {len(seen)}, удалено {removed}, "
+             f"живых {kept}, ожидалось {len(expected)}")
+    _publish_config_result("cleanup_orphans", req_id, True,
+                           extra={"removed": removed, "kept": kept,
+                                  "seen": len(seen), "expected": len(expected)})
+
+
+def _handle_cleanup_command(payload_str=""):
+    # v1.12.1: отчитываемся о результате — WebUI показывает «успех/ошибка», а не «отправлено».
+    req_id = _extract_request_id(payload_str)
     log.info("[Cleanup] Запуск по команде из MQTT...")
     CLEANUP_MODE["active"] = True
     CLEANUP_MODE["count"] = 0
@@ -2253,8 +3090,11 @@ def _handle_cleanup_command():
     removed = CLEANUP_MODE["count"]
 
     republished = 0
+    # v1.12.7: републикуем и выключенные — их retained мы только что удалили
+    # (удаление идёт по OUR_IDS, а он собран из ALL_DEVICES), иначе Discovery
+    # отключённых устройств терялся до повторного включения.
     with DEVICES_LOCK:
-        devs_snapshot = list(DEVICES)
+        devs_snapshot = list(ALL_DEVICES)
     for dev in devs_snapshot:
         try:
             publish_discovery(dev)
@@ -2264,6 +3104,8 @@ def _handle_cleanup_command():
         time.sleep(0.05)
 
     log.info(f"[Cleanup] Готово: removed={removed}, republished={republished}")
+    _publish_config_result("cleanup", req_id, True,
+                           extra={"removed": removed, "republished": republished})
 
 
 
@@ -2404,11 +3246,15 @@ def _ensure_worker_running(dev, reason=""):
     with DEVICES_LOCK:
         if name not in DEVICE_INDEX:
             return False
-    if _worker_alive(name):
-        return False
-    target = run_battery_listener if dev.get("battery_powered") else run_polling_device
-    t = threading.Thread(target=target, args=(dev,), daemon=True, name=f"worker-{name}")
-    t.start()
+    # v1.12.12: проверка «жив ли воркер» и старт — под одним локом, иначе два
+    # вызывающих (reconcile и отложенный retry / edit_config) могли поднять
+    # два воркера на одно устройство, а это два TCP (правило №1).
+    with WORKER_START_LOCK:
+        if _worker_alive(name):
+            return False
+        target = run_battery_listener if dev.get("battery_powered") else run_polling_device
+        t = threading.Thread(target=target, args=(dev,), daemon=True, name=f"worker-{name}")
+        t.start()
     if reason:
         log.info(f"[Worker] {name}: запущен ({reason})")
     return True
@@ -2450,11 +3296,16 @@ def _handle_edit_config(payload_str):
         return
 
     # v1.8.5: dps_map добавлен в разрешённые поля.
-    ALLOWED_FIELDS = {"ip", "local_key", "version", "dps_map", "enabled",
+    # v1.10.21: type добавлен — платформа HA (light/switch/climate/...) должна
+    # исправляться из UI, а не только правкой файла с рестартом.
+    # v1.11.0: expire_after = null означает «удалить поле» (вернуться к дефолту).
+    ALLOWED_FIELDS = {"ip", "local_key", "version", "type", "dps_map", "enabled",
                       "battery_powered", "expire_after"}
     filtered = {k: v for k, v in changes.items() if k in ALLOWED_FIELDS}
+    _expire_delete = ("expire_after" in changes
+                      and changes["expire_after"] is None)
 
-    if not filtered:
+    if not filtered and not _expire_delete:
         _publish_edit_result(dev_name, False, "no allowed fields",
                              request_id=request_id)
         return
@@ -2536,23 +3387,60 @@ def _handle_edit_config(payload_str):
             return
 
     # --- Валидация expire_after (v1.10.3) ---
+    # v1.11.0: expire_after = None → удалить поле из конфига (см. _expire_delete).
     if "expire_after" in filtered:
         v_exp = filtered["expire_after"]
-        if isinstance(v_exp, bool) or not isinstance(v_exp, int):
-            _publish_edit_result(dev_name, False,
-                                 f"invalid expire_after (must be int): {v_exp!r}",
-                                 request_id=request_id)
-            return
-        if v_exp <= 0:
-            _publish_edit_result(dev_name, False,
-                                 f"invalid expire_after (must be > 0): {v_exp}",
-                                 request_id=request_id)
-            return
+        if v_exp is None:
+            filtered.pop("expire_after")
+            _expire_delete = True
+        else:
+            if isinstance(v_exp, bool) or not isinstance(v_exp, int):
+                _publish_edit_result(dev_name, False,
+                                     f"invalid expire_after (must be int): {v_exp!r}",
+                                     request_id=request_id)
+                return
+            if v_exp <= 0:
+                _publish_edit_result(dev_name, False,
+                                     f"invalid expire_after (must be > 0): {v_exp}",
+                                     request_id=request_id)
+                return
 
     # --- Валидация dps_map ---
     warnings = []
+
+    # --- Валидация type (v1.10.21) ---
+    _new_type = filtered.get("type")
+    if _new_type is not None:
+        if not _is_valid_type(_new_type):
+            _publish_edit_result(
+                dev_name, False,
+                f"invalid type: {_new_type!r} (allowed: {', '.join(ALLOWED_TYPES)})",
+                request_id=request_id,
+            )
+            return
+        filtered["type"] = str(_new_type).strip()
+        _new_type = filtered["type"]
+
+    # Смена type без dps_map — проверяем, что текущая карта подходит новому типу
+    # (например, type=light требует имена DP из LIGHT_DP_NAMES).
+    _type_changed = (_new_type is not None
+                     and _new_type != dev.get("type", "sensor"))
+    if _type_changed and "dps_map" not in filtered:
+        ok_t, err_t, warn_t = _validate_dps_map(_new_type, dev.get("dps_map", {}))
+        if not ok_t:
+            _publish_edit_result(
+                dev_name, False,
+                f"type={_new_type}: dps_map не подходит ({err_t}). "
+                f"Сначала исправьте DP-карту, потом меняйте тип.",
+                request_id=request_id,
+            )
+            return
+        warnings.extend(warn_t)
+
     if "dps_map" in filtered:
-        dev_type = dev.get("type", "sensor")
+        # v1.10.21: если в том же запросе меняется type — валидируем карту
+        # по НОВОМУ типу (иначе смена прошла бы и сломала Discovery).
+        dev_type = _new_type or dev.get("type", "sensor")
         ok_dps, err_dps, warn_dps = _validate_dps_map(dev_type, filtered["dps_map"])
         if not ok_dps:
             _publish_edit_result(dev_name, False, f"invalid dps_map: {err_dps}",
@@ -2579,6 +3467,10 @@ def _handle_edit_config(payload_str):
             _in_pool_validate = dev_name in DEVICE_INDEX
         if _in_pool_validate:
             drop_device_conn(dev_name)
+            # v1.12.16: сначала просим НАСТОЯЩИЙ останов — иначе воркер делал лишь
+            # реконнект, `_wait_worker_exit` всегда истекал и TCP-валидация ip/key/version
+            # фактически не выполнялась (в лог уходило «пропущена»).
+            request_worker_stop(dev_name)
             request_worker_restart(dev_name)
             _worker_stopped_for_validate = _wait_worker_exit(dev_name, timeout=3.0)
             if not _worker_stopped_for_validate:
@@ -2604,7 +3496,7 @@ def _handle_edit_config(payload_str):
 
     # --- Чтение config ---
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             all_devices = json.load(f)
     except Exception as e:
         _publish_edit_result(dev_name, False, f"read config failed: {e}",
@@ -2622,6 +3514,8 @@ def _handle_edit_config(payload_str):
     for d in all_devices:
         if d.get("name") == dev_name:
             d.update(filtered)
+            if _expire_delete:
+                d.pop("expire_after", None)   # v1.11.0: вернуть дефолт bridge
             found = True
             break
 
@@ -2637,11 +3531,24 @@ def _handle_edit_config(payload_str):
                              request_id=request_id)
         return
 
-    log.info(f"[EditConfig] {dev_name}: конфиг обновлён ({list(filtered.keys())})")
+    log.info(f"[EditConfig] {dev_name}: конфиг обновлён "
+             f"({list(filtered.keys())}{' + expire_after удалён' if _expire_delete else ''})")
+
+    # v1.10.21: смена type — сначала снимаем старые Discovery/state-топики
+    # по СТАРОМУ типу (dev ещё не обновлён), новые публикуем ниже.
+    if _type_changed:
+        try:
+            _remove_discovery_for_device(dev)
+            log.info(f"[EditConfig] {dev_name}: type {dev.get('type', '?')}→"
+                     f"{_new_type} — старые сущности сняты")
+        except Exception as e:
+            log.warning(f"[EditConfig] {dev_name}: снятие старого Discovery: {e}")
 
     # --- Обновление in-memory ---
     with DEVICES_LOCK:
         dev.update(filtered)
+        if _expire_delete:
+            dev.pop("expire_after", None)
         # v1.8.6: синхронизируем ALL_DEVICES тем же полем enabled,
         # чтобы in-memory состояние не расходилось с файлом.
         # (ALL_DEVICES — снимок файла на старте; если поменяем только
@@ -2668,6 +3575,7 @@ def _handle_edit_config(payload_str):
             log.info(f"[EditConfig] {dev_name}: disable (soft={not ENABLED_FALSE_REMOVES_DISCOVERY})")
             with DEVICES_LOCK:
                 _d = DEVICE_INDEX.pop(dev_name, None)
+                drop_device_exec(dev_name)
                 if _d is not None:
                     try:
                         DEVICES.remove(_d)
@@ -2747,6 +3655,23 @@ def _handle_edit_config(payload_str):
             # или уже не работает корректно.
             log.debug(f"[EditConfig] {dev_name}: enabled={_new_enabled}, in_pool={_in_pool} — no change")
 
+    # --- Публикация Discovery при смене type (v1.10.21) ---
+    if _type_changed:
+        with DEVICES_LOCK:
+            _in_pool_type = dev_name in DEVICE_INDEX
+        if _in_pool_type:
+            try:
+                publish_discovery(dev)
+                log.info(f"[EditConfig] {dev_name}: type={_new_type} — "
+                         f"Discovery опубликован")
+            except Exception as e:
+                log.warning(f"[EditConfig] {dev_name}: publish_discovery "
+                            f"после смены type: {e}")
+            refresh_our_ids()
+        else:
+            log.info(f"[EditConfig] {dev_name}: type={_new_type}, устройство "
+                     f"отключено — Discovery не публикуем")
+
     # --- Переключение воркера при смене battery_powered (v1.9.14) ---
     if "battery_powered" in filtered:
         _new_battery = filtered["battery_powered"]   # v1.10.3: валидировано как bool
@@ -2787,6 +3712,22 @@ def _handle_edit_config(payload_str):
         _skip_final_restart = True
     else:
         _skip_final_restart = False
+
+    # --- Перепубликация Discovery при смене expire_after (v1.11.0) ---
+    # expire_after входит в Discovery-конфиг батарейных: без перепубликации
+    # HA продолжит жить со старым значением (и после удаления поля — тоже).
+    if "expire_after" in changes and dev.get("battery_powered"):
+        with DEVICES_LOCK:
+            _in_pool_exp = dev_name in DEVICE_INDEX
+        if _in_pool_exp:
+            try:
+                publish_discovery(dev)
+                log.info(f"[EditConfig] {dev_name}: expire_after="
+                         f"{dev.get('expire_after', 'по умолчанию')} — "
+                         f"Discovery перепубликован")
+            except Exception as e:
+                log.warning(f"[EditConfig] {dev_name}: publish_discovery "
+                            f"после смены expire_after: {e}")
 
     # --- Discovery diff (v1.8.5) ---
     if "dps_map" in filtered:
@@ -2901,6 +3842,9 @@ def _handle_edit_config(payload_str):
     if _worker_stopped_for_validate:
         _ensure_worker_running(dev, "после edit_config (validate)")
 
+    if _expire_delete:
+        filtered = dict(filtered)
+        filtered["expire_after"] = None    # сообщаем WebUI, что поле удалено
     _publish_edit_result(dev_name, True, None, changes=filtered,
                          request_id=request_id, warnings=warnings)
 
@@ -2932,20 +3876,21 @@ def _handle_delete_device(payload_str):
     req_id = _extract_request_id(payload_str)
 
     if not ALLOW_CONFIG_EDIT:
-        _publish_delete_result(None, False, "config edit disabled",
-                               request_id=req_id)
+        # v1.12.20: у хелпера request_id — ПЕРВЫЙ параметр. Раньше здесь был
+        # лишний позиционный None + request_id=… → TypeError «multiple values
+        # for argument 'request_id'», и на ветках ошибок ответ вообще не
+        # публиковался (WebUI ловил timeout вместо понятного текста).
+        _publish_delete_result(req_id, False, "config edit disabled")
         return
 
     try:
         data = json.loads(payload_str)
     except (json.JSONDecodeError, ValueError):
-        _publish_delete_result(None, False, "invalid json",
-                               request_id=req_id)
+        _publish_delete_result(req_id, False, "invalid json")
         return
 
     if not isinstance(data, dict):
-        _publish_delete_result(None, False, "payload must be json object",
-                               request_id=req_id)
+        _publish_delete_result(req_id, False, "payload must be json object")
         return
     request_id = data.get("request_id") or req_id
     dev_name = data.get("device")
@@ -2953,12 +3898,11 @@ def _handle_delete_device(payload_str):
     # v1.10.10: dev_name должен быть str — иначе DEVICE_INDEX.pop() / .get()
     # бросает TypeError (unhashable list/dict). Строгая проверка.
     if not dev_name or not isinstance(dev_name, str):
-        _publish_delete_result(None, False, "device required (string)",
-                               request_id=request_id)
+        _publish_delete_result(request_id, False, "device required (string)")
         return
 
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             all_devices = json.load(f)
     except Exception as e:
         # v1.8.4: req_id, а не None — WebUI сматчит ответ и не словит timeout.
@@ -2978,7 +3922,6 @@ def _handle_delete_device(payload_str):
         _publish_delete_result(request_id, False, "device not found")
         return
 
-    before = len(all_devices)
     all_devices = [d for d in all_devices if d.get("name") != dev_name]
 
     _backup_config()
@@ -2990,6 +3933,7 @@ def _handle_delete_device(payload_str):
     # In-memory cleanup: DEVICE_INDEX / DEVICES (независимо от cleanup).
     with DEVICES_LOCK:
         DEVICE_INDEX.pop(dev_name, None)
+        drop_device_exec(dev_name)
         # v1.10.15: удаляем по имени, а не по равенству dict. publish_discovery
         # мутирует in-memory dict (friendly_name/name), поэтому dev_to_remove
         # (из файла) уже не равен ему — remove() падал, призрак оставался.
@@ -3139,19 +4083,17 @@ def _handle_import_devices(payload_str):
     req_id = _extract_request_id(payload_str)
 
     if not ALLOW_CONFIG_EDIT:
-        _publish_import_result(None, False, "config edit disabled",
-                               request_id=req_id)
+        # v1.12.20: см. _handle_delete_device — request_id идёт ПЕРВЫМ.
+        _publish_import_result(req_id, False, "config edit disabled")
         return
 
     try:
         data = json.loads(payload_str)
     except (json.JSONDecodeError, ValueError):
-        _publish_import_result(None, False, "invalid json",
-                               request_id=req_id)
+        _publish_import_result(req_id, False, "invalid json")
         return
     if not isinstance(data, dict):
-        _publish_import_result(None, False, "payload must be json object",
-                               request_id=req_id)
+        _publish_import_result(req_id, False, "payload must be json object")
         return
 
     request_id = data.get("request_id") or req_id
@@ -3163,7 +4105,7 @@ def _handle_import_devices(payload_str):
         return
 
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             all_devices = json.load(f)
     except Exception as e:
         # v1.8.4: req_id, а не None.
@@ -3267,6 +4209,11 @@ def _handle_import_devices(payload_str):
         # publish_discovery в main() (AttributeError: 'str' object
         # has no attribute 'get').
         _import_dps_map = dev.get("dps_map", {})
+        if not isinstance(_import_dps_map, dict):
+            # v1.12.14: битый dps_map не должен валить поток импорта (результат не
+            # публиковался, WebUI получал таймаут) — считаем такое устройство
+            # «без DP» и идём дальше.
+            _import_dps_map = {}
         _validate_dps = data.get("validate_dps_map", True)
         if _import_dps_map:
             if _validate_dps:
@@ -3304,6 +4251,15 @@ def _handle_import_devices(payload_str):
 
         if name in existing_names:
             if overwrite:
+                # v1.12.7: id не должен совпадать с ДРУГИМ устройством — иначе
+                # в конфиге окажутся два устройства с одним и тем же id.
+                _id_conflict = [d.get("name") for d in all_devices
+                                if d.get("name") != name and d.get("id") == dev_id]
+                if _id_conflict:
+                    errors.append(f"{name}: id {dev_id} уже у устройства "
+                                  f"{_id_conflict[0]}")
+                    skipped += 1
+                    continue
                 for i, d in enumerate(all_devices):
                     if d.get("name") == name:
                         # v1.10.3: обновляем existing_ids/existing_ips —
@@ -3397,6 +4353,7 @@ def _handle_import_devices(payload_str):
             if not _new_enabled:
                 with DEVICES_LOCK:
                     DEVICE_INDEX.pop(name, None)
+                    drop_device_exec(name)
                     DEVICES[:] = [d for d in DEVICES if d.get("name") != name]
                 drop_device_conn(name)
                 request_worker_restart(name)
@@ -3536,7 +4493,7 @@ def _reload_all_devices():
     при попытке включить отключённое.
     """
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             fresh = json.load(f)
         with DEVICES_LOCK:
             ALL_DEVICES.clear()
@@ -3567,6 +4524,611 @@ def _write_config_atomic(all_devices):
     except Exception as e:
         log.error(f"[Config] Запись не удалась: {e}")
         return False
+
+
+# ==================== CONFIG REPORT / NORMALIZE (v1.11.0) ====================
+# Белый список: что bridge реально читает из конфига. Всё остальное — мусор
+# (его показывает «Проверить конфиг» и убирает «Нормализовать конфиг»).
+
+DEVICE_FIELDS_KEEP = (
+    "id", "name", "friendly_name", "ip", "local_key", "version", "type",
+    "model", "battery_powered", "enabled", "dps_map", "expire_after",
+    # climate
+    "presets", "preset_map", "min_temp", "max_temp", "temp_step",
+    # сохраняются для WebUI (пересборка tinytuya_devices.json, матчинг DP)
+    "product_id", "category", "product_name",
+)
+
+# DP-поля: что bridge читает у конкретного компонента + то, что нужно UI
+# (code/type/values), плюс любые "_"-маркеры источника — их не трогаем.
+_DP_FIELDS_COMMON = ("component", "name", "code", "type", "values")
+DP_FIELDS_KEEP = {
+    "switch": (),
+    "sensor": ("scale", "unit", "device_class", "state_class"),
+    "binary_sensor": ("device_class",),
+    "select": ("options", "map"),
+    "number": ("min", "max", "step", "scale", "unit"),
+    "light": ("min", "max", "kelvin_min", "kelvin_max"),
+    "cover": ("device_class",),
+    "fan": ("options", "min", "max"),
+    "lock": ("inverted",),
+    "phase_a": (),
+    "preset": (),
+}
+
+
+def _dp_keep_fields(dev_type, info):
+    """Какие поля DP-записи нельзя удалять у этого компонента.
+
+    None — компонент неизвестен, запись не трогаем (безопаснее).
+    """
+    comp = info.get("component")
+    if not comp:
+        # у light в dp-записи component может не быть (имена из LIGHT_DP_NAMES)
+        comp = "light" if dev_type == "light" else None
+    if not comp:
+        return None
+    keep = DP_FIELDS_KEEP.get(comp)
+    if keep is None:
+        return None
+    return set(keep) | set(_DP_FIELDS_COMMON)
+
+
+def _dp_extra_fields(dev_type, info):
+    """Поля DP-записи, которые bridge не читает и UI не использует."""
+    keep = _dp_keep_fields(dev_type, info)
+    if keep is None:
+        return []
+    return [k for k in info.keys() if k not in keep and not k.startswith("_")]
+
+
+def _config_report_build(devices):
+    """Собрать отчёт: что в конфиге bridge использует, а что игнорирует."""
+    report = []
+    dp_total = 0
+    device_extra_total = 0
+    dp_extra_total = 0
+    battery = 0
+    battery_without_expire = 0
+
+    for d in devices:
+        if not isinstance(d, dict):
+            continue
+        dev_type = d.get("type", "sensor")
+        device_extra = [k for k in d.keys() if k not in DEVICE_FIELDS_KEEP]
+        # expire_after применяется только к батарейным
+        if (not d.get("battery_powered") and "expire_after" in d
+                and "expire_after" not in device_extra):
+            device_extra.append("expire_after")
+
+        dp_extra = {}
+        dps_map = d.get("dps_map") or {}
+        dp_total += len(dps_map)
+        for dp, info in dps_map.items():
+            if not isinstance(info, dict):
+                continue
+            extra = _dp_extra_fields(dev_type, info)
+            if extra:
+                dp_extra[str(dp)] = extra
+                dp_extra_total += len(extra)
+
+        if d.get("battery_powered"):
+            battery += 1
+            if "expire_after" not in d:
+                battery_without_expire += 1
+
+        device_extra_total += len(device_extra)
+        report.append({
+            "name": d.get("name"),
+            "friendly_name": d.get("friendly_name"),
+            "type": dev_type,
+            "enabled": bool(d.get("enabled", True)),
+            "battery_powered": bool(d.get("battery_powered")),
+            "expire_after": d.get("expire_after"),
+            "device_extra": device_extra,
+            "dp_extra": dp_extra,
+        })
+
+    summary = {
+        "devices": len(report),
+        "dp_total": dp_total,
+        "device_extra": device_extra_total,
+        "dp_extra": dp_extra_total,
+        "extra_total": device_extra_total + dp_extra_total,
+        "battery": battery,
+        "battery_without_expire": battery_without_expire,
+    }
+    return {"summary": summary, "devices": report}
+
+
+def _config_normalize_inplace(all_devices):
+    """Убрать из конфига всё вне белого списка. Возвращает число удалённых полей."""
+    removed = 0
+    for d in all_devices:
+        if not isinstance(d, dict):
+            continue
+        for k in list(d.keys()):
+            if k not in DEVICE_FIELDS_KEEP:
+                d.pop(k, None)
+                removed += 1
+        # expire_after у проводных bridge не читает — мусор
+        if not d.get("battery_powered") and d.pop("expire_after", None) is not None:
+            removed += 1
+        dev_type = d.get("type", "sensor")
+        for _dp, info in (d.get("dps_map") or {}).items():
+            if not isinstance(info, dict):
+                continue
+            for k in _dp_extra_fields(dev_type, info):
+                info.pop(k, None)
+                removed += 1
+    return removed
+
+
+def _config_fix_format_inplace(all_devices):
+    """v1.12.18: починить типы и формат полей конфига (валидация + исправление).
+
+    Возвращает {вид_исправления: сколько}. Белый список НЕ трогает — только
+    приводит значения к каноническому виду:
+      * enabled / battery_powered → bool (в т.ч. из строк "true"/"0"/"да");
+      * id / version: число → строка; строковые поля — без пробелов по краям;
+      * expire_after — только положительное целое, у проводных удаляется;
+      * dps_map — словарь; ключи DP → строки; записи-не-словари и записи без
+        name/code удаляются.
+    """
+    fixes = {}
+
+    def bump(k):
+        fixes[k] = fixes.get(k, 0) + 1
+
+    def as_bool(v, default):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("true", "1", "yes", "on", "да"):
+                return True
+            if s in ("false", "0", "no", "off", "нет", ""):
+                return False
+        return default
+
+    _STR_FIELDS = ("id", "name", "friendly_name", "ip", "local_key", "version",
+                   "type", "model", "category", "product_id", "product_name")
+
+    for d in all_devices:
+        if not isinstance(d, dict):
+            continue
+        for key in ("enabled", "battery_powered"):
+            if key in d and not isinstance(d[key], bool):
+                d[key] = as_bool(d[key], key == "enabled")
+                bump(key)
+        for key in ("id", "version"):
+            v = d.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                d[key] = str(v)
+                bump(f"{key}_to_str")
+        for key in _STR_FIELDS:
+            v = d.get(key)
+            if isinstance(v, str) and v != v.strip():
+                d[key] = v.strip()
+                bump("trim")
+        if "expire_after" in d:
+            if not d.get("battery_powered"):
+                d.pop("expire_after", None)
+                bump("expire_after")
+            else:
+                try:
+                    iv = int(d.get("expire_after"))
+                except (TypeError, ValueError):
+                    iv = None
+                if iv is None or iv <= 0:
+                    d.pop("expire_after", None)
+                    bump("expire_after")
+                elif iv != d.get("expire_after"):
+                    d["expire_after"] = iv
+                    bump("expire_after")
+        dm = d.get("dps_map")
+        if dm is None:
+            continue
+        if not isinstance(dm, dict):
+            d["dps_map"] = {}
+            bump("dps_map")
+            continue
+        for k in list(dm.keys()):
+            info = dm[k]
+            if not isinstance(info, dict):
+                dm.pop(k, None)
+                bump("dp_entry")
+                continue
+            for ik in ("component", "name", "code", "type"):
+                iv = info.get(ik)
+                if isinstance(iv, str) and iv != iv.strip():
+                    info[ik] = iv.strip()
+                    bump("trim")
+            if not info.get("name") and not info.get("code"):
+                dm.pop(k, None)
+                bump("dp_empty")
+        for k in list(dm.keys()):
+            if not isinstance(k, str):
+                dm[str(k)] = dm.pop(k)
+                bump("dp_key")
+    return fixes
+
+
+def _publish_config_result(cmd, req_id, ok, error=None, extra=None):
+    payload = {"request_id": req_id, "ok": bool(ok), "error": error,
+               "ts": int(time.time())}
+    if extra:
+        payload.update(extra)
+    try:
+        mqtt_client.publish(f"{TOPIC_PREFIX}/bridge/{cmd}_result",
+                            json.dumps(payload, ensure_ascii=False),
+                            qos=1, retain=False)
+    except Exception as e:
+        log.warning(f"[CfgCmd] {cmd}: publish result failed: {e}")
+
+
+def _cfgcmd_read_config():
+    """Прочитать актуальный конфиг с диска. (all_devices, error)."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+            return json.load(f), None
+    except Exception as e:
+        return None, f"read config failed: {e}"
+
+
+def _cfgcmd_write(all_devices, what):
+    """Бэкап + атомарная запись + перечитка ALL_DEVICES."""
+    _backup_config()
+    if not _write_config_atomic(all_devices):
+        return False
+    _reload_all_devices()
+    log.info(f"[CfgCmd] {what}: конфиг обновлён")
+    return True
+
+
+def _republish_discovery_for(names):
+    """Перепубликовать Discovery для изменившихся устройств: expire_after
+    попадает в Discovery-конфиг, иначе HA не увидит новое значение."""
+    with DEVICES_LOCK:
+        index = {d.get("name"): d for d in ALL_DEVICES if isinstance(d, dict)}
+    for name in names:
+        dev = index.get(name)
+        if not dev or not dev.get("enabled", True):
+            continue
+        try:
+            publish_discovery(dev)
+        except Exception as e:
+            log.warning(f"[CfgCmd] Discovery {name}: {e}")
+
+
+def _handle_config_report(payload_str):
+    req_id = _extract_request_id(payload_str)
+    # отчёт строим по файлу: он же источник истины для остальных команд
+    all_devices, err = _cfgcmd_read_config()
+    if err:
+        _publish_config_result("config_report", req_id, False, err)
+        return
+    try:
+        report = _config_report_build(all_devices)
+    except Exception as e:
+        _publish_config_result("config_report", req_id, False, str(e))
+        return
+    _publish_config_result("config_report", req_id, True, extra=report)
+
+
+def _handle_expire_clear(payload_str):
+    req_id = _extract_request_id(payload_str)
+    if not ALLOW_CONFIG_EDIT:
+        _publish_config_result("expire_clear", req_id, False, "config edit disabled")
+        return
+    all_devices, err = _cfgcmd_read_config()
+    if err:
+        _publish_config_result("expire_clear", req_id, False, err)
+        return
+    cleared = []
+    for d in all_devices:
+        if isinstance(d, dict) and d.pop("expire_after", None) is not None:
+            cleared.append(d.get("name"))
+    if not cleared:
+        _publish_config_result("expire_clear", req_id, True, extra={"cleared": []})
+        return
+    if not _cfgcmd_write(all_devices, "expire_clear"):
+        _publish_config_result("expire_clear", req_id, False, "write config failed")
+        return
+    _republish_discovery_for(cleared)
+    _publish_config_result("expire_clear", req_id, True, extra={"cleared": cleared})
+
+
+def _handle_expire_fill(payload_str):
+    req_id = _extract_request_id(payload_str)
+    if not ALLOW_CONFIG_EDIT:
+        _publish_config_result("expire_fill", req_id, False, "config edit disabled")
+        return
+    try:
+        data = json.loads(payload_str) if payload_str else {}
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    value = data.get("value")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        _publish_config_result("expire_fill", req_id, False, "value must be int > 0")
+        return
+    all_devices, err = _cfgcmd_read_config()
+    if err:
+        _publish_config_result("expire_fill", req_id, False, err)
+        return
+    changed = []
+    for d in all_devices:
+        if not isinstance(d, dict) or not d.get("battery_powered"):
+            continue
+        if d.get("expire_after") != value:
+            d["expire_after"] = value
+            changed.append(d.get("name"))
+    if not changed:
+        _publish_config_result("expire_fill", req_id, True,
+                               extra={"changed": [], "value": value})
+        return
+    if not _cfgcmd_write(all_devices, "expire_fill"):
+        _publish_config_result("expire_fill", req_id, False, "write config failed")
+        return
+    _republish_discovery_for(changed)
+    _publish_config_result("expire_fill", req_id, True,
+                           extra={"changed": changed, "value": value})
+
+
+def _handle_config_normalize(payload_str):
+    req_id = _extract_request_id(payload_str)
+    if not ALLOW_CONFIG_EDIT:
+        _publish_config_result("config_normalize", req_id, False,
+                               "config edit disabled")
+        return
+    try:
+        data = json.loads(payload_str) if payload_str else {}
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    # v1.12.18: два независимых действия (галки в UI):
+    #   remove_extra — убрать поля вне белого списка (как раньше);
+    #   fix_types    — починить типы/формат значений (валидация).
+    do_extra = bool(data.get("remove_extra", True))
+    do_types = bool(data.get("fix_types", False))
+    all_devices, err = _cfgcmd_read_config()
+    if err:
+        _publish_config_result("config_normalize", req_id, False, err)
+        return
+    before = _config_report_build(all_devices)["summary"]
+    if not do_extra and not do_types:
+        _publish_config_result("config_normalize", req_id, False,
+                               "не выбрано ни одного действия")
+        return
+    if data.get("dry_run"):
+        # предпросмотр — считаем на копии, ничего не пишем
+        preview = json.loads(json.dumps(all_devices))
+        planned_fixes = _config_fix_format_inplace(preview) if do_types else {}
+        planned_removed = _config_normalize_inplace(preview) if do_extra else 0
+        _publish_config_result(
+            "config_normalize", req_id, True,
+            extra={"dry_run": True, "before": before,
+                   "removed": planned_removed, "fixes": planned_fixes,
+                   "remove_extra": do_extra, "fix_types": do_types})
+        return
+    fixes = _config_fix_format_inplace(all_devices) if do_types else {}
+    removed = _config_normalize_inplace(all_devices) if do_extra else 0
+    if not _cfgcmd_write(all_devices, "config_normalize"):
+        _publish_config_result("config_normalize", req_id, False,
+                               "write config failed")
+        return
+    after = _config_report_build(all_devices)["summary"]
+    _publish_config_result("config_normalize", req_id, True,
+                           extra={"dry_run": False, "removed": removed,
+                                  "fixes": fixes,
+                                  "remove_extra": do_extra, "fix_types": do_types,
+                                  "before": before, "after": after})
+
+
+# ==================== RESTORE / RECONCILE (v1.12.0) ====================
+
+def _restore_backup_name(raw):
+    """Безопасное имя бэкапа: только basename из BACKUP_DIR (иначе None).
+
+    Отсекаем пути, '..' и чужие файлы — restore_config приходит из сети.
+    """
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if not name or os.path.basename(name) != name:
+        return None
+    prefix = os.path.basename(CONFIG_FILE) + ".bak."
+    if not name.startswith(prefix) or len(name) == len(prefix):
+        return None
+    return name
+
+
+def _list_backups():
+    """Бэкапы конфига, новые первыми: {name, ts, size}."""
+    out = []
+    try:
+        if not os.path.isdir(BACKUP_DIR):
+            return out
+        prefix = os.path.basename(CONFIG_FILE) + ".bak."
+        for f in os.listdir(BACKUP_DIR):
+            if not f.startswith(prefix):
+                continue
+            p = os.path.join(BACKUP_DIR, f)
+            if not os.path.isfile(p):
+                continue
+            st = os.stat(p)
+            out.append({"name": f, "ts": int(st.st_mtime), "size": int(st.st_size)})
+    except Exception as e:
+        log.warning(f"[Backup] list: {e}")
+    # v1.12.16: сортируем по времени файла (как в ротации) — иначе при коллизии
+    # секунд суффиксы _2…_10 дают неверный порядок и «самый новый» в списке
+    # отката (он же выбор по умолчанию в WebUI) оказывается не самым свежим.
+    out.sort(key=lambda x: (x.get("ts") or 0, x.get("name") or ""), reverse=True)
+    return out
+
+
+def _restart_workers_later(names, reason, timeout: float = 120.0):
+    """v1.12.7: воркеры, не остановившиеся за дедлайн reconcile.
+
+    Они держат ссылку на ПРЕЖНИЙ dict устройства (и не увидят новую конфигурацию),
+    но перезапускать их нельзя, пока живы — иначе два TCP на устройство (правило №1).
+    Поэтому ждём завершения в фоне и только потом поднимаем воркер на свежем dict.
+    """
+    left = set(names)
+    deadline = time.time() + timeout
+    while left and time.time() < deadline and not STOP_EVENT.is_set():
+        left = {n for n in left if _worker_alive(n)}
+        if left:
+            time.sleep(0.5)
+    if left:
+        log.error(f"[Reconcile] {reason}: воркеры не остановились за "
+                  f"{timeout:.0f}с: {sorted(left)} — нужен перезапуск контейнера")
+        return
+    started = 0
+    for n in names:
+        with DEVICES_LOCK:
+            d = DEVICE_INDEX.get(n)
+        if d and _ensure_worker_running(d, f"{reason}: отложенный старт"):
+            started += 1
+    if started:
+        log.info(f"[Reconcile] {reason}: отложенно запущено воркеров: {started}")
+
+
+def _reconcile_workers(reason=""):
+    """Привести воркеры в соответствие с ALL_DEVICES — без перезапуска контейнера.
+
+    v1.12.0: после отката конфига состав и поля устройств меняются целиком,
+    а воркер держит ссылку на свой dict — поэтому поднимаем их заново на
+    свежих объектах. Возвращает (started, stopped).
+    """
+    with DEVICES_LOCK:
+        fresh = {d["name"]: d for d in ALL_DEVICES
+                 if isinstance(d, dict) and d.get("name")}
+        desired = {n: d for n, d in fresh.items() if d.get("enabled", True)}
+        old_names = set(DEVICE_INDEX.keys())
+
+    for name in old_names:
+        drop_device_conn(name)
+        # v1.12.13: именно ОСТАНОВ, а не restart: restart-флаг приводил лишь к
+        # реконнекту, воркер выживал со старым dict (старые ip/local_key/dps_map),
+        # и восстановленный конфиг фактически не применялся.
+        request_worker_stop(name)
+    # Ждём все воркеры разом (общий дедлайн): последовательное ожидание
+    # по 3с на устройство на 40 устройствах = минуты.
+    deadline = time.time() + 5.0
+    pending = set(old_names)
+    while pending and time.time() < deadline:
+        pending = {n for n in pending if _worker_alive(n)}
+        if pending:
+            time.sleep(0.1)
+    stopped = len(old_names) - len(pending)
+    if pending:
+        log.warning(f"[Reconcile] {reason}: не завершились вовремя: "
+                    f"{sorted(pending)} — подниму их в фоне после остановки")
+        threading.Thread(target=_restart_workers_later,
+                         args=(sorted(pending), reason),
+                         daemon=True, name="reconcile-retry").start()
+
+    with DEVICES_LOCK:
+        DEVICES.clear()
+        DEVICE_INDEX.clear()
+        for n, d in desired.items():
+            DEVICES.append(d)
+            DEVICE_INDEX[n] = d
+    with STATE_LOCK:
+        for n in desired:
+            STATE_CACHE.setdefault(n, {})
+
+    started = 0
+    for d in desired.values():
+        if _ensure_worker_running(d, reason or "reconcile"):
+            started += 1
+    refresh_our_ids()
+    log.info(f"[Reconcile] {reason}: запущено {started}, остановлено {stopped}, "
+             f"устройств в работе {len(desired)}")
+    return started, stopped
+
+
+def _handle_config_backups(payload_str):
+    req_id = _extract_request_id(payload_str)
+    _publish_config_result("config_backups", req_id, True,
+                           extra={"backups": _list_backups()})
+
+
+def _handle_restore_config(payload_str):
+    req_id = _extract_request_id(payload_str)
+    if not ALLOW_CONFIG_EDIT:
+        _publish_config_result("restore_config", req_id, False, "config edit disabled")
+        return
+    try:
+        data = json.loads(payload_str) if payload_str else {}
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    base = _restore_backup_name(data.get("backup"))
+    if not base:
+        _publish_config_result("restore_config", req_id, False, "invalid backup name")
+        return
+    path = os.path.join(BACKUP_DIR, base)
+    if not os.path.isfile(path):
+        _publish_config_result("restore_config", req_id, False, "backup not found")
+        return
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            restored = json.load(f)
+    except Exception as e:
+        _publish_config_result("restore_config", req_id, False, f"read backup failed: {e}")
+        return
+    if not isinstance(restored, list) or not restored:
+        _publish_config_result("restore_config", req_id, False, "backup is not a device list")
+        return
+    if not all(isinstance(d, dict) and d.get("name") for d in restored):
+        _publish_config_result("restore_config", req_id, False, "backup has invalid devices")
+        return
+
+    # снимок «до» — по нему снимаем Discovery у исчезнувших устройств
+    with DEVICES_LOCK:
+        old_devs = [dict(d) for d in ALL_DEVICES if isinstance(d, dict)]
+    old_names = {d.get("name") for d in old_devs}
+
+    _backup_config()          # откат тоже должен быть обратим
+    if not _write_config_atomic(restored):
+        _publish_config_result("restore_config", req_id, False, "write config failed")
+        return
+    _reload_all_devices()
+
+    with DEVICES_LOCK:
+        new_devs = [d for d in ALL_DEVICES if isinstance(d, dict)]
+    new_names = {d.get("name") for d in new_devs}
+
+    started, stopped = _reconcile_workers(f"restore {base}")
+
+    for od in old_devs:
+        if od.get("name") not in new_names:
+            try:
+                _remove_discovery_for_device(od)
+            except Exception as e:
+                log.warning(f"[Restore] снятие Discovery {od.get('name')}: {e}")
+    removed = len(old_names - new_names)
+    if removed:
+        log.info(f"[Restore] сняты Discovery-топики у {removed} устройств")
+
+    republished = 0
+    for d in new_devs:
+        if not d.get("enabled", True):
+            continue
+        try:
+            publish_discovery(d)
+            republished += 1
+        except Exception as e:
+            log.warning(f"[Restore] Discovery {d.get('name')}: {e}")
+
+    log.info(f"[Restore] {base}: устройств {len(new_names)}, снято {removed}, "
+             f"воркеров +{started}/-{stopped}, Discovery {republished}")
+    _publish_config_result("restore_config", req_id, True, extra={
+        "backup": base, "devices": len(new_names), "removed": removed,
+        "started": started, "stopped": stopped, "republished": republished,
+    })
 
 
 # ==================== DISCOVERY ====================
@@ -3743,11 +5305,14 @@ def publish_selects(device, device_info):
 
         options = info.get("options", [])
         if smap:
-            map_keys = list(smap.keys())
+            # v1.12.8: в options HA уходят МЕТКИ (значения карты), иначе список
+            # показывал бы сырые значения Tuya, а команда меткой не находила пару.
+            # Нетмэпленные значения (например "last") остаются как есть.
+            labels = list(smap.values())
             for o in options:
-                if o not in map_keys:
-                    map_keys.append(o)
-            options = map_keys
+                if o not in smap:
+                    labels.append(o)
+            options = labels
 
         unique_id = f"{dev_name}_{entity_name}"
         config = {
@@ -3889,7 +5454,14 @@ def publish_fan(device, device_info):
 
     if speed is not None:
         if speed.get("options"):
-            config["preset_modes"] = list(speed["options"])
+            # v1.12.14: как у select — в preset_modes уходят МЕТКИ карты (Tuya→HA),
+            # иначе HA показывал состояние-метку, которой нет в списке пресетов.
+            _pmap = get_select_map(speed)
+            _modes = list(_pmap.values()) if _pmap else []
+            for _o in speed["options"]:
+                if _o not in _pmap:
+                    _modes.append(_o)
+            config["preset_modes"] = _modes
             config["preset_mode_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/set"
             config["preset_mode_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/state"
         else:
@@ -4228,8 +5800,9 @@ def publish_state(device, dps):
                 sval = str(val)
                 smap = get_select_map(info)
                 if smap:
-                    rev = {v: k for k, v in smap.items()}
-                    sval = rev.get(sval, sval)
+                    # v1.12.8: здесь значение ОТ устройства (Tuya) → метка HA,
+                    # поэтому прямой map (Tuya→HA); разворот — только для команд.
+                    sval = smap.get(sval, sval)
                 mqtt_client.publish(
                     f"{TOPIC_PREFIX}/select/{dev_name}/{name}/state",
                     sval, retain=True,
@@ -4343,7 +5916,7 @@ def publish_state(device, dps):
                     sval = str(val)
                     smap = get_select_map(info)
                     if smap:
-                        sval = {v: k for k, v in smap.items()}.get(sval, sval)
+                        sval = smap.get(sval, sval)   # v1.12.8: Tuya→HA (как у select)
                     preset = sval
                 else:
                     pct = _to_int_percent(val)
@@ -4362,6 +5935,12 @@ def publish_state(device, dps):
         return
 
     for dp_str, info in dps_map.items():
+        # v1.12.14: у type=sensor публикуем только sensor/binary_sensor — остальные
+        # компоненты Discovery для такого типа не создаёт (был мусорный retained
+        # в tuya/sensor/<dev>/dps/... без Discovery).
+        if info.get("component") in ("switch", "light", "preset", "select",
+                                     "phase_a", "number", "cover", "fan", "lock"):
+            continue
         if dp_str in cached:
             _publish_sensor_value(dev_type, dev_name, dp_str, info, cached[dp_str])
 
@@ -4454,14 +6033,19 @@ _LAST_914_LOCK = threading.Lock()
 _LAST_905_STATE = {}   # name -> [last_ts, count, last_logged]
 _LAST_905_LOCK = threading.Lock()
 
+# v1.10.21: тот же антиспам для батарейного воркера — окно пробуждения
+# без данных (чтобы не спамить WARNING каждые 1-4 минуты).
+_LAST_BATT_STATE = {}   # name -> [last_ts, count, last_logged]
+_LAST_BATT_LOCK = threading.Lock()
 
-def _log_repeat(name, code_label, code_hint, where="", state_dict=None, lock=None):
+
+def _log_repeat(name, code_label, code_hint, where="", state_dict=None, lock=None,
+                prefix="[Worker]"):
     """
     Универсальный логгер повторяющихся событий (914/905).
     """
     now = time.time()
     should_log = False
-    log_level = "INFO"
     count = 0
 
     with lock:
@@ -4483,29 +6067,22 @@ def _log_repeat(name, code_label, code_hint, where="", state_dict=None, lock=Non
         # Решаем, логировать ли
         if count == 1:
             should_log = True
-            log_level = "INFO"
         elif count == 2:
             should_log = True
-            log_level = "WARNING"
         elif count <= 5:
             should_log = True
-            log_level = "WARNING"
         elif count <= 10:
             if count - last_logged >= 2:
                 should_log = True
-                log_level = "WARNING"
         elif count <= 50:
             if count - last_logged >= 10:
                 should_log = True
-                log_level = "WARNING"
         elif count <= 200:
             if count - last_logged >= 50:
                 should_log = True
-                log_level = "WARNING"
         else:
             if count - last_logged >= 100:
                 should_log = True
-                log_level = "WARNING"
 
         if should_log:
             entry[2] = count
@@ -4513,10 +6090,14 @@ def _log_repeat(name, code_label, code_hint, where="", state_dict=None, lock=Non
     if not should_log:
         return
 
+    if _is_quiet_now(name):
+        # v1.12.10: в тихих часах устройство выключено намеренно — не шумим WARNING'ом.
+        log.debug(f"{prefix} {name}: {code_label} {where} (подряд #{count}) — тихие часы")
+        return
     if count == 1:
-        log.info(f"[Worker] {name}: {code_label} {where} (разовый, не критично)")
+        log.info(f"{prefix} {name}: {code_label} {where} (разовый, не критично)")
     else:
-        log.warning(f"[Worker] {name}: {code_label} {where} (подряд #{count}) — {code_hint}")
+        log.warning(f"{prefix} {name}: {code_label} {where} (подряд #{count}) — {code_hint}")
 
 
 def _log_914_once(name, where=""):
@@ -4595,7 +6176,7 @@ def run_polling_device(dev):
     Умное логирование 914/905 (INFO первый раз, WARNING повтор).
     """
     name = dev["name"]
-    log.info(f"[Worker] polling: {name}")
+    log.debug(f"[Worker] polling: {name}")
     last_status_ok = 0
     last_real_data = time.time()
     has_phase_a = dev.get("dps_map", {}).get("6", {}).get("component") == "phase_a"
@@ -4604,6 +6185,10 @@ def run_polling_device(dev):
     first_iteration = True
 
     while not STOP_EVENT.is_set():
+        if consume_stop_flag(name):
+            # v1.12.13: настоящий останов (откат конфига / валидация) — выходим.
+            log.info(f"[Worker] {name}: запрошен останов — выхожу")
+            break
         if consume_restart_flag(name):
             # v1.9.14: если battery_powered сменилось на true — выходим.
             # Внешний код (_handle_edit_config) запустит run_battery_listener.
@@ -4627,7 +6212,10 @@ def run_polling_device(dev):
             _reset_repeat_counters(name)
 
         if consume_status_request(name):
-            last_status_ok = 0
+            # v1.12.6: не гонимся за командой — устройство отвечает на status()
+            # ДО применения команды и отдаёт старое значение. Форсируем опрос
+            # примерно через секунду, чтобы получить уже применённое состояние.
+            last_status_ok = time.time() - POLL_INTERVAL + 1.0
 
         with DEVICES_LOCK:
             if name not in DEVICE_INDEX:
@@ -4655,7 +6243,7 @@ def run_polling_device(dev):
             continue
 
         if DEBUG_CACHE_RECEIVE and data:
-            log.info(f"[Worker] {name}: receive()={data}")
+            log.debug(f"[Worker] {name}: receive()={data}")
 
         # ==== Обработка данных ====
         if data and isinstance(data, dict):
@@ -4694,9 +6282,9 @@ def run_polling_device(dev):
                     # Fix 1.8.2: успешный ответ — сбрасываем счётчики 914/905
                     _reset_repeat_counters(name)
                     if DEBUG_RAW_DP:
-                        log.info(f"[Worker] {name}: receive dps={dps}")
+                        log.debug(f"[Worker] {name}: receive dps={dps}")
                     try:
-                        publish_state(dev, dps)
+                        publish_state(dev, _cmd_guard_filter(name, dps))
                     except Exception as e:
                         log.warning(f"[Worker] {name}: publish_state: {e}")
                     last_real_data = time.time()
@@ -4711,7 +6299,6 @@ def run_polling_device(dev):
         if need_status:
             got_lock = lock.acquire(timeout=LOCK_ACQUIRE_TIMEOUT)
             if got_lock:
-                poll_data = None
                 try:
                     try:
                         d = get_device_conn(dev)
@@ -4724,7 +6311,7 @@ def run_polling_device(dev):
                     lock.release()
 
                 if DEBUG_CACHE_STATUS and poll_data:
-                    log.info(f"[Worker] {name}: status()={poll_data}")
+                    log.debug(f"[Worker] {name}: status()={poll_data}")
 
                 if poll_data and isinstance(poll_data, dict) and "Error" in poll_data:
                     err = poll_data.get("Error", "")
@@ -4761,9 +6348,9 @@ def run_polling_device(dev):
                         # Fix 1.8.2: успешный ответ — сбрасываем счётчики 914/905
                         _reset_repeat_counters(name)
                         if DEBUG_RAW_DP:
-                            log.info(f"[Worker] {name}: status dps={dps}")
+                            log.debug(f"[Worker] {name}: status dps={dps}")
                         try:
-                            publish_state(dev, dps)
+                            publish_state(dev, _cmd_guard_filter(name, dps))
                         except Exception as e:
                             log.warning(f"[Worker] {name}: publish_state (status): {e}")
                         last_real_data = time.time()
@@ -4797,8 +6384,13 @@ def run_polling_device(dev):
         # ==== OFFLINE_TIMEOUT ====
         if time.time() - last_real_data > OFFLINE_TIMEOUT:
             if last_online is not False:
-                log.warning(f"[Worker] {name}: нет данных "
-                            f"{int(time.time() - last_real_data)}с, offline")
+                # v1.12.10: в тихих часах offline ожидаем — в DEBUG, без WARNING.
+                _msg = (f"[Worker] {name}: нет данных "
+                        f"{int(time.time() - last_real_data)}с, offline")
+                if _is_quiet_now(name):
+                    log.debug(_msg + " (тихие часы)")
+                else:
+                    log.warning(_msg)
                 publish_availability(dev, False)
                 last_online = False
             last_real_data = time.time()
@@ -4859,8 +6451,9 @@ def run_battery_listener(dev):
       1. ICMP-пинг → ждём переход DOWN → UP (устройство проснулось).
       2. В окне UP: updatedps([dp1, dp2, ...]) N раз с интервалом.
       3. Публикуем изменения dps.
-      4. DOWN → считаем циклы, публикуем availability=offline
-         через BATTERY_OFFLINE_AFTER_DOWN циклов.
+      4. DOWN → устройство спит, это норма. `availability=offline` для
+         батарейных намеренно НЕ публикуем; по таймауту уходит только
+         `battery_alert=no_data`.
 
     Батарейные устройства НЕ опрашиваются постоянно — они спят.
     Просыпаются только на событие (дверь) или heartbeat.
@@ -4901,6 +6494,10 @@ def run_battery_listener(dev):
     _alert_state = None   # None | "ok" | "no_data"
 
     while not STOP_EVENT.is_set():
+        if consume_stop_flag(name):
+            # v1.12.13: настоящий останов (откат конфига / валидация) — выходим.
+            log.info(f"[Worker] {name}: запрошен останов — выхожу")
+            break
         if consume_restart_flag(name):
             # v1.9.14: если battery_powered сменилось на false — выходим.
             # Внешний код (_handle_edit_config) запустит run_polling_device.
@@ -4960,6 +6557,11 @@ def run_battery_listener(dev):
             # last_seen обновляется независимо от того, изменились ли dps.
             publish_last_seen(dev)
 
+            # v1.10.21: за окно данных может не быть вовсе — тогда сообщаем
+            # видимо (раньше это были только строки log.debug).
+            got_dps = False
+            last_err = None
+
             try:
                 for i in range(BATTERY_UPDATEDPS_COUNT):
                     if STOP_EVENT.is_set():
@@ -4977,8 +6579,9 @@ def run_battery_listener(dev):
                         drop_device_conn(name)
                         return
 
-                    # Прервать, если устройство заснуло
-                    if _ping_native(dev["ip"], timeout=BATTERY_PING_TIMEOUT) is None:
+                    # v1.12.33: на ПЕРВОЙ попытке не пингуем (только что поймали UP) —
+                    # не теряем короткое окно пробуждения батарейного PIR.
+                    if i > 0 and _ping_native(dev["ip"], timeout=BATTERY_PING_TIMEOUT) is None:
                         log.debug(f"[Battery] {name}: DOWN в середине окна, стоп")
                         break
 
@@ -4990,41 +6593,106 @@ def run_battery_listener(dev):
                         if STOP_EVENT.wait(BATTERY_UPDATEDPS_INTERVAL):
                             break
                         continue
+                    _via_status = False
                     try:
                         d = get_device_conn(dev)
                         d.set_socketTimeout(BATTERY_UPDATEDPS_TIMEOUT)
-                        result = d.updatedps(dp_list)
+                        dps = None
 
-                        if result and isinstance(result, dict) and "dps" in result:
-                            dps = result["dps"]
+                        # v1.12.34: на ПЕРВОЙ попытке сначала status() (0x0a) —
+                        # на многих батарейных PIR updatedps (0x12) отдаёт None,
+                        # а статус даёт DP сразу; это экономит ~3 с таймаута.
+                        if i == 0:
+                            _t0 = time.time()
+                            try:
+                                extra = _status_socket(d, timeout=BATTERY_UPDATEDPS_TIMEOUT)
+                            except Exception as e:
+                                log.debug(f"[Battery] {name}: status() first err: {e}")
+                                extra = None
+                            log.debug(
+                                f"[Battery] {name}: status() first -> "
+                                f"{json.dumps(extra, ensure_ascii=False) if isinstance(extra, dict) else extra} "
+                                f"({time.time() - _t0:.2f}s)"
+                            )
+                            if (isinstance(extra, dict) and "dps" in extra
+                                    and "Error" not in extra):
+                                dps = extra.get("dps")
+                                _via_status = True
+
+                        if dps is None:
+                            result = d.updatedps(dp_list)
+                            log.debug(f"[Battery] {name}: updatedps raw #{i + 1}: {result}")
+                            if isinstance(result, dict):
+                                if "dps" in result:
+                                    dps = result["dps"]
+                                elif result.get("Err"):
+                                    last_err = str(result.get("Err"))
+
+                        if dps is not None:
+                            got_dps = True
+                            with _LAST_BATT_LOCK:
+                                _LAST_BATT_STATE.pop(name, None)
                             if dps != last_dps:
                                 log.info(
                                     f"[Battery] {name}: updatedps → "
                                     f"{json.dumps(dps, ensure_ascii=False)}"
                                 )
-                                try:
-                                    publish_state(dev, dps)
-                                except Exception as e:
-                                    log.warning(f"[Battery] {name}: publish_state: {e}")
-                                publish_last_seen(dev)
-                                # v1.9.7: WebUI не видит cache батарейных
-                                # без этого вызова (publish_cache_snapshot
-                                # в polling-воркере есть, в battery — не было).
-                                publish_cache_snapshot(dev)
                                 last_dps = dps
+                            # v1.10.21: публикуем на КАЖДОМ пробуждении, даже если
+                            # значения не изменились — иначе HA гасит сущность по
+                            # expire_after (last_changed не трогается, обновляется
+                            # last_updated).
+                            try:
+                                publish_state(dev, dps)
+                            except Exception as e:
+                                log.warning(f"[Battery] {name}: publish_state: {e}")
+                            publish_last_seen(dev)
+                            # v1.9.7: WebUI не видит cache батарейных
+                            # без этого вызова (publish_cache_snapshot
+                            # в polling-воркере есть, в battery — не было).
+                            publish_cache_snapshot(dev)
 
-                                if was_online is not True:
-                                    publish_availability(dev, True)
-                                    was_online = True
-                        else:
-                            log.debug(f"[Battery] {name}: updatedps #{i+1} no dps")
+                            if was_online is not True:
+                                publish_availability(dev, True)
+                                was_online = True
                     except Exception as e:
                         log.debug(f"[Battery] {name}: updatedps #{i+1} err: {e}")
                     finally:
                         _lock.release()
 
-                    if STOP_EVENT.wait(BATTERY_UPDATEDPS_INTERVAL):
+                    if _via_status:
+                        # status() вернул полный снимок DP — окно можно закрывать
                         break
+                    # v1.12.33: первые попытки — быстрее (успеть в короткое окно PIR).
+                    _wait = BATTERY_UPDATEDPS_FAST if i < 2 else BATTERY_UPDATEDPS_INTERVAL
+                    if STOP_EVENT.wait(_wait):
+                        break
+
+                # v1.10.21: окно закрылось без данных — одна видимая запись
+                # с антиспамом (раньше тут были только строки log.debug).
+                if not got_dps:
+                    if last_err:
+                        _log_repeat(
+                            name,
+                            code_label=f"Tuya error {last_err}",
+                            code_hint="проверь local_key/version в конфиге (3.3 / 3.4)",
+                            where="(battery, окно без данных)",
+                            state_dict=_LAST_BATT_STATE,
+                            lock=_LAST_BATT_LOCK,
+                            prefix="[Battery]",
+                        )
+                    else:
+                        _log_repeat(
+                            name,
+                            code_label="нет данных",
+                            code_hint="устройство не отвечает (спит или недоступно)",
+                            where="(battery, окно без данных)",
+                            state_dict=_LAST_BATT_STATE,
+                            lock=_LAST_BATT_LOCK,
+                            prefix="[Battery]",
+                        )
+                    log.debug(f"[Battery] {name}: за окно данных нет "
+                              f"(updatedps + status)")
 
                 # Закрываем соединение — устройство засыпает
                 drop_device_conn(name)
@@ -5126,6 +6794,8 @@ def health_worker():
         # v1.10.11: раз в 30с — на случай потери retain или если
         # WebUI подключился позже старта bridge.
         _publish_ping_mode()
+        # v1.12.19: статистика отклика на команду (окно защиты от «эха»).
+        _publish_cmd_ack_stats()
         cpu, rss = _read_bridge_metrics()
         if cpu is not None:
             mqtt_client.publish(
@@ -5141,6 +6811,29 @@ def health_worker():
 
 
 # ==================== MAIN ====================
+# v1.12.17: CONFIG_LOCK — сериализуем команды, меняющие devices_config.json.
+# Они читают файл, меняют свой снимок и пишут поверх; без лока две параллельные
+# команды (частое дело: повтор при таймауте WebUI + вторая правка) затирают
+# правки друг друга. Обёртка не трогает тела обработчиков.
+CONFIG_LOCK = threading.RLock()
+
+
+def _serialize_config_handler(fn):
+    def _wrapped(*args, **kwargs):
+        with CONFIG_LOCK:
+            return fn(*args, **kwargs)
+    _wrapped.__name__ = getattr(fn, "__name__", "config_handler")
+    return _wrapped
+
+
+for _nm in ("_handle_edit_config", "_handle_delete_device", "_handle_import_devices",
+            "_handle_expire_clear", "_handle_expire_fill", "_handle_config_normalize",
+            "_handle_restore_config"):
+    _fn = globals().get(_nm)
+    if _fn is not None:
+        globals()[_nm] = _serialize_config_handler(_fn)
+
+
 def main():
     log.info("=" * 50)
     log.info(f"Tuya WiFi -> MQTT Bridge v{DISCOVERY_VERSION}")
@@ -5148,7 +6841,7 @@ def main():
              f"raw_dp={DEBUG_RAW_DP} mqtt_cmd={DEBUG_MQTT_CMD}")
     log.info(f"POLL_INTERVAL={POLL_INTERVAL}s  OFFLINE_TIMEOUT={OFFLINE_TIMEOUT}s  "
              f"EXPIRE_AFTER={AVAILABILITY_EXPIRE}s")
-    log.info(f"CMD_POOL_SIZE={CMD_POOL_SIZE}")
+    log.info("Pools: per-device (commands + retries)")
     log.info(f"RATE_LIMIT: stream={MIN_CMD_INTERVAL_STREAM}s switch={MIN_CMD_INTERVAL_SWITCH}s")
     log.info(f"SOCKET_TIMEOUT: cmd={SOCKET_TIMEOUT_CMD}s worker={SOCKET_TIMEOUT_WORKER}s")
     log.info(f"WORKER_IDLE_SLEEP={WORKER_IDLE_SLEEP}s  "
@@ -5204,6 +6897,9 @@ def main():
 
     # v1.10.11: публикуем режим пинга (для UI-warning про CAP_NET_RAW).
     _publish_ping_mode()
+    # v1.12.19: сброс retained-статистики отклика после рестарта (иначе WebUI
+    # показывал бы цифры прошлого запуска).
+    _publish_cmd_ack_stats(force=True)
 
     started = 0
     for dev in devs_start:
@@ -5220,6 +6916,12 @@ def main():
 
     threading.Thread(target=health_worker, daemon=True, name="health").start()
     threading.Thread(target=state_cache_worker, daemon=True, name="cache-writer").start()
+    # v1.12.29: авто-повтор команд, которые прибор не подтвердил.
+    threading.Thread(target=cmd_retry_worker, daemon=True, name="cmd-retry").start()
+    # v1.12.22: склейка спама switch/light (только если включено).
+    if SWITCH_DEBOUNCER.window > 0:
+        threading.Thread(target=debounce_worker, daemon=True,
+                         name="switch-debounce").start()
 
     log.info(f"[Bridge] Запущено воркеров: {started} (из {len(devs_start)})")
 
@@ -5244,7 +6946,15 @@ def main():
 
     mqtt_client.publish(f"{TOPIC_PREFIX}/bridge/status", "offline", qos=1, retain=True)
     time.sleep(0.3)
-    CMD_POOL.shutdown(wait=False)
+    # v1.12.31: закрыть per-device исполнители (команды и повторы).
+    with DEVICE_EXECS_LOCK:
+        for _ex in list(DEVICE_EXECS.values()) + list(DEVICE_RETRY_EXECS.values()):
+            try:
+                _ex.shutdown(wait=False)
+            except Exception:
+                pass
+        DEVICE_EXECS.clear()
+        DEVICE_RETRY_EXECS.clear()
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
     log.info("[Bridge] Завершено")

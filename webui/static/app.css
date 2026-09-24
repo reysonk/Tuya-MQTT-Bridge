@@ -1,6 +1,7 @@
   :root {
     --bg:#f4f6f8; --fg:#222; --muted:#666; --card:#fff; --border:#e1e4e8;
     --green:#2ea043; --red:#d73a49; --yellow:#b08800; --accent:#1f6feb;
+    --purple:#a371f7;
     --code-bg:#f6f8fa;
   }
   html[data-theme="dark"] {
@@ -9,7 +10,15 @@
     --code-bg:#0d1117;
   }
   * { box-sizing: border-box; }
-  body { margin:0; padding:16px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; background:var(--bg); color:var(--fg); font-size:14px; }
+  /* v1.33.21: страница — flex-колонка на всю высоту окна, чтобы подвал
+     прижимался к низу, когда контента мало (ПК). На мобильном контент
+     длиннее окна, поэтому там ничего не меняется.
+     box-sizing:border-box — чтобы padding тела входил в min-height
+     (иначе появлялась бы лишняя вертикальная прокрутка). */
+  body { margin:0; padding:16px; font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; background:var(--bg); color:var(--fg); font-size:14px;
+         display:flex; flex-direction:column; min-height:100vh; box-sizing:border-box; }
+  /* Активная вкладка тянется на свободное место — это и прижимает футер вниз. */
+  #view-dashboard, #view-analytics, #view-import, #view-tools, #view-help { flex:1 0 auto; }
   code, pre { font-family:"JetBrains Mono",ui-monospace,monospace; }
   /* v1.23.8: шапка — 3 строки (ПК).
      row1: h1 + theme (прижат вправо)
@@ -33,38 +42,61 @@
   .badge { padding:2px 8px; border-radius:12px; font-size:12px; background:var(--border); color:var(--muted); }
   .badge.online { background:var(--green); color:white; }
   .badge.offline { background:var(--red); color:white; }
-  .badge.battery { background:rgba(176,136,0,0.2); color:var(--yellow); }
+  /* v1.32.0: .badge.battery удалён — класс не использовался (батарейные идут через .badge.src). */
   /* v1.28.55: значок питания — без подложки. */
   .power-glyph { opacity: 0.9; }
   .badge.junk { background:rgba(215,58,73,0.15); color:var(--red); font-size:10px; white-space: nowrap; }
   /* v1.27.5: на ПК — текст «мусор», на мобиле (см. @media) — иконка 🗑. */
   .badge.junk .junk-icon { display: none; }
   .badge.junk .junk-text { display: inline; }
-  .badge.quiet { background:rgba(163,113,247,0.18); color:#a371f7; border:1px solid rgba(163,113,247,0.25); }
+  .badge.quiet { background:rgba(163,113,247,0.18); color:var(--purple); border:1px solid rgba(163,113,247,0.25); }
   .health-widget { display:inline-flex; align-items:center; gap:6px; padding:2px 10px;
     border-radius:12px; font-size:12px; background:rgba(56,120,200,0.12); color:var(--fg);
     border:1px solid rgba(56,120,200,0.2); cursor:pointer; user-select:none; }
   .health-widget:hover { border-color:var(--accent); }
   .health-widget .hw-sep { color:var(--muted); opacity:0.5; }
-  .health-widget .hw-dim { color:var(--muted); }
-  .health-widget .hw-quiet { color:#a371f7; }
-  .health-widget .hw-err { color:var(--red); font-weight:600; }
+  /* v1.32.0: .hw-dim/.hw-quiet/.hw-err удалены — в разметке не используются. */
   /* v1.23.7: фикс ширины, чтобы health-widget не дёргался при обновлении. */
-  .health-widget #hw-rest { min-width: 180px; display:inline-block; }
+  /* v1.31.11: в плашке — версии и индикаторы; метрики показываются только
+   в развёрнутом виде (и на мобиле уходят на вторую строку). */
+.health-widget { font-variant-numeric: tabular-nums; min-width: 200px; }
+.health-widget .hw-line1 { display:inline-flex; align-items:center; gap:6px; }
+.health-widget #hw-rest { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
+.health-widget #hw-rest:empty { display:none; }
+.health-widget .hw-meter { font-variant-numeric: tabular-nums; }
+.health-widget .dot { width:8px; height:8px; }
+@media (max-width: 700px) {
+  /* v1.31.15: метрики — второй строкой и по центру */
+  .health-widget.hw-expanded #hw-rest { flex: 1 0 100%; justify-content: center; }
+}
+/* v1.31.6: отчёт пересборки — цветные плитки вместо длинной строки */
+.rebuild-stats { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+.rstat { display:flex; flex-direction:column; gap:1px; padding:4px 9px;
+  border:1px solid var(--border); border-radius:6px; background:var(--card); }
+.rstat b { font-size:15px; line-height:1.15; font-variant-numeric: tabular-nums; }
+.rstat span { font-size:10px; text-transform:uppercase; letter-spacing:0.3px; color:var(--muted); }
+.rstat.ok { border-color: rgba(46,160,67,0.55); }
+.rstat.ok b { color: var(--green); }
+/* v1.32.0: цвет «warn» оставлен красным — контракт-тест test_ui_contract.py
+   закрепляет именно .rstat.warn b { color: var(--red); } (см. проверку 2d). */
+.rstat.warn { border-color: rgba(215,58,73,0.55); }
+.rstat.warn b { color: var(--red); }
+.rstat.zero b { color: var(--muted); }
   /* v1.23.9: на ПК health-бадж длинный, как было до 1.23.8.
-     Короткий вид (.hw-opt { display:none }) — только на мобиле,
+     v1.31.11: в плашке короткого/полного вида больше нет — метрики
+  показываются только в развороте;
      см. @media (max-width:700px). */
   .health-widget.hw-expanded { flex-wrap: wrap; }
   .health-widget.hw-expanded #hw-rest { min-width: 0; }
-  .health-detail { padding:12px 16px; background:var(--bg);
+  .health-detail { padding:14px 18px; background:var(--bg);
     border:1px solid var(--border); border-radius:6px; font-size:12px;
-    font-family:ui-monospace,monospace; line-height:1.6;
+    font-family:ui-monospace,monospace; line-height:1.7;
     /* v1.23.1: внутри header — на ПК переносим на новую строку. */
     flex-basis: 100%; width: 100%; order: 999; margin-top: 0; }
   .health-detail .hd-row { display:flex; gap:16px; }
   .health-detail .hd-key { color:var(--muted); min-width:90px; }
-  /* v1.25.0 (task #B-css): красивая health-карточка на русском. */
-  .health-detail { padding: 14px 18px; line-height: 1.7; }
+  /* v1.32.0: дубль .health-detail { padding:14px 18px; line-height:1.7 }
+     слит в правило выше (было два объявления подряд). */
   .health-detail .hd-head {
     display:flex; align-items:center; justify-content:space-between;
     margin-bottom: 10px; padding-bottom: 8px;
@@ -158,6 +190,9 @@
   button.logs-pause.active { background:var(--yellow); color:white; border-color:var(--yellow); animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.65;} }
   input, select { padding:6px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg); font-size:13px; width:100%; }
+  /* v1.32.0: чекбоксы/радио не растягиваем — глобальный width:100% делал из
+     галочки выбора узкую полосу во всю ячейку (Cloud-таблица, превью импорта). */
+  input[type="checkbox"], input[type="radio"] { width:auto; }
   label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   .form-group { margin-bottom:12px; }
   .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:0; overflow:hidden; margin-bottom:16px; }
@@ -176,7 +211,7 @@
   .dot.online { background:var(--green); }
   .dot.offline { background:var(--red); }
   .type-badge { display:inline-block; padding:1px 6px; font-size:11px; border-radius:4px; background:var(--border); color:var(--muted); }
-  .type-badge.primary { background:rgba(3,102,214,0.15); color:var(--accent); }
+  /* v1.32.3: .type-badge.primary удалён — класс нигде не применялся. */
   .device-ip { font-size:11px; color:var(--muted); margin-top:2px; }
   .latency { display:inline-block; padding:1px 6px; font-size:11px; border-radius:3px; }
   .lat-good { background:rgba(46,160,67,0.15); color:var(--green); }
@@ -297,7 +332,7 @@
   .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .table-toolbar { display:flex; gap:8px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--bg); flex-wrap:wrap; }
-  .table-toolbar input[type="text"] { max-width:280px; padding:5px 10px; font-size:12px; }
+  .table-toolbar input[type="text"] { flex: 1 1 320px; max-width: 480px; padding:5px 10px; font-size:12px; }
   .table-toolbar .toolbar-info { font-size:11px; color:var(--muted); margin-left:auto; }
   .table-toolbar .toolbar-clear { padding:3px 8px; font-size:11px; }
   .skeleton { display:inline-block; height:12px; border-radius:3px;
@@ -309,9 +344,12 @@
     font-weight:600; font-family:ui-monospace,monospace; vertical-align:middle; }
   .version-badge.v31 { background:rgba(148,163,184,0.18); color:#94a3b8; }
   .version-badge.v32 { background:rgba(56,189,248,0.15); color:#38bdf8; }
+  /* v1.32.3: в светлой теме эти оттенки давали контраст ниже нормы AA. */
+  html[data-theme="light"] .version-badge.v31 { color:#5a6673; }
+  html[data-theme="light"] .version-badge.v32 { color:#0369a1; }
   .version-badge.v33 { background:rgba(46,160,67,0.18); color:var(--green); }
   .version-badge.v34 { background:rgba(3,102,214,0.18); color:var(--accent); }
-  .version-badge.v35 { background:rgba(163,113,247,0.18); color:#a371f7; }
+  .version-badge.v35 { background:rgba(163,113,247,0.18); color:var(--purple); }
   .badge.bridge-version, .badge.webui-version {
     background: rgba(56,120,200,0.18); color: #6ea8fe; border:1px solid rgba(56,120,200,0.25); }
   html[data-theme="light"] .badge.bridge-version,
@@ -321,7 +359,7 @@
   .type-badge.switch { background:rgba(46,160,67,0.18); color:var(--green); }
   .type-badge.climate { background:rgba(219,109,40,0.18); color:#db6d28; }
   .type-badge.sensor { background:rgba(56,139,253,0.18); color:#388bfd; }
-  .type-badge.binary_sensor { background:rgba(163,113,247,0.18); color:#a371f7; }
+  .type-badge.binary_sensor { background:rgba(163,113,247,0.18); color:var(--purple); }
   .type-badge.cover { background:rgba(56,189,248,0.18); color:#38bdf8; }
   .type-badge.fan { background:rgba(45,212,191,0.18); color:#2dd4bf; }
   /* v1.25.0 (fix3): цветной бейдж для component DP. */
@@ -329,7 +367,7 @@
     background:var(--border); color:var(--muted); }
   .component-badge.switch        { background: rgba(46,160,67,0.18);  color: var(--green); }
   .component-badge.sensor        { background: rgba(56,139,253,0.18); color: #388bfd; }
-  .component-badge.binary_sensor { background: rgba(163,113,247,0.18); color: #a371f7; }
+  .component-badge.binary_sensor { background: rgba(163,113,247,0.18); color: var(--purple); }
   .component-badge.select        { background: rgba(219,109,40,0.18); color: #db6d28; }
   .component-badge.number        { background: rgba(219,109,40,0.18); color: #db6d28; }
   .component-badge.preset        { background: rgba(219,109,40,0.18); color: #db6d28; }
@@ -377,6 +415,68 @@
   .modal-body input[type="radio"] { scroll-margin: 9999px; }
   /* v1.28.51: больше воздуха между разделами модалок. */
   .modal-body h3 { margin:20px 0 8px 0; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
+/* v1.31.12: разделители блоков в модалке устройства — при любой вложенности
+   («Режим тишины», «Климат» и т.д.). Внутри таблиц и summary линий нет. */
+#modal-body h3 {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 16px;
+}
+#modal-body > h3:first-child,
+#modal-body > div:first-child > h3:first-child,
+#modal-body > div > div:first-child > h3:first-child {
+  border-top: none; padding-top: 0; margin-top: 0;
+}
+#modal-body table h3,
+#modal-body summary h3 { border-top: none; padding-top: 0; margin-top: 0; }
+/* v1.31.16: у блоков «УПРАВЛЕНИЕ DP» свой разделитель (.dps-section + .dps-section),
+   поэтому лишнюю линию от общего правила убираем — иначе их две */
+#modal-body .dps-section h3 { border-top: none; padding-top: 0; margin-top: 0; }
+/* v1.31.9: смысловые разделители блоков в модалках — секции не сливаются,
+   а лишний воздух у первого блока убираем. */
+/* v1.31.14: широкие правила убраны — разделители только в модалке устройства */
+.cache-details { border-top:1px solid var(--border); padding-top:12px; margin-top:14px; }
+/* v1.31.10: «Режим тишины» — разделитель и сверху, и снизу */
+/* v1.31.15: нижнюю линию у тишины убрали — разделитель даёт заголовок
+   следующего блока (иначе между блоками было две линии) */
+#modal-quiet-zone { padding-bottom:12px; }
+/* v1.31.10: в блоке «Климат» между «Диапазон» и «Пресеты» линии не нужно */
+.detail-table.climate-table td { border-bottom:none; }
+/* v1.31.10: переключатель источников в «Кэше состояния» */
+.base-info-actions { display:flex; flex-direction:column; gap:8px; }
+.base-info-actions button { width:100%; }
+.cache-src-bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:6px 0 4px 0; }
+.cache-src-btn { padding:2px 8px; font-size:11px; border:1px solid var(--border);
+  border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
+/* v1.31.12: активная кнопка — заливка акцентом, текст белый (было «пусто» —
+   цвет текста совпадал с фоном) */
+.cache-src-btn.active { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+/* v1.31.14: источник без данных — приглушённый (но выбрать можно: увидим «не найдено») */
+.cache-src-btn.dim { opacity:0.55; }
+.cache-view { font-size:12px; }
+/* v1.31.17: разделители блоков и в модалке Cloud (ПРОСМОТР / сырые данные) */
+#cloud-modal-body h3 {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 16px;
+}
+#cloud-modal-body h3:first-child { border-top:none; padding-top:0; margin-top:0; }
+#cloud-modal-body details {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 14px;
+}
+#cloud-modal-body details:first-child { border-top:none; padding-top:0; margin-top:0; }
+.cache-src-hint { font-size:11px; margin-bottom:6px; }
+/* v1.31.10: читаемый отчёт конфига (что и где лишнее) */
+.cfg-rep-dev { margin:6px 0 2px 0; font-size:13px; }
+.cfg-rep-dp { margin:0 0 2px 14px; font-size:12px; color:var(--muted); }
+.cfg-rep-bad { color:var(--red); }
+.cfg-rep-ok { color:var(--green); }
+.dps-section + .dps-section { border-top:1px solid var(--border); padding-top:12px; margin-top:12px; }
+/* «Просмотр» в Cloud-модалке: убираем лишний воздух, ставим разделитель */
+.cloud-warn { margin:10px 0; }
+.cloud-warn + .toolbar { margin-top:6px; }
   .modal-body h3:first-child { margin-top:0; }
   .modal-body > table,
   .modal-body > .wide-table-wrap,
@@ -430,7 +530,7 @@
   .quiet-title .quiet-status-inline {
     font-size: 11px;
     font-weight: 400;
-    color: #a371f7;
+    color: var(--purple);
     margin-left: 2px;
   }
   .quiet-title.quiet-off {
@@ -493,12 +593,132 @@
   .cache-details > summary:hover h3 { color: var(--accent); }
   .sparkline { background:var(--bg); border-radius:4px; padding:8px; margin-bottom:8px; }
   .sparkline svg { display:block; width:100%; height:40px; }
+  /* v1.32.3: числовые ячейки — вправо и моноширинными цифрами (не «пляшут»). */
+  th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  /* v1.32.10: мини-подвал — автор и ссылка на GitHub. */
+  .site-footer {
+    text-align: center; font-size: 11px; color: var(--muted);
+    margin-top: 18px;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--border);
+    flex: 0 0 auto;   /* v1.33.21: подвал не сжимается и не тянется */
+  }
+  .site-footer a { color: var(--accent); text-decoration: none; }
+  .site-footer a:hover { text-decoration: underline; }
+  /* v1.32.33: строка релиза в подвале + значок «!» слева от ☀️ при новом релизе. */
+  .footer-release { color: var(--muted); }
+  .footer-release b { color: var(--fg); }
+  .release-new {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%;
+    font-size: 11px; font-weight: 700; line-height: 1;
+    background: var(--red); color: #fff; cursor: pointer;
+  }
+  .release-new::before { content: "!"; }
+  .release-new:hover { filter: brightness(1.15); }
+  /* v1.32.16: пустые секции аналитики скрываем ПОЛНОСТЬЮ — нет данных, нет блока;
+     оставшиеся карточки и плитки перестраиваются сами. */
+  .analytics-card.is-empty,
+  .analytics-card.compact.is-empty { display: none !important; }
+  /* v1.32.19: KPI — компактные плашки одинаковой высоты, ряд заполняется целиком. */
+  .analytics-kpi {
+    display: grid; gap: 8px; margin-bottom: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+  }
+  .analytics-kpi .rstat { min-height: 44px; min-width: 0; }
+  /* v1.32.27: мягкое предупреждение — жёлтый (тихие; мерцания до 5 переходов). */
+  .rstat.soft { border-color: rgba(176,136,0,0.55); }
+  .rstat.soft b { color: var(--yellow); }
+  /* v1.32.27: размер шрифта лога (A− / A+ перед «Скачать»). */
+  :root { --log-font: 12px; }
+  .logs { font-size: var(--log-font); }
+  .log-font-ctl { display: inline-flex; gap: 4px; margin-left: auto; }
+  /* v1.33.22: группирующая обёртка уровней и A−/A+ — на ПК «растворяется»,
+     поэтому десктопная вёрстка тулбара не меняется. Мобильные правила —
+     в @media (max-width:700px). */
+  .logs-levels-row { display: contents; }
+  /* v1.32.31: A−/A+ прижаты к «Скачать» справа (auto-отступ теперь у группы
+     шрифта, а не у кнопки скачивания). */
+  .logs-toolbar-row1 .logs-download { margin-left: 0; }
+  .log-font-btn {
+    font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  }
+  .log-font-btn:hover { border-color: var(--accent); }
+  .analytics-kpi .rstat b {
+    display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* v1.32.19: если в ряду осталась ОДНА карточка (сосед скрыт как пустой) —
+     растягиваем её на всю ширину, чтобы не было пустой половины. */
+  .analytics-card.solo { grid-column: 1 / -1; }
+  /* v1.32.12: панель «Настроить аналитику» */
+  /* v1.32.21: кнопки аналитики — справа, панель настроек под ними на всю ширину. */
+  .an-cfg { display: flex; justify-content: flex-end; align-items: center;
+            gap: 8px; flex-wrap: wrap; margin: 0 0 10px 0; }
+  .an-cfg-panel { flex-basis: 100%; }
+  /* v1.32.22: при открытых настройках показываем все настраиваемые секции,
+     даже пустые — иначе непонятно, что именно включаешь. */
+  #view-analytics.an-cfg-open .analytics-card.is-empty,
+  #view-analytics.an-cfg-open .analytics-card.compact.is-empty { display: flex !important; }
+  #view-analytics.an-cfg-open .chart-block.is-empty { display: block !important; }
+  .an-cfg-btn {
+    font-size: 12px; padding: 5px 10px; border-radius: 6px; cursor: pointer;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  }
+  .an-cfg-btn:hover { border-color: var(--accent); }
+  .an-cfg-panel {
+    margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--bg); font-size: 12px;
+    display: flex; flex-wrap: wrap; gap: 8px 18px;
+  }
+  .an-cfg-panel label { display: inline-flex; align-items: center; gap: 6px; }
+  /* v1.32.13: на мобиле в таблице задержки скрываем колонку «последняя проверка»
+     (время выводится подстрокой под именем устройства). */
+  @media (max-width: 700px) {
+    .latency-table-wrap th:nth-child(3),
+    .latency-table-wrap td:nth-child(3) { display: none; }
+  }
+  /* v1.32.12: карточки-секции выравниваем по верху (были «дырки» разной высоты),
+     компактные секции («Мерцающие», «Хронология») — на всю ширину. */
+  .analytics-grid { align-items: start; }
+  /* v1.32.36: компактные карточки больше НЕ растягиваем на всю строку всегда —
+     это делал класс .solo только когда соседняя карточка скрыта (иначе
+     «Активность» оставалась половинной, а таблицы разъезжались по ширине). */
+  .chart-legend { margin: 2px 0 6px 0; }
+  /* v1.32.32: графики обрезают содержимое — маркеры не «вылазят» за область. */
+  #chart-activity, #chart-flaps { overflow: hidden; }
+  /* v1.32.44: аккуратнее рисуем линии и не даём направляющей мешать hit-тесту
+     наведения (полный рефакторинг графика — патч 1.33.0). */
+  #chart-activity, #chart-flaps { shape-rendering: geometricPrecision; }
+  #chart-activity path, #chart-flaps path,
+  #chart-activity polyline, #chart-flaps polyline {
+    stroke-linejoin: round; stroke-linecap: round;
+  }
+  line.activity-guide { pointer-events: none; }
+  /* v1.33.7: точки наведения не мешают hit-тесту. */
+  circle.activity-marker { pointer-events: none; }
+  /* v1.32.36: у «Мерцающих» числовая колонка узкая — цифра не отлетает к краю. */
+  #flappers-body td + td,
+  .analytics-table-scroll th:last-child:not(:first-child) { width: 130px; }
+  #flappers-body td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  /* v1.32.12: результаты «Безопасного скана LAN» — в окне ~20 устройств,
+     остальные доступны вертикальной прокруткой; тулбар залипает сверху. */
+  #scan-result { max-height: 560px; overflow-y: auto; }
+  #scan-result .scan-toolbar {
+    position: sticky; top: 0; z-index: 2;
+    background: var(--card); padding-bottom: 6px;
+  }
+  /* v1.32.16: пустой подграфик мерцаний скрываем целиком. */
+  .chart-block.is-empty { display: none !important; }
   .sparkline-labels { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); margin-top:2px; }
   .analytics-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;
     align-items:stretch; grid-auto-rows:minmax(280px, 520px); }
   @media (max-width:700px) { .analytics-grid { grid-template-columns:1fr; grid-auto-rows: auto; } }
   .analytics-card { margin-bottom:0; display:flex; flex-direction:column;
     min-height:200px; max-height:560px; overflow:hidden; }
+  /* v1.32.16: ряды сетки — по контенту (иначе пустые секции давали 280px); сами
+     пустые карточки скрыты правилом выше. */
+  .analytics-grid { grid-auto-rows: auto; }
   .analytics-card > .analytics-card-header { flex-shrink:0; }
   .analytics-card-header { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 16px; border-bottom:1px solid var(--border); flex-wrap:wrap; }
   .analytics-card-header h2 { margin:0; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
@@ -531,7 +751,7 @@
   .scan-badge.known { background:rgba(46,160,67,0.2); color:var(--green); }
   .scan-badge.iot { background:rgba(176,136,0,0.2); color:var(--yellow); }
   .scan-badge.unknown { background:var(--border); color:var(--muted); }
-  .scan-badge.bridge { background:rgba(163,113,247,0.2); color:#a371f7; }
+  .scan-badge.bridge { background:rgba(163,113,247,0.2); color:var(--purple); }
   .scan-badge.bridge-confirmed { background:rgba(46,160,67,0.25); color:var(--green); font-weight:700; }
   .scan-port { font-family:ui-monospace,monospace; font-size:10px; background:var(--bg); padding:0 4px; border-radius:2px; }
   .scan-toolbar { display:flex; gap:8px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--bg); flex-wrap:wrap; }
@@ -664,6 +884,48 @@
     gap: 12px;
     flex-wrap: wrap;
   }
+  /* v1.29.2: строка «Версия протокола» / «Тип устройства» в карточке превью. */
+  .preview-device-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px 2px 12px;
+    background: var(--bg);
+  }
+  .preview-ver-unknown {
+    display: inline-block;
+    padding: 1px 6px;
+    font-size: 11px;
+    border-radius: 4px;
+    background: rgba(215,58,73,0.15);
+    color: var(--red);
+    border: 1px solid rgba(215,58,73,0.35);
+  }
+  .preview-version-select,
+  .preview-type-select {
+    padding: 1px 4px;
+    font-size: 11px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--fg);
+    width: 10ch;
+    flex: 0 0 auto;
+  }
+  .preview-raw-pre {
+    margin: 4px 0 0 0;
+    padding: 8px;
+    max-height: 260px;
+    overflow: auto;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .invalid-input { border-color: var(--red) !important; }
   /* v1.28.10c: визуальный тумблер «Батарейное» (iOS-style switch). */
   .battery-switch {
     display: inline-flex;
@@ -791,6 +1053,11 @@
   .cloud-filter-btns button:not(.active):hover { border-color: var(--accent); background: rgba(3,102,214,0.08); }
   .badge.enabled-ok { background: rgba(46,160,67,0.18); color: var(--green); }
   .badge.enabled-off { background: rgba(139,148,158,0.18); color: var(--muted); }
+  /* v1.33.2: отметка «уже в конфиге» в Cloud-таблице — тонкая галочка без плашки. */
+  .cloud-check { color: var(--green); font-weight: 600; font-size: 13px; line-height: 1; flex: 0 0 auto; }
+  .cloud-check.off { color: var(--muted); }
+  .cloud-name-row { display: flex; align-items: baseline; gap: 4px; font-weight: 500; min-width: 0; }
+  .cloud-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rebuild-bar { width:100%; height:6px; background:var(--border); border-radius:3px; overflow:hidden; margin-top:6px; }
   .rebuild-bar-fill { height:100%; background:var(--accent); transition: width 0.3s; }
   /* v1.28.65: неопределённый прогресс (фаза скачивания tuya-local). */
@@ -945,16 +1212,28 @@
   .radio-row { display:flex; gap:8px; align-items:center; margin:8px 0; cursor:pointer; }
   .radio-row input[type="radio"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
   .radio-row label { cursor:pointer; margin:0; font-size:13px; color:var(--fg); }
+  /* v1.31.0: чекбоксы в модалках (опции пересборки) */
+  .radio-row input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; flex:0 0 auto; }
+  /* v1.31.0: список бэкапов для отката конфига */
+  .restore-list { max-height:240px; overflow:auto; border:1px solid var(--border); border-radius:6px; }
+  .restore-item { display:flex; gap:8px; align-items:center; padding:6px 8px; cursor:pointer; border-bottom:1px solid var(--border); font-size:12px; line-height:1.25; }
+  .restore-item:last-child { border-bottom:none; }
+  .restore-item:hover, .restore-item.active { background:var(--bg); }
+  .restore-when { flex:1 1 auto; white-space:nowrap; }
+  .restore-size { flex:0 0 auto; font-size:11px; }
+  /* v1.31.2: радио не должно «дёргать» прокрутку списка при клике */
+  .restore-item input[type="radio"] { width:14px; height:14px; margin:0; flex:0 0 auto;
+    accent-color:var(--accent); pointer-events:none; scroll-margin:0; }
   /* v1.25.14: pre-wrap — uiConfirm/uiAlert используют textContent,
      без этого \n в сообщениях теряются (склеиваются в одну строку). */
   .ui-confirm-text { margin:0 0 16px 0; font-size:14px; line-height:1.5; white-space: pre-wrap; }
   .ui-alert-icon { font-size:32px; text-align:center; margin-bottom:8px; }
   .modal-footer { display:flex; gap:8px; justify-content:flex-end; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg); }
-  .latency-spark-labels { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); margin-top:2px; }
+  /* v1.32.3: .latency-spark-labels удалён — в JS используется .sparkline-labels. */
   .chart-block { position:relative; }
-  .chart-subtitle { font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:0.5px; }
+  .chart-subtitle { font-size:11px; color:var(--muted); margin:8px 0 5px 0; text-transform:uppercase; letter-spacing:0.5px; }
   .chart-legend { display:flex; gap:16px; align-items:center; margin-top:6px; font-size:11px; color:var(--muted); flex-wrap:wrap; }
-  .legend-item { display:inline-flex; align-items:center; gap:6px; }
+  .legend-item { display:inline-flex; align-items:center; gap:6px; flex:0 0 auto; white-space:nowrap; }
   .legend-line { display:inline-block; width:20px; height:0; border-top:2px solid; }
   .legend-line.online { border-color:var(--green); }
   .legend-line.total { border-top-style:dashed; border-color:var(--muted); }
@@ -1269,25 +1548,33 @@
   @media (max-width: 700px) {
     header {
       display: grid;
-      grid-template-columns: 1fr auto auto;
+      /* v1.33.20: название | «!» | (свободно) | ☰ | ☀ — значок идёт сразу
+         за названием, как на ПК (в 1.33.19 он стоял 4-й колонкой, у края). */
+      grid-template-columns: minmax(0, max-content) max-content 1fr max-content;
       gap: 8px;
       padding: 10px 12px;
       align-items: center;
     }
-    header h1 { grid-column: 1; grid-row: 1; font-size: 16px; margin: 0; }
+    /* v1.33.19: заголовок не переносится — при нехватке места обрезается
+       многоточием (значок «!» стоит 2-й колонкой рядом). */
+    header h1 { grid-column: 1; grid-row: 1; font-size: 15px; margin: 0;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #nav-toggle {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      grid-column: 2; grid-row: 1;
+      grid-column: 3; grid-row: 1; justify-self: end;
       min-width: 44px; min-height: 44px;
       font-size: 20px; padding: 6px;
     }
     #theme-btn {
-      grid-column: 3; grid-row: 1;
+      grid-column: 4; grid-row: 1;
       min-width: 44px; min-height: 44px;
       font-size: 18px; padding: 6px;
     }
+    /* v1.33.20: значок «!» — сразу за названием (как на ПК), не у правого края.
+       Раньше (до 1.33.19) он вообще «уезжал» на 2-ю строку под заголовком. */
+    #release-new { grid-column: 2; grid-row: 1; justify-self: start; align-self: center; }
 
     /* v1.23.3: nav — выпадающее меню, скрыто по умолчанию */
     nav#main-nav {
@@ -1321,10 +1608,8 @@
       justify-content: center;
       font-size: 12px; padding: 6px 10px; gap: 4px;
     }
-    #health-widget .hw-opt { display: none; }
-    #health-widget.hw-expanded { flex-wrap: wrap; }
-    #health-widget.hw-expanded .hw-opt { display: inline; }
-    #health-detail {
+      #health-widget.hw-expanded { flex-wrap: wrap; }
+      #health-detail {
       grid-column: 1 / -1; grid-row: 4;
       margin: 0;
     }
@@ -1363,13 +1648,30 @@
     .logs-toolbar [data-role="source-label"],
     .logs-toolbar [data-role="info"] { display: none; }
 
-    /* Порядок: пауза → источник → уровень/Все → диапазон → скачать → поиск */
+    /* Порядок: пауза → источник → уровень → A−/A+ → диапазон → скачать → поиск */
     .logs-toolbar [data-role="pause"]    { order: 1; grid-column: 1 / -1; }
     .logs-toolbar [data-role="source"]   { order: 2; grid-column: 1 / -1; }
-    .logs-toolbar [data-role="level"]    { order: 3; grid-column: 1 / -1; }
-    .logs-toolbar [data-role="range"]    { order: 4; grid-column: 1 / -1; }
-    .logs-toolbar [data-role="download"] { order: 5; grid-column: 1 / -1; }
-    .logs-toolbar [data-role="search"]   { order: 6; grid-column: 1 / -1; }
+    /* v1.33.22: «Уровень: …» и A−/A+ — одна строка, адаптивно.
+       Если рядом не влезают, A−/A+ переносятся на свою строку (прижаты вправо
+       через margin-left:auto), а чипы уровней занимают всю ширину строки —
+       поэтому все 4 уровня остаются в один ряд. Раньше (с v1.33.10) A−/A+
+       ВСЕГДА уходили на отдельную строку, и при двух видимых уровнях
+       (DEBUG/ERROR скрыты) справа зияла пустота. */
+    .logs-toolbar .logs-levels-row       { order: 3; grid-column: 1 / -1;
+                                           display: flex; flex-wrap: wrap;
+                                           align-items: center; gap: 6px; }
+    .logs-toolbar .logs-levels-row .log-font-ctl { margin-left: auto; }
+
+    /* v1.33.26: на мобиле содержимое модалок не вылезает за правый край.
+       Симптом: в «Очистке БД» вылезали поля Дней/Часов (db-keep-days/hours),
+       в ✏️-редакторе — expire_after и кнопка вкл/выкл (edit-device-expire/toggle). */
+    .modal-overlay .edit-row-v2 { flex-wrap: wrap; }
+    .modal-overlay input, .modal-overlay select, .modal-overlay button {
+      max-width: 100%; box-sizing: border-box;
+    }
+    .logs-toolbar [data-role="range"]    { order: 5; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="download"] { order: 6; grid-column: 1 / -1; }
+    .logs-toolbar [data-role="search"]   { order: 7; grid-column: 1 / -1; }
 
     /* v1.23.7: обёртки-строки «растворяем» — дети снова в grid. */
     .logs-toolbar-row1,
@@ -1398,6 +1700,9 @@
     }
     #log-level-filter.hidden { display: none !important; }
     #log-level-filter button { padding: 5px 8px; font-size: 11px; }
+    /* v1.33.2: имя в Cloud-таблице на мобиле — одна строка с многоточием
+       (раньше длинные имена переносились на 2-ю строку). */
+    #cloud-devices-container .cloud-name { max-width: 44vw; }
 
     .logs-toolbar .time-btn-group {
       display: flex;
@@ -1651,6 +1956,11 @@
       font-size: 12px;
       padding: 8px 6px;
       margin: 0;
+    }
+    /* v1.32.7: обе кнопки баз DP — на всю ширину. Раньше «Обновить tuya-local»
+       занимала одну колонку из двух, и справа оставалась пустая половина. */
+    .base-info-actions #tuya-local-update-btn {
+      grid-column: 1 / -1;
     }
     /* «Пересобрать tinytuya.json» — на 2 колонки */
     .base-info-actions #rebuild-btn {
@@ -1938,7 +2248,8 @@
   }
   .dps-table {
     width: 100%;
-    border-collapse: collapse;
+    /* v1.32.0: border-collapse задаётся ниже (separate + его обоснование) —
+       раньше здесь был collapse, который всё равно перекрывался. */
     font-size: 12px;
     /* v1.28.33.fixup: fixed — колонки фиксируются по width,
        «пустоты» между Code и Перевод больше нет. */
@@ -2284,24 +2595,7 @@
   .dps-table-wrap,
   .wide-table-wrap,
   #modal-body { scrollbar-width: thin; }
-  .dps-compare-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
-  .dps-compare-table th {
-    padding: 6px 10px;
-    text-align: left;
-    font-size: 11px;
-    color: var(--muted);
-    border-bottom: 1px solid var(--border);
-  }
-  .dps-compare-table td {
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--border);
-    font-family: ui-monospace, monospace;
-    font-size: 11px;
-  }
+  /* v1.32.0: блок .dps-compare-table удалён — стили нигде не применялись. */
 
   /* v1.28.75: единый ритм секций модалки устройства — h3:first-child внутри
      зон больше не «слипает» соседние блоки. */
@@ -2311,7 +2605,7 @@
   #mv-raw .raw-details > summary { margin: 4px 0; padding: 0; line-height: 1.25; }
   .raw-details > summary { margin: 4px 0; padding: 0; line-height: 1.25; }
   /* v1.28.88: раздел «Справка». */
-  #nav-help .help-q { color: var(--red); font-weight: 700; }
+  #help-btn .help-q { color: var(--red); font-weight: 700; }
   .help-tabs { display: block; margin: 4px 0 0 0; }
   .help-tabs button {
     background: var(--bg); color: var(--fg); border: 1px solid var(--border);
@@ -2330,7 +2624,8 @@
   .help-body .help-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
   .help-body code { font-size: 12px; }
   /* v1.28.89: два уровня справки — Bridge / WebUI, ниже разделы. */
-  .card-pad { padding: 0 16px 16px 16px; }
+  /* v1.31.2: воздух сверху — раньше текст прилипал к заголовку раздела */
+  .card-pad { padding: 12px 16px 16px 16px; }
   .help-top-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 10px 0; }
   .help-top-row .help-top {
     padding: 7px 14px; font-size: 13px; font-weight: 500;
@@ -2662,10 +2957,8 @@
   .detail-table-key-merged td:first-child {
     border-top: none;
   }
-  #modal-key-zone {
-    margin: 0;
-    padding: 0;
-  }
+  /* v1.32.0: правило #modal-key-zone { margin:0; padding:0 } удалено — оно
+     обнуляло разделитель и отступ от Tuya ID (см. правило выше по файлу). */
   /* v1.28.34: выбор источника данных в превью импорта. */
   .preview-source-bar {
     display: flex;
@@ -2785,3 +3078,20 @@
     border: 1px solid var(--border); background: var(--bg); color: var(--fg); cursor: pointer;
   }
   .preview-src-btns button.active { border-color: var(--accent); color: var(--accent); background: var(--bg); }
+
+/* v1.31.13: help on mobile - even buttons: top row 2 per row, sections 3 per row */
+@media (max-width: 700px) {
+  .help-top-row { display:flex; flex-wrap:wrap; gap:8px; }
+  .help-top-row > button { flex: 1 1 calc(50% - 4px); justify-content:center; }
+  .help-tabs-row { display:flex; flex-wrap:wrap; gap:8px; }
+  .help-tabs-row > button { flex: 1 1 calc(33.333% - 6px); justify-content:center; }
+  /* v1.33.4: инструменты карточки превью на мобиле — ровно, без «рваных»
+     переносов: тумблер «батарейное/проводное» — своя строка, кнопки —
+     компактной группой, статус опроса — строкой ниже. */
+  .preview-device-header-tools { gap: 8px; row-gap: 6px; }
+  .preview-device-header-tools .battery-switch { flex: 1 1 100%; }
+  .preview-device-header-tools .preview-edit-btn,
+  .preview-device-header-tools .preview-diff { flex: 0 0 auto; white-space: nowrap; }
+  .preview-device-header-tools .preview-sandbox-label { flex: 1 1 auto; }
+  .preview-device-header-tools .preview-probe-status:not(:empty) { flex: 1 1 100%; }
+}

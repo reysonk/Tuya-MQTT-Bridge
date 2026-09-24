@@ -3,7 +3,19 @@
 // константу, но она не была объявлена в JS → ReferenceError.
 const BRIDGE_STARTUP_GRACE_SEC = 60;
 // v1.28.27: локальный STATE для bridge ping_mode / bridge_started_at.
-const BRIDGE_STATE = { bridge_ping_mode: null, bridge_started_at: 0 };
+const BRIDGE_STATE = { bridge_ping_mode: null, bridge_started_at: 0, cmd_ack: null };
+// v1.33.28: не падать на не-JSON ответе (502/HTML от прокси, обрыв) — вместо
+// SyntaxError в консоли отдаём {}, и код уходит в свою ветку «нет данных».
+(function () {
+  if (typeof Response === "undefined" || !Response.prototype || !Response.prototype.json) return;
+  const _json = Response.prototype.json;
+  Response.prototype.json = function () {
+    return _json.call(this).catch((e) => {
+      try { console.warn("[api] не-JSON ответ:", this.url, this.status, e && e.message); } catch (_) {}
+      return {};
+    });
+  };
+})();
 
 const logsEl = document.getElementById("logs");
 // v1.23.8: состояние лог-панели выживает при переключении вкладок
@@ -171,7 +183,8 @@ const PREVIEW_SOURCES = [
   { id: "cloud",      label: "Tuya Cloud",            icon: "☁" },
   { id: "cache",      label: "Текущий",               icon: "⚙️" },
   { id: "tuya_local", label: "tuya-local",            icon: "📚" },
-  { id: "heuristic",  label: "эвристика (значение)",  icon: "⚠️" },
+  { id: "local_db",   label: "Локальная база",        icon: "📦" },
+  { id: "heuristic",  label: "Эвристика",  icon: "⚠️" },
 ];
 let PREVIEW_CURRENT = 0;
 
@@ -470,7 +483,11 @@ const _chartTooltip = (function() {
       handler.onHover(svg, hit);
       show(handler.render(hit), e.clientX, e.clientY, {});
     }, { signal: sig });
-    svg.addEventListener("mouseleave", () => { hide(); }, { signal: sig });
+    // v1.31.12: уводим мышь на сам тултип — не скрываем (пока не уберёшь)
+    svg.addEventListener("mouseleave", () => {
+      if (el && el.matches(":hover")) return;
+      hide();
+    }, { signal: sig });
   }
 
   // Мобиль: только быстрый тап. Long-press убран.
@@ -511,10 +528,31 @@ const _chartTooltip = (function() {
       activeHandler = handler;
       handler.onHover(svg, hit);
       show(handler.render(hit), t.clientX, t.clientY, { centerAbove: true });
-      hideTimer = setTimeout(() => { hide(); }, 10000);
+      hideTimer = setTimeout(() => { hide(); }, 5000);   // v1.31.12: 5 секунд
     }, { signal: sig });
+    // v1.31.12: палец на тултипе — не скрываем, отпустил — ещё 5 секунд
+    // v1.32.4: слушатели на общем элементе тултипа вешаем ОДИН раз — bind()
+    // вызывается при каждой перерисовке графика, и без флага они копились.
+    if (el && !el._ttTouchBound) {
+      el._ttTouchBound = true;
+      el.addEventListener("touchstart", () => {
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      }, { passive: true });
+      el.addEventListener("touchend", () => {
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = setTimeout(() => { hide(); }, 5000);
+      }, { passive: true });
+    }
     svg.addEventListener("touchcancel", () => { hide(); }, { signal: sig });
   }
+
+  // v1.31.12: клик вне тултипа (и не по графику) — скрыть
+  document.addEventListener("click", (e) => {
+    if (!visible) return;
+    if (el && el.contains(e.target)) return;
+    if (e.target && e.target.closest && e.target.closest("svg")) return;
+    hide();
+  });
 
   function bind(svg, handler) {
     bindDesktop(svg, handler);
@@ -525,6 +563,10 @@ const _chartTooltip = (function() {
     bind,
     hide,
     isOpen: () => visible,
+    // v1.33.29: открыт ли tooltip именно ДЛЯ этого svg. Guard'ы графиков
+    // должны проверять свой chart, а не «любой открытый tooltip» — иначе
+    // tooltip на chart-activity блокирует перерисовку chart-flaps.
+    isOpenFor: (svg) => visible && !!svg && activeSvg === svg,
   };
 })();
 
@@ -621,7 +663,7 @@ const _dpTooltip = (function() {
     }
     e.preventDefault();
     show(t);
-    hideTimer = setTimeout(() => hide(), 10000);
+    hideTimer = setTimeout(() => hide(), 5000);   // v1.31.12: единый таймаут 5с
   }, { passive: false });
 
   // Скролл/ресайз — скрыть (координаты устаревают)
@@ -648,8 +690,10 @@ const _dpTooltip = (function() {
 function svgClientToLocal(svg, clientX, clientY) {
   const rect = svg.getBoundingClientRect();
   const vb = svg.viewBox.baseVal;
-  const scaleX = vb.width / rect.width;
-  const scaleY = vb.height / rect.height;
+  // v1.33.7: у графиков активности/мерцаний viewBox больше нет (рисуем в
+  // реальных пикселях) — тогда пользовательские единицы = CSS-пиксели (1:1).
+  const scaleX = (vb && vb.width > 0 && rect.width > 0) ? vb.width / rect.width : 1;
+  const scaleY = (vb && vb.height > 0 && rect.height > 0) ? vb.height / rect.height : 1;
   return {
     x: (clientX - rect.left) * scaleX,
     y: (clientY - rect.top) * scaleY,
@@ -796,17 +840,22 @@ function detectView() {
   const _navHelp = document.getElementById("nav-help");
   if (_navHelp) _navHelp.className = VIEW === "help" ? "active" : "";
   if (VIEW === "tools") loadConfig();
-  if (VIEW === "import") { loadBaseInfo(); _ensureBaseInfoTimer(); }
+  if (VIEW === "import") { loadBaseInfo(); _ensureBaseInfoTimer(); resumeBaseProgress(); }
   if (VIEW === "help") _renderHelp();
   // v1.28.74: вернуть результаты безопасного скана LAN (если ещё свежие).
   if (_loadScanCache()) renderScanResults(SCAN_SUBNET);
+  // v1.33.6: не «сбрасываем» кнопку Ping при загрузке — показываем идущий замер.
+  resumeLatencyButton();
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 function escapeAttr(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+  // v1.32.0: апостроф тоже экранируем — значения подставляются внутрь
+  // одинарных кавычек в onclick/ontoggle ("...'${escapeAttr(x)}'...").
+  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+                  .replace(/'/g, "&#39;");
 }
 // v1.25.0 (task #C): зеркало backend-словарей для Cloud-таблицы
 // и «Кэш состояния». Используются только для тултипов — колонка
@@ -1013,6 +1062,26 @@ const DP_CN_NAMES_RU_FRONT = {
     "Voltage": "Напряжение",
     "Current": "Ток",
 };
+
+// v1.31.9: перевод названия продукта из облака — тем же словарём, что DP-имена.
+// Возвращает "" если перевода нет (тогда просто не показываем).
+function _productRu(name) {
+  const s = (name || "").trim();
+  if (!s) return "";
+  if (typeof DP_CN_NAMES_RU_FRONT !== "undefined" && DP_CN_NAMES_RU_FRONT[s]) {
+    return DP_CN_NAMES_RU_FRONT[s];
+  }
+  const cjkWord = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+/g;
+  const parts = s.match(cjkWord);
+  if (!parts) return "";
+  let hit = false;
+  const out = parts.map(p => {
+    const ru = DP_CN_NAMES_RU_FRONT[p];
+    if (ru) { hit = true; return ru; }
+    return p;
+  });
+  return hit ? out.join(" ") : "";
+}
 
 // v1.25.0 (task #C): единый резолвер отображения DP.
 // Возвращает:
@@ -1362,7 +1431,7 @@ function setPresetLang(lang) {
 // Возвращает массив строк (пустой, если preset-DP нет или options пусты).
 function _climatePresetOptions(d) {
   const dps_map = d && d.dps_map ? d.dps_map : {};
-  for (const [dp, info] of Object.entries(dps_map)) {
+  for (const info of Object.values(dps_map)) {
     if (info && info.component === "preset"
         && Array.isArray(info.options) && info.options.length > 0) {
       return info.options.slice();
@@ -1528,6 +1597,9 @@ function sortDevices(key) {
 }
 function updateSortIndicators() {
   document.querySelectorAll("th[data-sort]").forEach(th => {
+    // v1.32.0: у секции «Отключённые» свои стрелки (SORT_KEY_DISABLED) — их
+    // перетирала сортировка основной таблицы при каждой перерисовке.
+    if (th.closest("#disabled-block")) return;
     const ind = th.querySelector(".sort-ind");
     if (!ind) return;
     if (th.dataset.sort === SORT_KEY) ind.textContent = SORT_DIR > 0 ? "▲" : "▼";
@@ -1736,17 +1808,23 @@ function restoreButtonAfter(btn, delayMs, idleHtml) {
 }
 
 let _firstStatusLoad = true;
+let _STATUS_REQ = 0;   // v1.32.0: номер запроса — устаревший ответ не перетирает свежий
 async function fetchStatus() {
+  const _req = ++_STATUS_REQ;
   if (_firstStatusLoad && VIEW === "dashboard") {
     renderSkeleton(document.getElementById("devices-body"), 5, 5);
   }
   try {
     const r = await fetch("/api/status");
     const data = await r.json();
+    // v1.32.0: пока запрос летел, мог уйти более новый — этот ответ уже неактуален.
+    if (_req !== _STATUS_REQ) return;
     // v1.21.2.fix1: старые ID удалены из HTML (health-widget вместо них).
     // Их роль выполняет refreshHealthWidget() через /api/health/full.
     // v1.28.27: bridge ping_mode и started_at (для CAP_NET_RAW warning).
     BRIDGE_STATE.bridge_ping_mode = data.ping_mode || null;
+    // v1.33.8: отклик на команду / окно защиты от «эха» (bridge 1.12.19+).
+    BRIDGE_STATE.cmd_ack = data.cmd_ack || null;
     if (data.bridge_started_at !== undefined) {
       BRIDGE_STATE.bridge_started_at = data.bridge_started_at || 0;
     }
@@ -1754,6 +1832,15 @@ async function fetchStatus() {
     for (const d of devs) if (DEVICE_HISTORY_CACHE[d.name]) d.history = DEVICE_HISTORY_CACHE[d.name];
     LAST_DEVICES = devs;
     // v1.22.0: мёртвая переменная online удалена.
+    if (VIEW === "dashboard") {
+      renderDashboardKpi();
+    } else if (VIEW === "analytics") {
+      // v1.32.15: KPI аналитики и бейджи (🔇 в тишине / online) зависят от
+      // /api/status — обновляем их вместе со статусом, иначе при первой
+      // загрузке страницы аналитики было «0/0» и «нет ответа».
+      renderAnalyticsKpi();
+      if (Array.isArray(LATENCY_DATA)) renderLatencyTable(LATENCY_DATA);
+    }
     if (VIEW === "dashboard") {
       renderProblems(computeProblems(devs));
       renderDeviceTable(devs);
@@ -1817,7 +1904,10 @@ function computeProblems(devs) {
   // last_seen/status в state_cache старые (bridge ещё не опросил
   // устройства) — иначе UI показывает 28 «проблемных» с
   // «последняя активность 5м назад».
-  const _bs = (typeof STATE !== "undefined" && BRIDGE_STATE.bridge_started_at) || 0;
+  // v1.32.0: раньше здесь было `typeof STATE !== "undefined"` — такой переменной
+  // нет (есть только BRIDGE_STATE), поэтому grace после рестарта моста не работал
+  // никогда и все устройства сразу попадали в «Проблемные».
+  const _bs = BRIDGE_STATE.bridge_started_at || 0;
   const _bridge_grace = (_bs > 0 && (now - _bs) < BRIDGE_STARTUP_GRACE_SEC);
   const out = [];
   for (const d of devs) {
@@ -2113,7 +2203,7 @@ function sparklineSvgWithLabels(history, width, height) {
         const dur = h.end - h.start;
         const hh = Math.floor(dur / 3600);
         const mi = Math.floor((dur % 3600) / 60);
-        let durStr = "";
+        let durStr;
         if (hh > 0) durStr = `${hh}ч ${mi}м`;
         else if (mi > 0) durStr = `${mi}м`;
         else durStr = `${dur}с`;
@@ -2152,7 +2242,6 @@ function latencySparklineSvg(points, width, height) {
   // после quiet-разрывов линия уезжает в сторону, а правый
   // край пустует.
   const now = Math.floor(Date.now() / 1000);
-  const tsEnd = now;
   const tsStart = now - 24 * 3600;
   const tsSpan = 24 * 3600;
   const msValues = valid.map(p => p.ms);
@@ -2332,7 +2421,7 @@ function latencySparklineSvg(points, width, height) {
 
         // Обычная точка — цвет маркера совпадает с цветом бейджа.
         const h = hit.data;
-        let dotColor = "var(--accent)";
+        let dotColor;
         if (h.ms === null || h.ms === undefined) {
           dotColor = "var(--red)";
         } else if (h.ms >= 100) {
@@ -2344,7 +2433,8 @@ function latencySparklineSvg(points, width, height) {
         }
         const c = document.createElementNS(ns, "circle");
         c.setAttribute("class", "pt-hover hover");
-        c.setAttribute("cx", h.x);
+        // v1.32.32: не даём маркеру вылезать за область графика.
+        c.setAttribute("cx", Math.max(6, Math.min(width - 6, h.x)));
         c.setAttribute("cy", h.y);
         c.setAttribute("r", 5);
         c.setAttribute("fill", dotColor);
@@ -2380,7 +2470,7 @@ function latencySparklineSvg(points, width, height) {
           const dur = h.tsTo - h.tsFrom;
           const hh = Math.floor(dur / 3600);
           const mi = Math.floor((dur % 3600) / 60);
-          let durStr = "";
+          let durStr;
           if (hh > 0) durStr = `${hh}ч ${mi}м`;
           else durStr = `${mi}м`;
           return `<div class="tt-head">${from} — ${to}</div>
@@ -2417,6 +2507,29 @@ const _modalZoneHashes = {};
 // чтобы между автообновлениями (каждые 5 сек) выбор пользователя
 // сохранялся.
 const _CACHE_OPEN_STATE = {};
+// v1.31.10: фильтр «Кэша состояния» по источнику (только показ строк).
+const _srcLabels2 = { cloud: "Cloud", tuya_local: "tuya-local",
+                      local_db: "Локальная база", similar: "similar" };
+
+function _cacheSrcFilter(src, btn) {
+  const box = btn && btn.closest ? btn.closest(".cache-details") : null;
+  if (!box) return;
+  for (const b of box.querySelectorAll("[data-cache-src]")) {
+    b.classList.toggle("active", b === btn);
+  }
+  // v1.31.15: меняем ТОЛЬКО скобки у DP без имени; известные строки не трогаем
+  for (const tr of box.querySelectorAll("tr")) {
+    const views = tr.querySelectorAll(".cache-view");
+    if (!views.length) continue;              // известный DP — оставляем как есть
+    const mine = tr.querySelector(`.cache-view[data-src="${src}"]`);
+    const none = tr.querySelector(".cache-view-none");
+    for (const v of views) v.style.display = "none";
+    if (none) none.style.display = "none";
+    if (mine) mine.style.display = "";
+    else if (none) none.style.display = "";
+  }
+}
+
 function _onCacheToggle(deviceName, isOpen) {
   if (deviceName) _CACHE_OPEN_STATE["_cacheOpen_" + deviceName] = !!isOpen;
 }
@@ -2539,7 +2652,7 @@ function _renderInfoHtml(d) {
 function _renderClimateHtml(d) {
   if (!d || d.type !== "climate") return "";
   if (!(d.presets?.length > 0 || d.min_temp || d.max_temp)) return "";
-  let html = `<h3>Климат</h3><table class="detail-table">`;
+  let html = `<h3>Климат</h3><table class="detail-table climate-table">`;
   if (d.min_temp !== null && d.min_temp !== undefined && d.max_temp !== null && d.max_temp !== undefined)
     html += `<tr><td>Диапазон</td><td>${d.min_temp}°C — ${d.max_temp}°C (шаг ${d.temp_step || "?"})</td></tr>`;
   if (d.presets?.length > 0) {
@@ -2582,7 +2695,9 @@ function _renderLatencyHtml(d) {
   if (timeouts > 0) { if (stats) stats += " · "; stats += `<span style="color:var(--red)">timeout: ${timeouts}</span>`; }
   const cnt = latPoints.length;
   let html = `<h3>Задержка (24ч, ${cnt}) <span class="muted" style="float:right; text-transform:none; font-weight:normal;">${stats}</span></h3>`;
-  html += `<div class="sparkline" style="height:60px;">${latencySparklineSvg(latPoints, 700, 60)}</div>`;
+  // v1.32.0: было style="height:60px" при viewBox 60 и CSS-высоте 40 —
+  // график сплющивался, а снизу оставалась пустая полоса. Теперь 40/40.
+  html += `<div class="sparkline">${latencySparklineSvg(latPoints, 700, 40)}</div>`;
   return html;
 }
 
@@ -2637,9 +2752,15 @@ function _renderCacheHtml(d) {
     // ссылка на несуществующую переменную (ReferenceError при
     // display === "?"). Бейдж истинного источника:
     let badge = "";
+    // v1.31.9: бейдж = РЕАЛЬНЫЙ источник (было: любой _from_cache рисовался
+    // облачком, хотя значение могло прийти из локальной базы/кэша).
+    const _srcBadge = { cloud: "☁", tuya_local: "📚", local_db: "📦",
+                        similar: "🔗", dict: "📖", cn: "🈶" };
     if (display !== "?") {
-      if (fromCache || src === "cloud") {
-        badge = "☁";
+      if (_srcBadge[src]) {
+        badge = _srcBadge[src];
+      } else if (fromCache) {
+        badge = "📦";
       } else if (src === "dict") {
         badge = "📖";
       } else if (src === "cn") {
@@ -2656,22 +2777,82 @@ function _renderCacheHtml(d) {
     else if (!_badge && _r.badge) _badge = _r.badge;
     // v1.28.11: убран мёртвый _warn (_r.replaced не существует в resolveDpDisplay).
     const _tipText = (fromCache || src === "cloud")
-      ? _r.tooltip + (src ? "\nИсточник: " + (fromCache ? "cache" : src) : "")
+      ? _r.tooltip + "\nИсточник: "
+        + ({ cloud: "Tuya Cloud", tuya_local: "tuya-local", local_db: "локальная база",
+             similar: "похожее устройство", dict: "словарь кодов", cn: "словарь CN" }[src]
+           || (fromCache ? "кэш bridge" : src))
       : _r.tooltip;
     const _badgeHtml = _badge
       ? ` <span class="dp-tip" data-tip="${escapeAttr(_tipText)}">${_badge}</span>`
       : '';
     const val = JSON.stringify(cache[dp]);
-    // v1.25.12: обёртка .cache-dp-name — чтобы ☁ не съезжал на новую строку
-    rows += `<tr><td><span class="cache-dp-name">${escapeHtml(dp)} <span class="muted">(${escapeHtml(display)})</span>${_badgeHtml}</span></td>
-      <td>${_cellValue(val, 80)}</td></tr>`;
+    // v1.31.15: по нажатию кнопки-источника меняем ТОЛЬКО то, что в скобках
+    // у DP без имени (display === "?"). Известные DP не трогаем вообще.
+    const _rowSrc = _srcBadge[src] ? src : (fromCache ? "cache" : "");
+    // v1.31.18: варианты по источникам — для ЛЮБОГО DP, у которого есть кандидаты
+    // (меняем только то, что в скобках, остальная строка не трогается).
+    const _cand = (info._dps_candidates || {});
+    const _views = Object.entries(_cand)
+      .filter(([, c]) => c && typeof c === "object")
+      .map(([s, c]) => {
+        const nm = c.name || c.code || "";
+        if (!nm) return "";
+        const on = (s === "cloud");        // по умолчанию выбран Cloud
+        return `<span class="cache-view" data-src="${escapeAttr(s)}" `
+          + `style="display:${on ? "" : "none"};">${escapeHtml(nm)} `
+          + `<span class="dp-tip" data-tip="Источник: ${escapeAttr(_srcLabels2[s] || s)}">`
+          + `${_srcBadge[s] || ""}</span></span>`;
+      }).join("");
+    if (_views) {
+      rows += `<tr data-src="${escapeAttr(_rowSrc)}"><td>`
+        + `<span class="cache-dp-name">${escapeHtml(dp)} <span class="muted">(`
+        + `${_views}<span class="cache-view-none" style="display:none;">?</span>`
+        + `)</span></span></td><td>${_cellValue(val, 80)}</td></tr>`;
+    } else {
+      // v1.25.12: обёртка .cache-dp-name — чтобы ☁ не съезжал на новую строку
+      rows += `<tr data-src="${escapeAttr(_rowSrc)}"><td>`
+        + `<span class="cache-dp-name">${escapeHtml(dp)} <span class="muted">(${escapeHtml(display)})</span>${_badgeHtml}</span>`
+        + `</td><td>${_cellValue(val, 80)}</td></tr>`;
+    }
   }
 
+  // v1.31.10: переключатель по источникам — видно, откуда взято сопоставление
+  const _srcLabels = { cloud: "☁ Cloud", tuya_local: "📚 tuya-local",
+                       local_db: "📦 Локальная база", similar: "🔗 similar" };
+  // v1.31.17: источники берём из КАНДИДАТОВ по DP (а не из _name_source) — иначе
+  // виден только тот источник, который «победил», и бар схлопывался в одну кнопку.
+  const _have = [];
+  for (const dp of sorted) {
+    const info0 = dps_map[dp] || {};
+    for (const s of Object.keys(info0._dps_candidates || {})) {
+      if (!_have.includes(s)) _have.push(s);
+    }
+    const s0 = info0._name_source || "";
+    if (s0 && !_have.includes(s0)) _have.push(s0);
+  }
+  // v1.31.14: бар показываем всегда (4 источника) — источник без данных приглушён,
+  // но выбрать его можно: DP будут помечены «не найдено».
+  // v1.31.16: только те источники, где есть хоть одно совпадение для устройства
+  // (similar убран как бессмысленный), по умолчанию — Cloud (или первый доступный).
+  const _pickable = ["cloud", "tuya_local", "local_db"].filter(s => _have.includes(s));
+  const _defSrc = _pickable.includes("cloud") ? "cloud" : (_pickable[0] || "");
+  const _srcBar = _pickable.length
+    ? `<div class="cache-src-bar">`
+      + _pickable.map(s => {
+          const on = (s === _defSrc);
+          return `<button type="button" class="cache-src-btn${on ? " active" : ""}" `
+            + `data-cache-src="${s}" onclick="_cacheSrcFilter('${s}', this)">${_srcLabels[s] || s}</button>`;
+        }).join("")
+      + `</div>`
+      + `<div class="muted cache-src-hint">Выберите источник — у DP **без имени** `
+      + `подставится его код из этого источника</div>`
+    : "";
   return `<details class="cache-details" ${isOpen}
       ontoggle="_onCacheToggle('${escapeAttr(d.name || "")}', this.open)">
     <summary><h3 style="display:inline; margin:0;">Кэш состояния (${keys.length})</h3>
       <span class="muted" style="font-size:11px; margin-left:6px;">${_CACHE_OPEN_STATE[cacheKey] ? "" : "клик — раскрыть"}</span>
     </summary>
+    ${_srcBar}
     <table class="detail-table" style="margin-top:6px;">${rows}</table>
   </details>`;
 }
@@ -2908,7 +3089,6 @@ async function showDevice(idx) {
 let QUIET_EDIT = { windows: [] };
 
 function renderQuietSection(d) {
-  const wins = d.quiet_windows || [];
   const now = Math.floor(Date.now()/1000);
   const inQuiet = d.quiet || (d.quiet_until && d.quiet_until > now);
 
@@ -2930,7 +3110,7 @@ function renderQuietSection(d) {
       <button class="danger" style="padding:2px 8px; font-size:11px;" onclick="quietRemove(${i})">×</button>
     </div>`;
   }
-  if (!rows) rows = '<div class="muted" style="font-size:12px;">Окон нет — устройство всегда активно.</div>';
+  // v1.31.12: надпись «окон нет» убрана — пустой список говорит сам за себя
 
   return `<h3 class="${cls}">
       <span class="quiet-emoji">${emoji}</span>
@@ -3049,7 +3229,8 @@ function quietRemove(i) {
     const row = wrap.querySelector(`.quiet-row[data-qidx="${i}"]`);
     if (row) row.remove();
     if (QUIET_EDIT.windows.length === 0) {
-      wrap.innerHTML = '<div class="muted quiet-placeholder" style="font-size:12px;">Окон нет — устройство всегда активно.</div>';
+      // v1.31.12: надпись «Окон нет» убрана — пустой список говорит сам за себя
+      wrap.innerHTML = "";
     } else {
       quietReindexRows();
     }
@@ -3231,6 +3412,31 @@ function editDevice(name) {
   // v1.28.12: поля активны сразу, без чекбоксов.
   document.getElementById("edit-device-ip").value = d.ip || "";
   document.getElementById("edit-device-version").value = d.version || "3.3";
+  // v1.29.2: тип устройства (платформа HA) — редактируемый.
+  const _typeSel = document.getElementById("edit-device-type");
+  if (_typeSel) _typeSel.value = d.type || "switch";
+
+  // v1.32.0: expire_after — только батарейным. Есть значение → поле ввода и
+  // «Сбросить по умолчанию»; нет → подпись и «Задать».
+  _EDIT_EXPIRE_RESET = false;
+  const _expRow = document.getElementById("edit-device-expire-row");
+  const _expInp = document.getElementById("edit-device-expire");
+  const _expNote = document.getElementById("edit-device-expire-note");
+  const _expBtnSet = document.getElementById("edit-device-expire-set");
+  const _expBtnReset = document.getElementById("edit-device-expire-reset");
+  const _hasExp = (d.expire_after !== undefined && d.expire_after !== null);
+  if (_expRow) _expRow.style.display = d.battery_powered ? "" : "none";
+  if (_expInp) {
+    _expInp.value = _hasExp ? String(d.expire_after) : "";
+    _expInp.style.display = _hasExp ? "" : "none";
+    _expInp.classList.remove("invalid-input");
+  }
+  if (_expNote) {
+    _expNote.textContent = "Не задано — применяется значение по умолчанию (bridge)";
+    _expNote.style.display = _hasExp ? "none" : "";
+  }
+  if (_expBtnSet) _expBtnSet.style.display = _hasExp ? "none" : "";
+  if (_expBtnReset) _expBtnReset.style.display = _hasExp ? "" : "none";
   document.getElementById("edit-device-key").value = "";
   // v1.28.26: type="text" — пользователь должен видеть, что вводит.
   // Текущий key показывается отдельно (👁 Показать в модалке устройства).
@@ -3444,6 +3650,13 @@ function _editDeviceCountChanges() {
     changes.version = ver;
   }
 
+  // v1.29.2: тип устройства (платформа HA).
+  const _typeEl = document.getElementById("edit-device-type");
+  const _typeVal = _typeEl ? _typeEl.value : "";
+  if (_typeVal && _typeVal !== (d.type || "")) {
+    changes.type = _typeVal;
+  }
+
   // v1.28.14: key — любое непустое. Длину проверяет bridge (_is_valid_key: 10–50).
   const key = document.getElementById("edit-device-key").value;
   if (key && key.length > 0) {
@@ -3454,6 +3667,26 @@ function _editDeviceCountChanges() {
   const _cur_bat = d.battery_powered ? "true" : "false";
   if (bat !== _cur_bat) {
     changes.battery_powered = (bat === "true");
+  }
+
+  // v1.32.0: expire_after (только батарейным).
+  //  поле видно → пишем его значение; «Сбросить по умолчанию» → null (удалить поле).
+  const _expRow = document.getElementById("edit-device-expire-row");
+  const _expInp = document.getElementById("edit-device-expire");
+  if (_expRow && _expInp && _expRow.style.display !== "none") {
+    const _oldExp = (d.expire_after === undefined || d.expire_after === null)
+      ? null : d.expire_after;
+    if (_EDIT_EXPIRE_RESET) {
+      if (_oldExp !== null) changes.expire_after = null;
+    } else if (_expInp.style.display !== "none") {
+      const _raw = _expInp.value.trim();
+      const _n = Number(_raw);
+      const _bad = (_raw === "" || !Number.isInteger(_n) || _n <= 0);
+      _expInp.classList.toggle("invalid-input", _bad);
+      if (!_bad && _n !== _oldExp) changes.expire_after = _n;
+    } else {
+      _expInp.classList.remove("invalid-input");
+    }
   }
 
   return { count: Object.keys(changes).length, changes: changes };
@@ -3497,6 +3730,12 @@ function _editDeviceMarkModified() {
   setMod("edit-device-version", verMod);
   setLabelMod("edit-device-version-label", verMod);
 
+  // v1.29.2: тип устройства
+  const _typeMark = document.getElementById("edit-device-type");
+  const _typeMarkMod = !!_typeMark && _typeMark.value !== (d.type || "");
+  setMod("edit-device-type", _typeMarkMod);
+  setLabelMod("edit-device-type-label", _typeMarkMod);
+
   // v1.28.14: key — подсветка при любом непустом. Длину решает bridge.
   const key = document.getElementById("edit-device-key").value;
   const keyMod = key && key.length > 0;
@@ -3511,12 +3750,47 @@ function _editDeviceMarkModified() {
   setLabelMod("edit-device-battery-label", batMod);
 }
 
+// v1.32.0: expire_after в ✏️.
+//  «Задать» — только показывает поле ввода (применяется кнопкой «Сохранить»);
+//  «Сбросить по умолчанию» — видна лишь когда значение уже задано в конфиге.
+let _EDIT_EXPIRE_RESET = false;
+
+function editDeviceExpireSet() {
+  const inp = document.getElementById("edit-device-expire");
+  const note = document.getElementById("edit-device-expire-note");
+  const btnSet = document.getElementById("edit-device-expire-set");
+  if (!inp) return;
+  _EDIT_EXPIRE_RESET = false;
+  inp.style.display = "";
+  if (inp.value === "") inp.value = "3600";
+  if (note) note.style.display = "none";
+  if (btnSet) btnSet.style.display = "none";
+  inp.focus();
+  updateEditSubmitState();
+}
+
+function editDeviceExpireReset() {
+  const inp = document.getElementById("edit-device-expire");
+  const note = document.getElementById("edit-device-expire-note");
+  const btnSet = document.getElementById("edit-device-expire-set");
+  const btnReset = document.getElementById("edit-device-expire-reset");
+  if (!inp) return;
+  _EDIT_EXPIRE_RESET = true;
+  inp.style.display = "none";
+  inp.value = "";
+  inp.classList.remove("invalid-input");
+  if (note) { note.style.display = ""; note.textContent = "Не задано — применяется значение по умолчанию (bridge)"; }
+  if (btnSet) btnSet.style.display = "";
+  if (btnReset) btnReset.style.display = "none";
+  updateEditSubmitState();
+}
+
 function updateEditSubmitState() {
   if (!EDIT_DEVICE_NAME) return;
   const d = LAST_DEVICES.find(x => x.name === EDIT_DEVICE_NAME);
   if (!d) return;
 
-  const { count, changes } = _editDeviceCountChanges();
+  const { count } = _editDeviceCountChanges();
 
   const btn = document.getElementById("edit-device-submit");
   btn.disabled = (count === 0);
@@ -3618,7 +3892,7 @@ async function submitEditDevice() {
   }
 }
 
-function logLevelPass(level, source) {
+function logLevelPass(level) {
   // v1.28.86: уровни работают одинаково для Bridge и WebUI.
   return (LEVEL_ORDER[level || "INFO"] || 1) >= (LEVEL_ORDER[LOG_LEVEL_FILTER] || 0);
 }
@@ -3861,7 +4135,11 @@ function findNext() {
 }
 function findPrev() {
   if (SEARCH_MATCHES.length === 0) return;
-  SEARCH_CURRENT = (SEARCH_CURRENT - 1 + SEARCH_MATCHES.length) % SEARCH_MATCHES.length;
+  // v1.32.0: при «ничего не выбрано» (-1) шаг назад должен попадать на ПОСЛЕДНЕЕ
+  // совпадение, а не на предпоследнее (последнее пропускалось).
+  SEARCH_CURRENT = SEARCH_CURRENT < 0
+    ? SEARCH_MATCHES.length - 1
+    : (SEARCH_CURRENT - 1 + SEARCH_MATCHES.length) % SEARCH_MATCHES.length;
   SEARCH_MATCHES.forEach(el => el.classList.remove("current-match"));
   const el = SEARCH_MATCHES[SEARCH_CURRENT];
   if (!el || !el.isConnected) { SEARCH_CURRENT = -1; return; }
@@ -3939,6 +4217,39 @@ async function loadLogHistory() {
   } catch (e) { return 0; }
 }
 
+async function cleanupOrphans() {
+  const btn = document.getElementById("cleanup-orphans-btn");
+  const res = document.getElementById("cleanup-result");
+  const ok = await uiConfirm(
+    "Очистить «зависшие» топики (orphan)?",
+    "«Зависшие» — это retained-топики Discovery, которые bridge публиковал раньше, "
+    + "а сейчас они не нужны: удалили устройство, убрали DP, переименовали сущность. "
+    + "Home Assistant держит их как «фантомные» сущности.\n\n"
+    + "В отличие от «Очистить Discovery», здесь bridge удаляет ТОЛЬКО те топики, которых "
+    + "нет в текущем наборе: живые сущности не пропадают и не перезагружаются.\n\n"
+    + "Конфиг устройств и данные не трогаются.",
+    { okText: "Очистить" });
+  if (!ok) return;
+  btn.disabled = true;
+  if (res) { res.textContent = "Ищу «зависшие» топики…"; res.style.color = ""; }
+  try {
+    const r = await fetch("/api/cleanup/orphans", { method: "POST" });
+    const data = await r.json();
+    if (data.ok) {
+      const n = data.removed ?? 0;
+      setStatus(res, true, n
+        ? `✅ Успех: удалено «зависших» топиков ${n} (живых не тронуто: ${data.kept ?? 0})`
+        : `✅ «Зависших» не найдено (проверено ${data.seen ?? 0}, живых ${data.kept ?? 0})`);
+    } else {
+      setStatus(res, false, "❌ Ошибка: " + (data.error || "неизвестно"));
+    }
+  } catch (e) {
+    setStatus(res, false, "❌ Ошибка: " + e.message);
+  }
+  btn.disabled = false;
+  setTimeout(() => { if (res) { res.textContent = ""; res.style.color = ""; } }, 20000);
+}
+
 async function doCleanup() {
   const btn = document.getElementById("cleanup-btn");
   const res = document.getElementById("cleanup-result");
@@ -3956,59 +4267,111 @@ async function doCleanup() {
     {okText: "Очистить"});
   if (!ok) return;
   btn.disabled = true; res.innerHTML = '<span class="spin"></span>';
-  try { await fetch("/api/cleanup", { method: "POST" }); res.textContent = "✅ отправлено"; }
-  catch (e) { res.textContent = "❌ " + e.message; }
+  try {
+    const r = await fetch("/api/cleanup", { method: "POST" });
+    const data = await r.json();
+    if (data.ok) {
+      setStatus(res, true, `✅ Успех: удалено топиков ${data.removed ?? 0}, `
+        + `перепубликовано ${data.republished ?? 0}`);
+    } else {
+      setStatus(res, false, "❌ Ошибка: " + (data.error || "неизвестно"));
+    }
+  } catch (e) {
+    setStatus(res, false, "❌ Ошибка: " + e.message);
+  }
   btn.disabled = false;
-  setTimeout(() => res.textContent = "", 5000);
+  setTimeout(() => { if (res) { res.textContent = ""; res.style.color = ""; } }, 20000);
 }
 
 // ==================== LATENCY REFRESH ====================
+// v1.33.6: кнопка «📡 Ping» — одна операция, устойчивая к перезагрузке страницы.
+function _latencyBtnIdle(btn) {
+  if (!btn) return;
+  btn.disabled = false;
+  btn.innerHTML = '📡<span class="btn-label"> Ping</span><span class="btn-label-short"> Ping</span>';
+}
+let _LATENCY_POLL_FAILS = 0;
+function pollLatencyProgress(btn) {
+  btn = btn || document.getElementById("latency-btn");
+  _LATENCY_POLL_FAILS = 0;
+  const poll = async () => {
+    try {
+      const s = await (await fetch("/api/latency/refresh/progress")).json();
+      if (s.running) {
+        btn.disabled = true;
+        const pct = s.total > 0 ? Math.round((s.current / s.total) * 100) : 0;
+        btn.innerHTML = `<span class="spin"></span> ${s.current}/${s.total} (${pct}%)`;
+        setTimeout(poll, 800);
+      } else {
+        btn.textContent = "✅ Готово";
+        setTimeout(fetchStatus, 500);
+        if (VIEW === "analytics" && ANALYTICS_ENABLED) loadAnalytics();
+        setTimeout(() => _latencyBtnIdle(btn), 5000);
+      }
+    } catch (e) {
+      // v1.32.0: после 5 неудач возвращаем кнопку — раньше опрос шёл бесконечно.
+      if (++_LATENCY_POLL_FAILS <= 5) {
+        setTimeout(poll, 1500);
+      } else {
+        btn.textContent = "❌ " + (e.message || "прогресс недоступен");
+        setTimeout(() => _latencyBtnIdle(btn), 3000);
+      }
+    }
+  };
+  poll();
+}
 async function doLatencyRefresh() {
   const btn = document.getElementById("latency-btn");
-  const oldText = btn.textContent;
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Замер…';
+  if (btn && btn.disabled) return;   // v1.33.6: не дублируем замер
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Замер…'; }
 
   try {
     const r = await fetch("/api/latency/refresh", { method: "POST" });
     const data = await r.json();
     if (!data.ok) {
-      btn.textContent = "❌ " + (data.error || "занято");
-      setTimeout(() => { btn.textContent = oldText; btn.disabled = false; }, 3000);
+      // замер уже идёт (таймер или второй клиент) — просто подхватываем прогресс,
+      // а не показываем ошибку и не сбиваем его (правило «один замер»).
+      if (/already running|занято|уже/i.test(String(data.error || ""))) {
+        pollLatencyProgress(btn);
+        return;
+      }
+      if (btn) btn.textContent = "❌ " + (data.error || "занято");
+      setTimeout(() => _latencyBtnIdle(btn), 3000);
       return;
     }
-    const poll = async () => {
-      try {
-        const s = await (await fetch("/api/latency/refresh/progress")).json();
-        if (s.running) {
-          const pct = s.total > 0 ? Math.round((s.current / s.total) * 100) : 0;
-          btn.innerHTML = `<span class="spin"></span> ${s.current}/${s.total} (${pct}%)`;
-          setTimeout(poll, 800);
-        } else {
-          btn.textContent = "✅ Готово";
-          setTimeout(fetchStatus, 500);
-          if (VIEW === "analytics" && ANALYTICS_ENABLED) loadAnalytics();
-          setTimeout(() => { btn.textContent = oldText; btn.disabled = false; }, 5000);
-        }
-      } catch (e) {
-        setTimeout(poll, 1500);
-      }
-    };
-    poll();
+    pollLatencyProgress(btn);
   } catch (e) {
-    btn.textContent = "❌ " + e.message;
-    setTimeout(() => { btn.textContent = oldText; btn.disabled = false; }, 3000);
+    if (btn) btn.textContent = "❌ " + e.message;
+    setTimeout(() => _latencyBtnIdle(btn), 3000);
   }
+}
+
+// v1.33.6: при открытии/перезагрузке страницы показываем реальный статус
+// замера (идёт по таймеру или запущен вручную) — кнопка не «сбрасывается».
+async function resumeLatencyButton() {
+  const btn = document.getElementById("latency-btn");
+  if (!btn) return;
+  try {
+    const s = await (await fetch("/api/latency/refresh/progress")).json();
+    if (s.running) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span> Замер…';
+      pollLatencyProgress(btn);
+    }
+  } catch (e) { /* нет состояния — не мешаем */ }
 }
 
 // ==================== DB CLEANUP ====================
 function openDbCleanup() {
+  setOverlayBusy("db-cleanup-overlay", false);
+  setModalFooterState("db-cleanup-cancel", "db-cleanup-hint", "idle");
   const res = document.getElementById("db-cleanup-result");
   if (res) res.textContent = "";
   updateDbCleanupForm();
   document.getElementById("db-cleanup-overlay").classList.add("open");
 }
 function closeDbCleanup(evt) {
+  if (overlayBusy("db-cleanup-overlay")) return;   // идёт операция
   if (evt && evt.target && evt.target.id !== "db-cleanup-overlay") return;
   document.getElementById("db-cleanup-overlay").classList.remove("open");
 }
@@ -4029,7 +4392,7 @@ async function doDbCleanup() {
   } else if (scope === "custom") {
     const days = parseInt(document.getElementById("db-keep-days").value) || 0;
     const hours = parseInt(document.getElementById("db-keep-hours").value) || 0;
-    if (days === 0 && hours === 0) { res.textContent = "❌ Укажи дни или часы"; return; }
+    if (days === 0 && hours === 0) { setStatus(res, false, "❌ Укажи дни или часы"); return; }
     body = { keep_days: days, keep_hours: hours };
     msg = `Удалить данные старше ${days}д ${hours}ч?`;
   } else {
@@ -4040,26 +4403,495 @@ async function doDbCleanup() {
   const ok = await uiConfirm("Очистить БД", msg + " Действие необратимо.", {danger:true, okText:"Удалить"});
   if (!ok) return;
   btn.disabled = true; res.innerHTML = '<span class="spin"></span> удаление…';
+  setOverlayBusy("db-cleanup-overlay", true);
+  setModalFooterState("db-cleanup-cancel", "db-cleanup-hint", "busy", "Идёт удаление…");
   try {
     const r = await fetch("/api/db/cleanup", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
     const data = await r.json();
-    if (data.ok) { res.textContent = `✅ Удалено: ${data.deleted}`; setTimeout(closeDbCleanup, 1500); }
-    else res.textContent = "❌ " + (data.error || "ошибка");
-  } catch (e) { res.textContent = "❌ " + e.message; }
+    if (data.ok) {
+      setStatus(res, true, `✅ Удалено: ${data.deleted}`);
+      setOverlayBusy("db-cleanup-overlay", false);
+      setModalFooterState("db-cleanup-cancel", "db-cleanup-hint", "done",
+                          "Готово — окно закроется само");
+      setTimeout(closeDbCleanup, 1500);
+    } else {
+      setStatus(res, false, "❌ " + (data.error || "ошибка"));
+      setOverlayBusy("db-cleanup-overlay", false);
+      setModalFooterState("db-cleanup-cancel", "db-cleanup-hint", "error",
+                          "Не удалось — можно закрыть окно");
+    }
+  } catch (e) {
+    setStatus(res, false, "❌ " + e.message);
+    setOverlayBusy("db-cleanup-overlay", false);
+    setModalFooterState("db-cleanup-cancel", "db-cleanup-hint", "error",
+                        "Не удалось — можно закрыть окно");
+  }
   btn.disabled = false;
 }
 
 // ==================== AUDIT (config history) CLEANUP ====================
+// ==================== v1.30.0: ИНСТРУМЕНТЫ КОНФИГА ====================
+// Отчёт по конфигу и операции с expire_after выполняет bridge
+// (единый белый список, один бэкап, запись в «Историю конфига»).
+function _cfgToolsStatus(text, isErr) {
+  const el = document.getElementById("cfg-tools-status");
+  if (!el) return;
+  el.textContent = text || "";
+  // v1.31.4: успех — зелёный, ошибка — красная (единый вид статусов)
+  el.style.color = isErr ? "var(--red)"
+                        : (String(text || "").startsWith("✅") ? "var(--green)" : "");
+}
+
+// v1.30.1: понятная подсказка, если bridge не ответил (частая причина —
+// контейнер bridge не обновлён/не перезапущен).
+function _cfgToolsError(err) {
+  let msg = "❌ " + (err || "ошибка");
+  if (String(err || "").toLowerCase().includes("timeout")) {
+    msg += " — bridge не ответил. Проверьте, что контейнер bridge обновлён "
+      + "и перезапущен (версия bridge видна в шапке, нужна 1.11.0+)";
+  }
+  _cfgToolsStatus(msg, true);
+}
+
+function _cfgToolsStatusHtml(html) {
+  const el = document.getElementById("cfg-tools-status");
+  if (!el) return;
+  el.innerHTML = html || "";
+  el.style.color = "";
+}
+
+// v1.31.10: читаемый отчёт конфига — что именно и где лишнее (красным),
+// а не сырой JSON.
+function _cfgToolsReportDevices(devices) {
+  const el = document.getElementById("cfg-tools-report");
+  if (!el) return;
+  const bad = (arr) => arr.map(x => `<span class="cfg-rep-bad">${escapeHtml(String(x))}</span>`).join(", ");
+  let html = "";
+  let shown = 0;
+  for (const d of (devices || [])) {
+    const dev = d.device_extra || [];
+    const dps = d.dp_extra || {};
+    const dpKeys = Object.keys(dps);
+    if (!dev.length && !dpKeys.length) continue;
+    shown++;
+    html += `<div class="cfg-rep-dev"><b>${escapeHtml(d.friendly_name || d.name || "?")}</b>`
+          + ` <span class="muted">(${escapeHtml(d.name || "?")}, ${escapeHtml(d.type || "?")})</span>`;
+    if (dev.length) html += ` — лишние поля устройства: ${bad(dev)}`;
+    html += `</div>`;
+    for (const dp of dpKeys) {
+      html += `<div class="cfg-rep-dp">DP ${escapeHtml(dp)} — лишние поля: ${bad(dps[dp])}</div>`;
+    }
+  }
+  if (!shown) html = `<span class="cfg-rep-ok">✅ Лишних полей нет — конфиг чистый</span>`;
+  el.style.display = "";
+  el.innerHTML = html;
+}
+
+function _cfgToolsReport(obj) {
+  const el = document.getElementById("cfg-tools-report");
+  if (!el) return;
+  if (obj === null || obj === undefined) {
+    el.style.display = "none";
+    el.textContent = "";
+    return;
+  }
+  el.style.display = "";
+  el.textContent = JSON.stringify(obj, null, 2);
+}
+
+async function toolConfigReport() {
+  _cfgToolsStatus("Проверяю конфиг…");
+  try {
+    const r = await fetch("/api/config/report?_=" + Date.now());
+    const data = await r.json();
+    if (!data.ok) { _cfgToolsError(data.error); return; }
+    const s = data.summary || {};
+    // v1.31.7: отчёт читаемыми плитками (как в пересборке), а не одной строкой
+    _cfgToolsStatusHtml(`<div class="rebuild-stats">`
+      + _rstat("устройств", s.devices, "")
+      + _rstat("DP всего", s.dp_total, "")
+      + _rstat("лишних полей", s.extra_total, s.extra_total ? "warn" : "zero",
+               "Поля, которые bridge не читает и UI не использует — их уберёт «Нормализовать конфиг»")
+      + _rstat("в устройствах", s.device_extra, s.device_extra ? "warn" : "zero")
+      + _rstat("в DP", s.dp_extra, s.dp_extra ? "warn" : "zero")
+      + _rstat("батарейных", s.battery, "")
+      + _rstat("без expire_after", s.battery_without_expire, "ok",
+               "Батарейные без своего expire_after — применяется значение по умолчанию "
+               + "(это нормальное поведение)")
+      + `</div>`);
+    _cfgToolsReportDevices(data.devices || []);
+  } catch (e) { _cfgToolsStatus("❌ " + e.message, true); }
+}
+
+async function toolExpireClear() {
+  const ok = await uiConfirm(
+    "Очистить expire_after?",
+    "У всех устройств будет удалено поле expire_after.\n"
+    + "Батарейные вернутся к значению по умолчанию (bridge), у проводных это был мусор.\n\n"
+    + "Discovery будет перепубликован, операция попадёт в историю конфига.");
+  if (!ok) return;
+  _cfgToolsStatus("Очищаю…");
+  try {
+    const r = await fetch("/api/config/expire_clear", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    const data = await r.json();
+    if (!data.ok) { _cfgToolsError(data.error); return; }
+    const names = data.cleared || [];
+    _cfgToolsStatus(names.length
+      ? `✅ Очищено у ${names.length}: ${names.join(", ")}`
+      : "Нечего очищать — поля нет ни у кого");
+    _cfgToolsReport(names);
+    fetchStatus();   // v1.30.1: в ✏️/дашборде сразу видно новое состояние
+  } catch (e) { _cfgToolsStatus("❌ " + e.message, true); }
+}
+
+async function toolExpireFill() {
+  const v = await uiPrompt("expire_after для батарейных",
+    "Сколько секунд? Значение будет проставлено всем батарейным устройствам.",
+    { value: "3600", placeholder: "например 3600" });
+  if (v === null || v === undefined) return;
+  const num = Number(String(v).trim());
+  if (!Number.isInteger(num) || num <= 0) {
+    _cfgToolsStatus("❌ Нужно целое число больше 0", true);
+    return;
+  }
+  _cfgToolsStatus("Записываю…");
+  try {
+    const r = await fetch("/api/config/expire_fill", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value: num }),
+    });
+    const data = await r.json();
+    if (!data.ok) { _cfgToolsError(data.error); return; }
+    const names = data.changed || [];
+    _cfgToolsStatus(names.length
+      ? `✅ Проставлено ${num} с у ${names.length}: ${names.join(", ")}`
+      : `Нечего менять — у всех батарейных уже ${num} с`);
+    _cfgToolsReport(names);
+    fetchStatus();
+  } catch (e) { _cfgToolsStatus("❌ " + e.message, true); }
+}
+
+// ==================== v1.33.5: нормализация конфига (модалка с галками) ====================
+function _normalizeFlags() {
+  const extra = document.getElementById("norm-extra");
+  const types = document.getElementById("norm-types");
+  return {
+    remove_extra: !extra || !!extra.checked,
+    fix_types: !types || !!types.checked,
+  };
+}
+function normalizeInvalidate() {
+  // после смены галок прошлый отчёт неактуален — применение блокируем
+  const apply = document.getElementById("normalize-apply-btn");
+  if (apply) apply.disabled = true;
+  const res = document.getElementById("normalize-result");
+  if (res) res.textContent = "";
+  const hint = document.getElementById("normalize-hint");
+  if (hint) hint.textContent = "";
+}
+function openNormalizeConfig() {
+  const res = document.getElementById("normalize-result");
+  if (res) { res.textContent = ""; res.style.color = ""; }
+  const hint = document.getElementById("normalize-hint");
+  if (hint) hint.textContent = "";
+  const apply = document.getElementById("normalize-apply-btn");
+  if (apply) apply.disabled = true;
+  const extra = document.getElementById("norm-extra");
+  const types = document.getElementById("norm-types");
+  if (extra) extra.checked = true;
+  if (types) types.checked = true;
+  const check = document.getElementById("normalize-check-btn");
+  if (check) { check.disabled = false; check.textContent = "🔍 Проверить"; }
+  document.getElementById("normalize-overlay").classList.add("open");
+}
+function closeNormalizeConfig(evt) {
+  if (evt && evt.target && evt.target.id !== "normalize-overlay") return;
+  document.getElementById("normalize-overlay").classList.remove("open");
+}
+function _normalizeFixesText(fixes) {
+  if (!fixes || !Object.keys(fixes).length) return "ничего не потребовалось";
+  const labels = {
+    enabled: "enabled → bool", battery_powered: "battery_powered → bool",
+    id_to_str: "id → строка", version_to_str: "version → строка",
+    trim: "убраны пробелы", expire_after: "expire_after",
+    dps_map: "dps_map → словарь", dp_entry: "битые записи DP",
+    dp_empty: "пустые записи DP", dp_key: "ключи DP → строки",
+  };
+  return Object.entries(fixes)
+    .filter(([, n]) => n)
+    .map(([k, n]) => `${labels[k] || k}: ${n}`)
+    .join(", ") || "ничего не потребовалось";
+}
+async function normalizeDryRun() {
+  const f = _normalizeFlags();
+  const res = document.getElementById("normalize-result");
+  const hint = document.getElementById("normalize-hint");
+  const apply = document.getElementById("normalize-apply-btn");
+  const check = document.getElementById("normalize-check-btn");
+  if (!f.remove_extra && !f.fix_types) {
+    setStatus(res, false, "Отметь хотя бы одно действие");
+    return;
+  }
+  if (check) { check.disabled = true; check.textContent = "Проверяю…"; }
+  if (apply) apply.disabled = true;
+  if (res) { res.textContent = "Считаю, что будет исправлено…"; res.style.color = ""; }
+  try {
+    const r = await fetch("/api/config/normalize", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ dry_run: true }, f)),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      setStatus(res, false, d.error || "ошибка");
+      return;
+    }
+    const s = d.before || {};
+    const parts = [];
+    if (f.remove_extra) parts.push(`удалить лишних полей: ${d.removed || 0}`);
+    if (f.fix_types) parts.push(`исправить значений — ${_normalizeFixesText(d.fixes)}`);
+    setStatusHtml(res, true,
+      `Будет: ${escapeHtml(parts.join("; "))}.<br>`
+      + `Устройств: ${s.devices}, DP: ${s.dp_total}, лишних полей сейчас: ${s.extra_total}.`);
+    if (hint) hint.textContent = "Проверено — можно применять";
+    if (apply) apply.disabled = false;
+  } catch (e) {
+    setStatus(res, false, e.message);
+  } finally {
+    if (check) { check.disabled = false; check.textContent = "🔍 Проверить"; }
+  }
+}
+async function normalizeApply() {
+  const f = _normalizeFlags();
+  const res = document.getElementById("normalize-result");
+  const hint = document.getElementById("normalize-hint");
+  const apply = document.getElementById("normalize-apply-btn");
+  const ok = await uiConfirm(
+    "Нормализовать конфиг?",
+    (f.remove_extra ? "• синтаксис: удалить лишние/неизвестные поля\n" : "")
+    + (f.fix_types ? "• формат: исправить типы значений\n" : "")
+    + "\nПеред записью делается бэкап конфига.");
+  if (!ok) return;
+  if (apply) apply.disabled = true;
+  if (hint) hint.textContent = "Идёт запись…";
+  if (res) { res.textContent = "Нормализую…"; res.style.color = ""; }
+  try {
+    const r = await fetch("/api/config/normalize", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ dry_run: false }, f)),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      setStatus(res, false, d.error || "ошибка");
+      if (hint) hint.textContent = "";
+      return;
+    }
+    const s = d.after || {};
+    setStatusHtml(res, true,
+      `Готово. Удалено полей: <b>${d.removed || 0}</b>. `
+      + `Исправлено: ${escapeHtml(_normalizeFixesText(d.fixes))}. `
+      + `Осталось лишних: ${s.extra_total}.`);
+    if (hint) hint.textContent = "Готово";
+    _cfgToolsReport({ before: d.before, after: d.after });
+    fetchStatus();
+  } catch (e) {
+    setStatus(res, false, e.message);
+  }
+}
+
+// ==================== v1.31.0: ОТКАТ КОНФИГА ИЗ БЭКАПА ====================
+// Бэкапы живут у bridge (папка backup), поэтому список и откат — через него.
+let CFG_BACKUPS = [];
+
+function _fmtBackupName(n) {
+  // devices_config.json.bak.20260924_101530[_2] → 24.09.2026 10:15:30
+  const m = /\.bak\.(\d{8})_(\d{6})(?:_(\d+))?$/.exec(n || "");
+  if (!m) return n || "?";
+  const d = m[1], t = m[2];
+  let s = `${d.slice(6, 8)}.${d.slice(4, 6)}.${d.slice(0, 4)} `
+        + `${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`;
+  if (m[3]) s += ` (#${m[3]})`;
+  return s;
+}
+
+function _fmtSize(b) {
+  if (b === undefined || b === null) return "";
+  if (b < 1024) return `${b} Б`;
+  if (b < 1048576) return `${(b / 1024).toFixed(1)} КБ`;
+  return `${(b / 1048576).toFixed(2)} МБ`;
+}
+
+// v1.31.3: в модалках, где действие выполняется внутри окна, кнопка «Закрыть»
+// не должна выглядеть как «отмена операции»: пока операция идёт и после успеха
+// она неактивна — окно закрывается крестиком ✕ или Esc (подсказка в футере).
+function setModalFooterState(cancelId, hintId, state, text) {
+  const b = document.getElementById(cancelId);
+  const h = document.getElementById(hintId);
+  // v1.31.4: кнопки «Закрыть» блокируем ТОЛЬКО на время операции — после
+  // завершения (успех/ошибка) она снова доступна.
+  if (b) b.disabled = (state === "busy");
+  if (h) {
+    h.textContent = (state === "idle") ? "" : (text || "");
+    h.style.color = (state === "done") ? "var(--green)"
+                  : (state === "idle" ? "" : "var(--red)");
+  }
+}
+
+// v1.31.4: пока модалка занята операцией — закрыть её нельзя (✕, Esc, фон).
+function setOverlayBusy(overlayId, busy) {
+  const ov = document.getElementById(overlayId);
+  if (ov) ov.dataset.busy = busy ? "1" : "";
+  if (ov) {
+    const x = ov.querySelector(".modal-close");
+    if (x) x.disabled = !!busy;
+  }
+}
+
+function overlayBusy(overlayId) {
+  const ov = document.getElementById(overlayId);
+  return !!ov && ov.dataset.busy === "1";
+}
+
+// v1.31.6: плитка отчёта пересборки — цифра сверху, подпись снизу.
+function _rstat(label, value, cls, title) {
+  return `<span class="rstat ${cls || ""}"${title ? ` title="${escapeAttr(title)}"` : ""}>`
+       + `<b>${escapeHtml(String(value))}</b><span>${escapeHtml(label)}</span></span>`;
+}
+
+// v1.31.4: единый цвет статусов — успех зелёный, ошибка красная.
+function setStatus(elOrId, ok, text) {
+  const el = (typeof elOrId === "string") ? document.getElementById(elOrId) : elOrId;
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = ok ? "var(--green)" : "var(--red)";
+}
+
+function setStatusHtml(elOrId, ok, html) {
+  const el = (typeof elOrId === "string") ? document.getElementById(elOrId) : elOrId;
+  if (!el) return;
+  el.innerHTML = html;
+  el.style.color = ok ? "var(--green)" : "var(--red)";
+}
+
+async function openConfigRestore() {
+  setOverlayBusy("cfg-restore-overlay", false);
+  setModalFooterState("cfg-restore-cancel", "cfg-restore-hint", "idle");
+  const res = document.getElementById("cfg-restore-result");
+  const list = document.getElementById("cfg-restore-list");
+  const btn = document.getElementById("cfg-restore-btn");
+  if (res) res.textContent = "";
+  if (btn) { btn.disabled = true; btn.textContent = "↩️ Откатить"; }
+  list.innerHTML = '<span class="spin"></span> загрузка…';
+  document.getElementById("cfg-restore-overlay").classList.add("open");
+  try {
+    const r = await fetch("/api/config/backups?_=" + Date.now());
+    const data = await r.json();
+    if (!data.ok) {
+      list.innerHTML = `<span style="color:var(--red);">❌ ${escapeHtml(data.error || "ошибка")}</span>`;
+      return;
+    }
+    CFG_BACKUPS = data.backups || [];
+    if (!CFG_BACKUPS.length) {
+      list.innerHTML = '<div style="padding:10px;" class="muted">Бэкапов пока нет.</div>';
+      return;
+    }
+    list.innerHTML = CFG_BACKUPS.map((b, i) =>
+      `<div class="restore-item${i === 0 ? " active" : ""}" onclick="pickConfigBackup('${escapeAttr(b.name)}')">`
+      + `<input type="radio" name="cfg-restore-pick" value="${escapeAttr(b.name)}"${i === 0 ? " checked" : ""}>`
+      + `<span class="restore-when">${escapeHtml(_fmtBackupName(b.name))}</span>`
+      + `<span class="restore-size muted">${escapeHtml(_fmtSize(b.size))}</span></div>`).join("");
+    if (btn) btn.disabled = false;
+  } catch (e) {
+    list.innerHTML = `<span style="color:var(--red);">❌ ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+function closeConfigRestore(evt) {
+  if (overlayBusy("cfg-restore-overlay")) return;   // пока идёт откат — не закрываем
+  if (evt && evt.target && evt.target.id !== "cfg-restore-overlay") return;
+  document.getElementById("cfg-restore-overlay").classList.remove("open");
+}
+
+// v1.31.2: выбор строки списка бэкапов без фокуса/скролла.
+// Раньше строки были <label> — клик фокусировал radio и «дёргал» прокрутку списка.
+function pickConfigBackup(name) {
+  const list = document.getElementById("cfg-restore-list");
+  if (!list) return;
+  for (const el of list.querySelectorAll(".restore-item")) {
+    const inp = el.querySelector('input[name="cfg-restore-pick"]');
+    const on = !!inp && inp.value === name;
+    if (inp) inp.checked = on;
+    el.classList.toggle("active", on);
+  }
+}
+
+async function doConfigRestore() {
+  const sel = document.querySelector('input[name="cfg-restore-pick"]:checked');
+  if (!sel) return;
+  const name = sel.value;
+  const ok = await uiConfirm("Откатить конфиг?",
+    `Восстановить devices_config.json из бэкапа ${_fmtBackupName(name)}?\n\n`
+    + "Текущий конфиг будет сохранён в бэкап. Bridge перезапустит воркеры и перепубликует "
+    + "сущности в Home Assistant.",
+    { okText: "Откатить" });
+  if (!ok) return;
+  const btn = document.getElementById("cfg-restore-btn");
+  const res = document.getElementById("cfg-restore-result");
+  btn.disabled = true;
+  setButtonState(btn, "loading", "Откатываю…");
+  res.textContent = "Откатываю…";
+  setOverlayBusy("cfg-restore-overlay", true);
+  setModalFooterState("cfg-restore-cancel", "cfg-restore-hint", "busy",
+                      "Идёт откат — не закрывайте окно");
+  try {
+    const r = await fetch("/api/config/restore", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backup: name }),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      // v1.32.0: снимаем busy и в ветке ошибки — иначе окно не закрывалось
+      // ни крестиком, ни Esc, ни кликом по фону (только F5).
+      setOverlayBusy("cfg-restore-overlay", false);
+      setStatusHtml(res, false, `❌ ${escapeHtml(data.error || "ошибка")}`);
+      setButtonState(btn, "err", "Ошибка");
+      setModalFooterState("cfg-restore-cancel", "cfg-restore-hint", "error",
+                          "Откат не выполнен — можно закрыть окно");
+      return;
+    }
+    setStatusHtml(res, true, `✅ Устройств в конфиге: ${data.devices ?? "?"}`
+      + ` · снято: ${data.removed ?? 0}`
+      + ` · воркеров: +${data.started ?? 0}/−${data.stopped ?? 0}`);
+    setButtonState(btn, "ok", "Готово");
+    setOverlayBusy("cfg-restore-overlay", false);
+    setModalFooterState("cfg-restore-cancel", "cfg-restore-hint", "done",
+                        "Конфиг восстановлен, можно закрыть окно");
+    loadConfig();
+    loadBaseInfo();
+    fetchStatus();
+  } catch (e) {
+    setStatusHtml(res, false, `❌ ${escapeHtml(e.message)}`);
+    setButtonState(btn, "err", "Ошибка");
+    setOverlayBusy("cfg-restore-overlay", false);
+    setModalFooterState("cfg-restore-cancel", "cfg-restore-hint", "error",
+                        "Откат не выполнен — можно закрыть окно");
+  }
+}
+
 function openAuditCleanup() {
+  setOverlayBusy("audit-cleanup-overlay", false);
+  setModalFooterState("audit-cleanup-cancel", "audit-cleanup-hint", "idle");
   const res = document.getElementById("audit-cleanup-result");
   if (res) res.textContent = "";
   updateAuditCleanupForm();
   document.getElementById("audit-cleanup-overlay").classList.add("open");
 }
 function closeAuditCleanup(evt) {
+  if (overlayBusy("audit-cleanup-overlay")) return;   // идёт операция
   if (evt && evt.target && evt.target.id !== "audit-cleanup-overlay") return;
   document.getElementById("audit-cleanup-overlay").classList.remove("open");
 }
@@ -4080,7 +4912,7 @@ async function doAuditCleanup() {
   } else if (scope === "custom") {
     const days = parseInt(document.getElementById("audc-keep-days").value) || 0;
     const hours = parseInt(document.getElementById("audc-keep-hours").value) || 0;
-    if (days === 0 && hours === 0) { res.textContent = "❌ Укажи дни или часы"; return; }
+    if (days === 0 && hours === 0) { setStatus(res, false, "❌ Укажи дни или часы"); return; }
     body = { keep_days: days, keep_hours: hours };
     msg = `Удалить записи старше ${days}д ${hours}ч?`;
   } else {
@@ -4091,6 +4923,8 @@ async function doAuditCleanup() {
   const ok = await uiConfirm("Очистить историю конфига", msg + " Действие необратимо.", {danger:true, okText:"Удалить"});
   if (!ok) return;
   btn.disabled = true; res.innerHTML = '<span class="spin"></span> удаление…';
+  setOverlayBusy("audit-cleanup-overlay", true);
+  setModalFooterState("audit-cleanup-cancel", "audit-cleanup-hint", "busy", "Идёт удаление…");
   try {
     const r = await fetch("/api/config/audit/cleanup", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -4098,15 +4932,29 @@ async function doAuditCleanup() {
     });
     const data = await r.json();
     if (data.ok) {
-      res.textContent = `✅ Удалено записей: ${data.deleted}`;
+      setStatus(res, true, `✅ Удалено записей: ${data.deleted}`);
+      setOverlayBusy("audit-cleanup-overlay", false);
+      setModalFooterState("audit-cleanup-cancel", "audit-cleanup-hint", "done",
+                          "Готово — окно закроется само");
       setTimeout(() => { closeAuditCleanup(); loadAudit(); }, 1200);
-    } else res.textContent = "❌ " + (data.error || "ошибка");
-  } catch (e) { res.textContent = "❌ " + e.message; }
+    } else {
+      setStatus(res, false, "❌ " + (data.error || "ошибка"));
+      setOverlayBusy("audit-cleanup-overlay", false);
+      setModalFooterState("audit-cleanup-cancel", "audit-cleanup-hint", "error",
+                          "Не удалось — можно закрыть окно");
+    }
+  } catch (e) {
+    setStatus(res, false, "❌ " + e.message);
+    setOverlayBusy("audit-cleanup-overlay", false);
+    setModalFooterState("audit-cleanup-cancel", "audit-cleanup-hint", "error",
+                        "Не удалось — можно закрыть окно");
+  }
   btn.disabled = false;
 }
 
 // ==================== TIMELINE CLEANUP ====================
 function openTimelineCleanup() {
+  setOverlayBusy("timeline-cleanup-overlay", false);
   document.getElementById("tl-scope-all").checked = true;
   document.getElementById("tl-keep-days").value = 3;
   document.getElementById("tl-keep-hours").value = 0;
@@ -4121,6 +4969,7 @@ function openTimelineCleanup() {
   document.getElementById("timeline-cleanup-overlay").classList.add("open");
 }
 function closeTimelineCleanup(evt) {
+  if (overlayBusy("timeline-cleanup-overlay")) return;   // идёт операция
   if (evt && evt.target && evt.target.id !== "timeline-cleanup-overlay") return;
   document.getElementById("timeline-cleanup-overlay").classList.remove("open");
 }
@@ -4140,15 +4989,15 @@ async function doTimelineCleanup() {
   if (scope === "age") {
     const days = parseInt(document.getElementById("tl-keep-days").value) || 0;
     const hours = parseInt(document.getElementById("tl-keep-hours").value) || 0;
-    if (days === 0 && hours === 0) { res.textContent = "❌ Укажи дни или часы"; return; }
+    if (days === 0 && hours === 0) { setStatus(res, false, "❌ Укажи дни или часы"); return; }
     body = { scope: "timeline_age", keep_days: days, keep_hours: hours };
     confirmMsg = `Удалить события старше ${days}д ${hours}ч?`;
   } else if (scope === "before") {
     const dateStr = document.getElementById("tl-before-date").value;
     const timeStr = document.getElementById("tl-before-time").value || "00:00";
-    if (!dateStr) { res.textContent = "❌ Укажи дату"; return; }
+    if (!dateStr) { setStatus(res, false, "❌ Укажи дату"); return; }
     const dt = new Date(`${dateStr}T${timeStr}:00`);
-    if (isNaN(dt.getTime())) { res.textContent = "❌ Некорректная дата"; return; }
+    if (isNaN(dt.getTime())) { setStatus(res, false, "❌ Некорректная дата"); return; }
     body = { scope: "timeline_before", before_ts: Math.floor(dt.getTime() / 1000) };
     confirmMsg = `Удалить события до ${dateStr} ${timeStr}?`;
   }
@@ -4157,6 +5006,9 @@ async function doTimelineCleanup() {
   if (!ok) return;
   btn.disabled = true;
   res.innerHTML = '<span class="spin"></span> удаление…';
+  setOverlayBusy("timeline-cleanup-overlay", true);
+  setModalFooterState("timeline-cleanup-cancel", "timeline-cleanup-hint", "busy",
+                      "Идёт удаление…");
   try {
     const r = await fetch("/api/db/cleanup", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -4164,14 +5016,23 @@ async function doTimelineCleanup() {
     });
     const data = await r.json();
     if (data.ok) {
-      res.textContent = `✅ Удалено записей: ${data.deleted}`;
+      setStatus(res, true, `✅ Удалено записей: ${data.deleted}`);
       if (ANALYTICS_ENABLED) loadAnalytics();
+      setOverlayBusy("timeline-cleanup-overlay", false);
+      setModalFooterState("timeline-cleanup-cancel", "timeline-cleanup-hint", "done",
+                          "Готово — окно закроется само");
       setTimeout(closeTimelineCleanup, 1500);
     } else {
-      res.textContent = "❌ " + (data.error || "ошибка");
+      setStatus(res, false, "❌ " + (data.error || "ошибка"));
+      setOverlayBusy("timeline-cleanup-overlay", false);
+      setModalFooterState("timeline-cleanup-cancel", "timeline-cleanup-hint", "error",
+                          "Не удалось — можно закрыть окно");
     }
   } catch (e) {
-    res.textContent = "❌ " + e.message;
+    setStatus(res, false, "❌ " + e.message);
+    setOverlayBusy("timeline-cleanup-overlay", false);
+    setModalFooterState("timeline-cleanup-cancel", "timeline-cleanup-hint", "error",
+                        "Не удалось — можно закрыть окно");
   }
   btn.disabled = false;
 }
@@ -4210,22 +5071,32 @@ async function loadBaseInfo(btn) {
 async function updateTuyaLocalDb() {
   const btn = document.getElementById("tuya-local-update-btn");
   const res = document.getElementById("base-update-result");
-  const progressWrap = document.getElementById("rebuild-progress");
-  const progressText = document.getElementById("rebuild-progress-text");
-  const progressFill = document.getElementById("rebuild-bar-fill");
-  const ok = await uiConfirm("Обновить tuya-local?", "Скачать/обновить базу tuya-local? (~50 МБ, займёт до 2 мин)\n\nДва этапа: 1) скачивание  2) импорт (индекс).", {okText:"Скачать"});
+  // v1.32.8: у обновления tuya-local свой прогресс-бар — раньше обе операции
+  // (обновление базы и пересборка) писали в один блок и перетирали друг друга.
+  const progressWrap = document.getElementById("tuya-local-progress");
+  const progressText = document.getElementById("tuya-local-progress-text");
+  const progressFill = document.getElementById("tuya-local-bar-fill");
+  const ok = await uiConfirm("Обновить tuya-local?",
+    "Скачать/обновить базу tuya-local?\n\n"
+    + "• этап 1: архив ~1.3 МБ из GitHub (при плохой сети бывают повторы)\n"
+    + "• этап 2: распаковка и индекс ≈50 МБ YAML (~20–30 с)\n\n"
+    + "Конфиг устройств не затрагивается.",
+    {okText: "Скачать"});
   if (!ok) return;
   btn.disabled = true;
   setButtonState(btn, "loading", "Запуск…");
   res.innerHTML = "";
+  // v1.33.9: убираем карточки прошлого прогона.
+  _renderTuyaLocalReport(null);
   progressWrap.style.display = "block";
   progressText.innerHTML = '<span class="spin"></span> запуск…';
+  progressText.style.color = "";
   progressFill.style.width = "0%";
   try {
     const r = await fetch("/api/base/tuya-local/update", { method: "POST" });
     const data = await r.json();
     if (!data.ok) {
-      progressText.textContent = "❌ " + (data.error || "ошибка");
+      setStatus(progressText, false, "❌ " + (data.error || "ошибка"));
       setButtonState(btn, "err", "Ошибка");
       restoreButtonAfter(btn, 3000, "⬇ Обновить tuya-local");
       btn.disabled = false;
@@ -4233,11 +5104,33 @@ async function updateTuyaLocalDb() {
     }
     pollTuyaLocalProgress();
   } catch (e) {
-    progressText.textContent = "❌ " + e.message;
+    setStatus(progressText, false, "❌ " + e.message);
     setButtonState(btn, "err", "Ошибка");
     restoreButtonAfter(btn, 3000, "⬇ Обновить tuya-local");
     btn.disabled = false;
   }
+}
+
+// v1.33.9: карточки-плитки результата обновления tuya-local (как у пересборки).
+function _renderTuyaLocalReport(rep) {
+  const el = document.getElementById("tuya-local-report");
+  if (!el) return;
+  if (!rep) { el.style.display = "none"; el.innerHTML = ""; return; }
+  el.style.display = "";
+  el.innerHTML = `<div class="rebuild-stats">`
+    + _rstat("YAML-файлов", rep.yaml_files || 0, "")
+    + _rstat("product_id в индексе", rep.product_ids || 0,
+             (rep.product_ids ? "ok" : "zero"))
+    + _rstat("скачано", `${rep.download_mb || 0} МБ`, "")
+    + _rstat("скачивание", `${rep.download_sec || 0} с`, "")
+    + _rstat("попыток", rep.attempts_used || 1,
+             ((rep.attempts_used || 1) > 1 ? "warn" : "zero"),
+             "Сколько попыток потребовалось: сеть до GitHub бывает нестабильной")
+    + _rstat("всего", `${rep.total_sec || 0} с`, "")
+    + `</div>`
+    + `<div class="muted" style="margin-top:6px; font-size:11px;">`
+    + `обновлено ${rep.fetched_at ? new Date(rep.fetched_at * 1000).toLocaleString("ru-RU") : "—"}`
+    + `</div>`;
 }
 
 // v1.28.65: прогресс обновления tuya-local (фаза download → import).
@@ -4248,31 +5141,58 @@ function pollTuyaLocalProgress() {
       const r = await fetch("/api/base/tuya-local/progress");
       const s = await r.json();
       const btn = document.getElementById("tuya-local-update-btn");
-      const progressWrap = document.getElementById("rebuild-progress");
-      const progressText = document.getElementById("rebuild-progress-text");
-      const progressFill = document.getElementById("rebuild-bar-fill");
-      const pct = s.total > 0 ? Math.round((s.current / s.total) * 100) : 0;
+      const progressWrap = document.getElementById("tuya-local-progress");
+      const progressText = document.getElementById("tuya-local-progress-text");
+      const progressFill = document.getElementById("tuya-local-bar-fill");
+      // v1.33.3: в фазе скачивания процент считаем по МБ (если знаем размер),
+      // иначе — как раньше, по шагам импорта.
+      const _dl = s.phase === "download" && s.mb_total > 0;
+      const pct = _dl ? Math.min(100, Math.round((s.mb_done / s.mb_total) * 100))
+                      : (s.total > 0 ? Math.round((s.current / s.total) * 100) : 0);
       progressFill.style.width = pct + "%";
       if (s.running) {
-        progressFill.classList.toggle("indeterminate", s.total <= 0);
-        const det = s.total > 0 ? ` ${s.current}/${s.total} (${pct}%)` : "";
-        progressText.innerHTML = `<span class="spin"></span> ${escapeHtml(s.message || "…")}${det}`;
+        // v1.33.3: если страницу перезагрузили во время операции — приводим
+        // кнопку в состояние «идёт» (иначе её можно нажать повторно).
+        if (btn && !btn.disabled) { btn.disabled = true; setButtonState(btn, "loading", "Запуск…"); }
+        progressFill.classList.toggle("indeterminate", !_dl && s.total <= 0);
+        const det = (!_dl && s.total > 0) ? ` ${s.current}/${s.total} (${pct}%)` : "";
+        // v1.32.28 + v1.33.3: в фазе скачивания показываем МБ (и всего, если известно).
+        const _mb = (s.phase === "download")
+          ? ` · ${s.mb_done || 0} МБ${s.mb_total > 0 ? ` / ${s.mb_total} МБ (${pct}%)` : ""}`
+          : "";
+        // v1.33.9: номер попытки приходит в самом сообщении с сервера
+        // («…(попытка 2/3)…»), поэтому отдельный суффикс не дублируем.
+        progressText.innerHTML = `<span class="spin"></span> ${escapeHtml(s.message || "…")}${det}${_mb}`;
         pollTuyaLocalProgress();
       } else if (s.ok === true) {
+        clearTimeout(TUYA_LOCAL_POLL_TIMER);
+        TUYA_LOCAL_POLL_TIMER = null;   // v1.33.3: иначе бар не прятался
         progressFill.classList.remove("indeterminate");
-        progressText.textContent = "✅ " + (s.message || "готово");
+        progressFill.style.width = "100%";
+        setStatus(progressText, true, "✅ " + (s.message || "готово"));
+        // v1.33.9: показываем карточки результата (скрывать их через 6 с —
+        // слишком мало, поэтому блок держим минуту, как отчёт пересборки).
+        _renderTuyaLocalReport(s.report);
         setButtonState(btn, "ok", "Готово");
         restoreButtonAfter(btn, 3000, "⬇ Обновить tuya-local");
         btn.disabled = false;
         loadBaseInfo();
-        setTimeout(() => { progressWrap.style.display = "none"; }, 6000);
+        // v1.32.4: не прячем прогресс, если поллинг уже начал новый прогон.
+        setTimeout(() => {
+          if (!TUYA_LOCAL_POLL_TIMER) progressWrap.style.display = "none";
+        }, 60000);
       } else if (s.ok === false) {
+        clearTimeout(TUYA_LOCAL_POLL_TIMER);
+        TUYA_LOCAL_POLL_TIMER = null;   // v1.33.3: иначе бар не прятался
         progressFill.classList.remove("indeterminate");
-        progressText.textContent = "❌ " + (s.error || s.message || "ошибка");
+        setStatus(progressText, false, "❌ " + (s.error || s.message || "ошибка"));
         setButtonState(btn, "err", "Ошибка");
         restoreButtonAfter(btn, 3000, "⬇ Обновить tuya-local");
         btn.disabled = false;
-        setTimeout(() => { progressWrap.style.display = "none"; }, 8000);
+        // v1.32.4: не прячем прогресс, если поллинг уже начал новый прогон.
+        setTimeout(() => {
+          if (!TUYA_LOCAL_POLL_TIMER) progressWrap.style.display = "none";
+        }, 8000);
       } else {
         pollTuyaLocalProgress();   // состояние ещё не инициализировано
       }
@@ -4283,16 +5203,34 @@ function pollTuyaLocalProgress() {
 }
 
 // ===== Rebuild tinytuya.json =====
-async function rebuildTinytuyaJson() {
+// v1.31.0: сначала диалог с опциями — пересборка идёт отдельными
+// TCP-подключениями, поэтому параметры важны (правило №1).
+function rebuildTinytuyaJson() {
+  // v1.31.2: галки такие же, как в прошлый раз по смыслу по умолчанию —
+  // «не опрашивать батарейные» и «стоп на первой версии» включены
+  const _sb = document.getElementById("rebuild-skip-battery");
+  const _sf = document.getElementById("rebuild-stop-first");
+  if (_sb) _sb.checked = true;
+  if (_sf) _sf.checked = true;
+  document.getElementById("rebuild-overlay").classList.add("open");
+}
+
+function closeRebuildDialog(evt) {
+  if (evt && evt.target && evt.target.id !== "rebuild-overlay") return;
+  document.getElementById("rebuild-overlay").classList.remove("open");
+}
+
+async function startRebuild() {
+  const skipBatt = !!document.getElementById("rebuild-skip-battery").checked;
+  const stopFirst = !!document.getElementById("rebuild-stop-first").checked;
+  closeRebuildDialog();
+
   const btn = document.getElementById("rebuild-btn");
   const progressWrap = document.getElementById("rebuild-progress");
   const progressText = document.getElementById("rebuild-progress-text");
   const progressFill = document.getElementById("rebuild-bar-fill");
-
-  const ok = await uiConfirm("Пересобрать tinytuya.json?",
-    "Пересобрать webui_state/tinytuya_devices.json? Это может занять несколько минут (probe каждого устройства).",
-    {okText:"Запустить"});
-  if (!ok) return;
+  const reportEl = document.getElementById("rebuild-report");
+  if (reportEl) { reportEl.style.display = "none"; reportEl.innerHTML = ""; }
 
   btn.disabled = true;
   setButtonState(btn, "loading", "Сборка…");
@@ -4302,21 +5240,21 @@ async function rebuildTinytuyaJson() {
   progressFill.style.width = "0%";
 
   try {
-    const r = await fetch("/api/base/tinytuya/rebuild", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+    const r = await fetch("/api/base/tinytuya/rebuild", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ skip_battery: skipBatt, stop_first: stopFirst }) });
     const data = await r.json();
     if (!data.ok) {
-      progressText.textContent = "❌ " + (data.error || "ошибка");
+      setStatus(progressText, false, "❌ " + (data.error || "ошибка"));
       setButtonState(btn, "err", "Ошибка");
-      restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya.json");
+      restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya базу");
       btn.disabled = false;
       return;
     }
     progressText.textContent = "запущено, ждём прогресс…";
     pollRebuildProgress();
   } catch (e) {
-    progressText.textContent = "❌ " + e.message;
+    setStatus(progressText, false, "❌ " + e.message);
     setButtonState(btn, "err", "Ошибка");
-    restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya.json");
+    restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya базу");
     btn.disabled = false;
   }
 }
@@ -4332,30 +5270,104 @@ function pollRebuildProgress() {
       const progressText = document.getElementById("rebuild-progress-text");
       const progressFill = document.getElementById("rebuild-bar-fill");
       if (s.running) {
+        // v1.33.3: восстанавливаем состояние кнопки после перезагрузки страницы.
+        if (btn && !btn.disabled) { btn.disabled = true; setButtonState(btn, "loading", "Сборка…"); }
         const pct = s.total > 0 ? Math.round((s.current / s.total) * 100) : 0;
         progressFill.style.width = pct + "%";
         progressText.innerHTML = `<span class="spin"></span> ${s.current}/${s.total} — ${escapeHtml(s.device || "")}`;
         pollRebuildProgress();
       } else {
+        clearTimeout(REBUILD_POLL_TIMER);
+        REBUILD_POLL_TIMER = null;   // v1.33.3: иначе бар не прятался
         const pct = s.total > 0 ? Math.round((s.current / s.total) * 100) : 0;
         progressFill.style.width = pct + "%";
         let msg = s.ok ? `✅ Готово: ${s.current}/${s.total}` : `⚠️ Завершено с ошибками (${s.errors?.length || 0})`;
         if (s.errors?.length) msg += " · " + s.errors.slice(0,3).map(escapeHtml).join("; ");
         progressText.textContent = msg;
+        progressText.style.color = s.ok ? "var(--green)" : "var(--red)";
+        // v1.31.0: отчёт качества сопоставления (verified/mismatch/ambiguous)
+        const _rep = (s.report && s.report.summary) || null;
+        const reportEl = document.getElementById("rebuild-report");
+        if (reportEl && _rep) {
+          reportEl.style.display = "";
+          reportEl.innerHTML = `<div class="rebuild-stats">`
+            + _rstat("в базе", _rep.devices, "")
+            + _rstat("опрошено", `${_rep.probed_ok}/${s.total}`, "")
+            + _rstat("совпало с Cloud", _rep.verified, "ok",
+                     "Номер DP сопоставлен с кодом по облачному mapping, и значение DP совпало с облачным")
+            + _rstat("значение не совпало", _rep.mismatch,
+                     _rep.mismatch ? "warn" : "zero",
+                     "Привязка из Cloud, но значение DP на устройстве отличается от облачного "
+                     + "(обычно устаревшее значение в Cloud или сдвиг нумерации DP)")
+            + _rstat("эвристика", _rep.ambiguous, _rep.ambiguous ? "warn" : "zero",
+                     "В Cloud для этих DP ничего не было — код выбран эвристикой по значению, проверьте вручную")
+            + _rstat("из прошлой базы", _rep.kept_existing,
+                     _rep.kept_existing ? "" : "zero",
+                     "DP, которых не было в ответе устройства — взяты из прежней tinytuya_devices.json")
+            + _rstat("добавлено", _rep.added || 0, _rep.added ? "ok" : "zero",
+                     "Устройств, которых не было в прежней базе")
+            + _rstat("обновлено", _rep.updated || 0, _rep.updated ? "warn" : "zero",
+                     "Устройства, у которых DP/mapping изменились относительно прежней базы")
+            + _rstat("без изменений", _rep.unchanged || 0, "zero",
+                     "Устройства, чьи данные совпали с прежней базой")
+            + _rstat("удалено", _rep.removed || 0, _rep.removed ? "warn" : "zero",
+                     "Записи прежней базы, которых больше нет ни в новой сборке, ни в конфиге")
+            + (_rep.battery_skipped
+               ? _rstat("батарейных пропущено", _rep.battery_skipped, "",
+                        "Спящие батарейные не опрашивались: их mapping сохранён из прежней базы")
+               : "")
+            + `</div>`
+            + `<div class="muted" style="margin-top:6px; font-size:11px;">`
+            + `собрано ${_rep.fetched_at ? new Date(_rep.fetched_at * 1000).toLocaleString("ru-RU") : "—"}`
+            + ` · наведите курсор на цифру — пояснение</div>`
+            + ((s.errors && s.errors.length)
+               ? `<div style="color:var(--red); margin-top:6px;">Ошибки: ${s.errors.slice(0,5).map(escapeHtml).join("; ")}${s.errors.length > 5 ? " …" : ""}</div>`
+               : "");
+        }
         if (s.ok) {
           setButtonState(btn, "ok", "Готово");
         } else {
           setButtonState(btn, "err", "Ошибка");
         }
-        restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya.json");
+        restoreButtonAfter(btn, 3000, "🔄 Пересобрать tinytuya базу");
         btn.disabled = false;
         loadBaseInfo();
-        setTimeout(() => { progressWrap.style.display = "none"; }, 6000);
+        // v1.31.4: результат сборки держим на экране минуту (было 6 секунд)
+        // v1.32.3: не скрываем прогресс, если за это время стартовал новый прогон.
+        setTimeout(() => {
+          if (!REBUILD_POLL_TIMER) progressWrap.style.display = "none";
+        }, 60000);
       }
     } catch (e) {
       pollRebuildProgress();
     }
   }, 800);
+}
+
+// ===== Cloud cache =====
+// v1.33.3: после перезагрузки/перехода на «Импорт» подхватываем идущие
+// операции «Локальных баз DP» — раньше прогресс-бар пропадал, хотя операция
+// продолжалась, и кнопку можно было нажать повторно.
+function _baseProgressFresh(s, sec) {
+  return s && s.finished_at && (Date.now() / 1000 - s.finished_at) < sec;
+}
+async function resumeBaseProgress() {
+  try {
+    const s = await (await fetch("/api/base/tuya-local/progress")).json();
+    if (s.running || (s.ok !== null && s.ok !== undefined && _baseProgressFresh(s, 120))) {
+      const wrap = document.getElementById("tuya-local-progress");
+      if (wrap) wrap.style.display = "block";
+      pollTuyaLocalProgress();
+    }
+  } catch (e) { /* нет состояния — не мешаем */ }
+  try {
+    const s = await (await fetch("/api/base/rebuild/progress")).json();
+    if (s.running || (s.ok !== null && s.ok !== undefined && _baseProgressFresh(s, 120))) {
+      const wrap = document.getElementById("rebuild-progress");
+      if (wrap) wrap.style.display = "block";
+      pollRebuildProgress();
+    }
+  } catch (e) { /* нет состояния — не мешаем */ }
 }
 
 // ===== Cloud cache =====
@@ -4462,6 +5474,7 @@ async function clearCloudCache() {
   const ok = await uiConfirm("Очистить кэш Cloud?", "Очистить кэш Cloud-устройств на сервере?", {danger:true, okText:"Очистить"});
   if (!ok) return;
   try { await fetch("/api/cloud/cache", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ clear: true }) }); } catch {}
+  _CLOUD_RAW_MAP = null;   // v1.32.0: кэш очищен — локальная карта тоже невалидна
   CLOUD_DEVICES = []; CLOUD_SELECTED = {};
   CLOUD_CACHE_FETCHED_AT = 0;
   renderCloudDevices();
@@ -4471,12 +5484,15 @@ async function clearCloudCache() {
 
 // ===== Cloud =====
 async function fetchCloudDevices() {
+  // v1.32.0: облачный кэш сейчас перезапишется — сбрасываем локальную карту,
+  // иначе «Кэш состояния»/дополнение по кэшу показывали бы прежние данные.
+  _CLOUD_RAW_MAP = null;
   const btn = document.getElementById("fetch-btn");
   const res = document.getElementById("cloud-result");
   const aid = document.getElementById("cloud-access-id").value.trim();
   const asec = document.getElementById("cloud-access-secret").value.trim();
   const region = document.getElementById("cloud-region").value;
-  if (!aid || !asec) { res.textContent = "❌ Заполни Access ID и Secret"; return; }
+  if (!aid || !asec) { setStatus(res, false, "❌ Заполни Access ID и Secret"); return; }
   saveCloudCreds();
   btn.disabled = true;
   res.innerHTML = '<span class="spin"></span> запрос… (до 30 сек)';
@@ -4486,18 +5502,18 @@ async function fetchCloudDevices() {
       body: JSON.stringify({ access_id: aid, access_secret: asec, region })
     });
     const data = await r.json();
-    if (!data.ok) { res.textContent = "❌ " + (data.error || "ошибка"); btn.disabled = false; return; }
+    if (!data.ok) { setStatus(res, false, "❌ " + (data.error || "ошибка")); btn.disabled = false; return; }
     CLOUD_DEVICES = data.devices || []; CLOUD_SELECTED = {};
     CLOUD_CACHE_FETCHED_AT = Math.floor(Date.now()/1000);
     const withKey = CLOUD_DEVICES.filter(d => d.local_key).length;
     const withMap = CLOUD_DEVICES.filter(d => d.mapping && Object.keys(d.mapping).length > 0).length;
     const withStatus = CLOUD_DEVICES.filter(d => d.cloud_status && Object.keys(d.cloud_status).length > 0).length;
-    res.textContent = `✅ ${CLOUD_DEVICES.length} устройств · key: ${withKey} · mapping: ${withMap} · status: ${withStatus}`;
+    setStatus(res, true, `✅ ${CLOUD_DEVICES.length} устройств · key: ${withKey} · mapping: ${withMap} · status: ${withStatus}`);
     renderCloudDevices();
     renderCloudCacheInfo();
     hideCacheBanner();
     loadBaseInfo();
-  } catch (e) { res.textContent = "❌ " + e.message; }
+  } catch (e) { setStatus(res, false, "❌ " + e.message); }
   btn.disabled = false;
 }
 
@@ -4526,7 +5542,9 @@ function renderCloudDevices() {
   const savedScrollTop = oldScroller ? oldScroller.scrollTop : 0;
   const _th = (key, label) =>
     `<th style="cursor:pointer;" onclick="sortCloudDevices('${key}')">${label}${_cloudSortInd(key)}</th>`;
-  let html = `<div class="cloud-scroll" style="max-height:500px; overflow-y:auto;"><table>
+  // v1.32.0: overflow:auto (не только по вертикали) — на мобиле таблица шире
+  // карточки, и правые колонки (DP, Online) обрезались без возможности прокрутки.
+  let html = `<div class="cloud-scroll" style="max-height:500px; overflow:auto;"><table>
     <thead><tr><th style="width:40px;"></th>${_th("name","Имя")}${_th("type","Тип")}${_th("product","Продукт")}<th>Local key</th>${_th("dp","DP")}${_th("online","Online")}</tr></thead><tbody>`;
   for (const d of filtered) {
     const i = CLOUD_DEVICES.indexOf(d);
@@ -4543,12 +5561,13 @@ function renderCloudDevices() {
     const rowCls = (isDisabled ? "cloud-row-disabled"
                   : (inConfig ? "cloud-row-in-config" : ""))
                   + (CLOUD_SELECTED[i] ? " cloud-row-selected" : "");
-    // v1.27.7: компактный бейдж — только ✅, текст в title.
+    // v1.33.2: тонкая галочка БЕЗ плашки (emoji ✅ был крупным и переносил
+    // строку); текст — в title.
     let alreadyBadge = '';
     if (isDisabled) {
-      alreadyBadge = ' <span class="badge enabled-off" style="font-size:10px;" title="Уже в конфиге (отключено)">✓</span>';
+      alreadyBadge = ' <span class="cloud-check off" title="Уже в конфиге (отключено)">✓</span>';
     } else if (inConfig) {
-      alreadyBadge = ' <span class="badge enabled-ok" style="font-size:10px;" title="Уже в конфиге">✅</span>';
+      alreadyBadge = ' <span class="cloud-check" title="Уже в конфиге">✓</span>';
     }
     // v1.28.26: Local key в таблице Cloud — под маской. Показ через
     // кнопку 👁, состояние — per-device в CLOUD_REVEALED_KEYS (сброс
@@ -4574,7 +5593,7 @@ function renderCloudDevices() {
     html += `<tr class="${rowCls}" style="${cls}; cursor:pointer;" data-cloud-idx="${i}" onclick="showCloudDevice(${i})">
       <td onclick="event.stopPropagation()"><input type="checkbox" ${sel} onchange="toggleCloudSelect(${i}, this.checked)"></td>
       <td>
-        <div style="font-weight:500;">${escapeHtml(d.name || '?')}${alreadyBadge}</div>
+        <div class="cloud-name-row"><span class="cloud-name">${escapeHtml(d.name || '?')}</span>${alreadyBadge}</div>
         <div class="muted" style="font-size:11px; font-family:ui-monospace,monospace;">${escapeHtml(d.id || '')}</div>
       </td>
       <td>${typeBadge(d.type_guess || 'switch')}</td>
@@ -4638,9 +5657,31 @@ function showCloudDevice(idx) {
   html += row("Имя", d.name);
   html += row("ID", d.id, true);
   html += `<tr><td>Category (raw)</td><td><span class="type-badge">${escapeHtml(d.category || '?')}</span> <span class="muted" style="font-size:11px;">(код Tuya)</span></td></tr>`;
-  html += `<tr><td>Тип устройства</td><td>${typeBadge(d.type_guess || 'switch')}</td></tr>`;
-  html += `<tr><td>Версия протокола (guess)</td><td>${copyCodePlain(d.version_guess || '3.3')}</td></tr>`;
-  html += row("Продукт", d.product_name);
+  html += `<tr><td>Тип устройства</td><td>${d.type_guess ? typeBadge(d.type_guess) : '<span class="muted">не определён — задайте в ✏️</span>'}</td></tr>`;
+  // v1.31.9: облако версию не отдаёт — берём из конфига, если устройство есть;
+  // иначе честно «не определено» (без длинной подсказки).
+  const _known = (typeof LAST_DEVICES !== "undefined" ? LAST_DEVICES : [])
+    .find(x => x.tuya_id === d.id);
+  const _ver = d.version || (_known && _known.version) || "";
+  if (_ver) {
+    html += `<tr><td>Версия протокола</td><td>${versionBadge(_ver)}`
+      + (_known && !d.version
+         ? ` <span class="muted" style="font-size:11px;">из конфига</span>` : "")
+      + `</td></tr>`;
+  } else {
+    html += `<tr><td>Версия протокола</td><td><span class="muted">не определено`
+      + ` <span style="font-size:11px;">(определяется локально: 🔍 Опросить или ✏️)</span>`
+      + `</span></td></tr>`;
+  }
+  // v1.31.9: рядом с продуктом — перевод, если он есть в наших словарях
+  if (d.product_name) {
+    const _pru = _productRu(d.product_name);
+    html += `<tr><td>Продукт</td><td>${escapeHtml(d.product_name)}`
+      + (_pru ? ` <span class="muted" style="font-size:11px;">— ${escapeHtml(_pru)}</span>` : "")
+      + `</td></tr>`;
+  } else {
+    html += row("Продукт", "");
+  }
   html += row("Product ID", d.product_id, true);
   html += row("Модель", d.model);
   html += row("UUID", d.uuid, true);
@@ -4940,7 +5981,13 @@ async function importSelected() {
 
     const known = (_knownCfg && _knownCfg.ip === ip) ? _knownCfg
                 : LAST_DEVICES.find(x => x.ip === ip);
-    let version = (known && known.version) ? known.version : (d.version_guess || "3.3");
+    // v1.29.2: version_guess больше не приходит из облака (константа убрана).
+    // Версия берётся из конфига, если устройство там уже есть; иначе — из
+    // probe (🔍) или ручного выбора в карточке превью. До этого — дефолт 3.3
+    // с честной пометкой «не определена».
+    let version = (known && known.version) ? known.version : (d.version || "3.3");
+    const versionConfirmed = !!(known && known.version);
+    const versionSource = versionConfirmed ? "из конфига" : "";
     let probeInfo = null;
     if (!known) {
       probeInfo = { skipped: true, reason: "auto probe disabled, будет по кнопке в превью" };
@@ -4956,6 +6003,12 @@ async function importSelected() {
       model: d.product_name || "",
       battery_powered: _isBattery, enabled: true,
       dps_map: dps_map,
+      // v1.29.2: состояние версии для карточки превью (подтверждена ли).
+      version_confirmed: versionConfirmed,
+      version_source: versionSource,
+      // v1.29.2: тип не определён (категория неизвестна) — показываем честно,
+      // в конфиг уходит "switch" как безопасный дефолт (меняется в ✏️).
+      type_confirmed: !!d.type_guess,
       _cloud_ref: d,
       _probe: probeInfo,
     };
@@ -5035,6 +6088,11 @@ async function importSelected() {
 
   PREVIEW_CURRENT = 0;
   renderImportPreview();
+  // v1.31.2: свежее открытие превью — «Отмена» снова доступна, подсказка обычная
+  const _cb = document.getElementById("preview-cancel-btn");
+  const _fh = document.getElementById("preview-footer-hint");
+  if (_cb) _cb.disabled = false;
+  if (_fh) _fh.textContent = "Закрыть окно — крестиком ✕ справа сверху";
   document.getElementById("preview-overlay").classList.add("open");
 }
 
@@ -5042,7 +6100,7 @@ function renderImportPreview() {
   if (PREVIEW_DEVICES.length === 0) return;
   const body = document.getElementById("preview-body");
   // v1.18.10: сохраняем и восстанавливаем скролл, чтобы перерисовка
-  // (например, при Probe все) не сбрасывала позицию наверх.
+  // (например, при «Опросить все») не сбрасывала позицию наверх.
   const scrollTop = body.scrollTop;
   const scrollLeft = body.scrollLeft;   // v1.28.79: не «слайдить» таблицу
   // v1.28.82: сохраняем скролл ВСЕХ таблиц — перерисовка не должна
@@ -5199,6 +6257,17 @@ function _previewSourceMapping(item, src) {
     }
     return out;
   }
+  if (src === "local_db") {
+    // v1.30.0: локальная база мэппингов (tinytuya_devices.json) —
+    // приходит с сервера в dps_map_generated с _dps_source="local_db".
+    const out = {};
+    for (const [dp, info] of Object.entries(d.dps_map_generated || {})) {
+      if (info && info._dps_source === "local_db") {
+        out[dp] = Object.assign({}, info, { code: info.name || info.code || ("dp_" + dp) });
+      }
+    }
+    return out;
+  }
   if (src === "cache") {
     // v1.28.34: только для устройств, уже бывших в конфиге (нет кэша — пусто).
     // v1.28.71: ищем по tuya_id (имена Cloud и конфига часто не совпадают).
@@ -5229,14 +6298,9 @@ function _previewSourceMapping(item, src) {
   return getDeviceMapping(d);   // auto
 }
 
-function _previewSourceAvailable(item, src) {
-  if (src === "cache") return Object.keys(_previewSourceMapping(item, "cache")).length > 0;
-  return true;
-}
-
 function _previewAllDps(item) {
   const set = new Set();
-  for (const s of ["auto", "cloud", "cache", "tuya_local", "heuristic"]) {
+  for (const s of ["auto", "cloud", "cache", "tuya_local", "local_db", "heuristic"]) {
     for (const dp of Object.keys(_previewSourceMapping(item, s))) set.add(dp);
   }
   return Array.from(set).sort((a, b) => (parseInt(a) || 0) - (parseInt(b) || 0));
@@ -5413,14 +6477,20 @@ function _previewSrcItemsHtml(item, idx, dp) {
   let items = "";
   for (const s of PREVIEW_SOURCES) {
     if (s.id === "auto") continue;
-    const avail = _previewSourceAvailable(item, s.id);
+    // v1.31.4: в списке — только источники, у которых есть данные для ЭТОГО DP
+    // (то, чего нет, в выборе не показываем).
+    if (!_previewSourceMapping(item, s.id)[dp]) continue;
     const isHdr = (s.id === PREVIEW_SOURCE);
     const isActive = cur ? (cur === s.id) : isHdr;
     items += `<button type="button" class="prev-src-item${isActive ? " active" : ""}"`
-          + ` ${avail ? "" : "disabled"} onclick="previewPickSrc(${idx}, '${escapeAttr(dp)}', '${s.id}')">`
+          + ` onclick="previewPickSrc(${idx}, '${escapeAttr(dp)}', '${s.id}')">`
           + `${s.icon} ${escapeHtml(s.label)}`
           + (isHdr ? `<span class="prev-src-dot" title="источник из шапки">•</span>` : "")
-          + `${avail ? "" : " (нет)"}</button>`;
+          + `</button>`;
+  }
+  if (!items) {
+    items = '<div class="prev-src-item muted" style="cursor:default;">'
+          + 'Для этого DP нет источников с данными</div>';
   }
   return items;
 }
@@ -5471,19 +6541,25 @@ function _renderPreviewRowSource(item, idx, dp) {
   // v1.28.41: источник данных — только для новых.
   // v1.28.42: в песочнице — и для известных.
   // v1.28.70: когда новых нет — шапка управляет известными (предпросмотр).
+  const k = _previewRowKey(idx, dp);
+  const _manual = PREVIEW_ROW_SOURCE[k] || "";
+  const _res = _previewResolveRow(item, idx, dp);
+  // v1.32.0: если источник выбран вручную — показываем именно его, иначе
+  // в ячейке «прыгал» фактический источник и выбор выглядел неработающим.
+  // «(нет)» — в выбранном источнике для этого DP ничего нет.
+  const _eff = _manual || _res.src || "auto";
+  const _empty = _manual && !(_previewSourceMapping(item, _manual)[dp]);
+  const _suffix = _empty ? ` <span class="muted">(нет)</span>` : "";
   if (item._isKnown && item._edit !== true) {
-    const _eff = _previewResolveRow(item, idx, dp).src || "auto";
     if (_eff && _eff !== "auto") {
       return `<span class="muted" title="предпросмотр — изменения не сохраняются">`
-           + `${_previewSourceIcon(_eff)} ${escapeHtml(_previewSourceLabel(_eff))}</span>`;
+           + `${_previewSourceIcon(_eff)} ${escapeHtml(_previewSourceLabel(_eff))}${_suffix}</span>`;
     }
     return '<span class="muted">—</span>';
   }
-  const k = _previewRowKey(idx, dp);
-  const _eff = _previewResolveRow(item, idx, dp).src || "auto";
   return `<button type="button" class="prev-src-btn" data-key="${k}"`
     + ` onclick="previewToggleSrc(${idx}, '${escapeAttr(dp)}', event)">`
-    + `${_previewSourceIcon(_eff)} ${escapeHtml(_previewSourceLabel(_eff))}</button>`;
+    + `${_previewSourceIcon(_eff)} ${escapeHtml(_previewSourceLabel(_eff))}${_suffix}</button>`;
 }
 
 function renderPreviewDeviceBlock(item, idx) {
@@ -5547,15 +6623,25 @@ function renderPreviewDeviceBlock(item, idx) {
       + `<span class="preview-sandbox-label">${_sandboxOn ? "Песочница (не сохраняется)" : "Как настроено"}</span>`
     : "";
 
-  const _probeBtn = `<button type="button" class="preview-edit-btn" onclick="probeDeviceItem(PREVIEW_DEVICES[${idx}], ${idx})" title="Опрос устройства локально (probe): сопоставить DP, если Cloud не дал mapping">🔍 Опросить устройство</button>`;
+  // v1.30.0: у устройств, которые уже в конфиге, кнопки опроса нет
+  // (probe известного IP запрещён — правило №1).
+  const _probeBtn = _inCfg ? "" :
+    `<button type="button" class="preview-edit-btn" onclick="probeDeviceItem(PREVIEW_DEVICES[${idx}], ${idx})" title="Опрос устройства локально (probe): сопоставить DP, если Cloud не дал mapping">🔍 Опросить устройство</button>`;
+
+  // v1.32.0: строки «Тип устройства» + «Версия протокола» (общий кусок с
+  // previewRefreshProbeUi — тот обновляет их на месте после опроса).
+  const _verTypeRow = `<div class="preview-rows-slot">`
+    + _previewDeviceRowsInner(item, idx) + `</div>`;
 
   let html = `<div class="${_cardCls}" data-idx="${idx}">
     ${_removeBtn}
     <div class="preview-device-header">
       <span>${escapeHtml(d.friendly_name)} <span class="muted" style="font-weight:400; font-size:11px;">(${escapeHtml(d.name)})</span>${_alreadyBadge}</span>
-      <span class="muted" style="font-size:11px;">${escapeHtml(d.ip)} · ${versionBadge(d.version)} · <span class="preview-dp-count">${enabled}/${total} DP</span> <span class="muted preview-probe-status" data-idx="${idx}" style="font-size:11px;">${item.probe_status_html || ""}</span></span>
+      <span class="muted" style="font-size:11px;">${escapeHtml(d.ip)} · <span class="preview-dp-count">${enabled}/${total} DP</span></span>
     </div>
-    <div class="preview-device-header-tools">${_batteryToggle}${_presetPreviewHtml}${_diffHtml}${_editBtn}${_probeBtn}</div>
+    ${_verTypeRow}
+    <div class="preview-device-header-tools">${_batteryToggle}${_presetPreviewHtml}${_diffHtml}${_editBtn}${_probeBtn}<span class="muted preview-probe-status" data-idx="${idx}" style="font-size:11px;">${item.probe_status_html || ""}</span></div>
+    <div class="preview-raw-slot">${item.probe_raw_html || ""}</div>
     <div class="preview-device-body">${_errHtml}`;
 
   const _allDps = _previewAllDps(item);
@@ -5619,7 +6705,7 @@ function renderPreviewDeviceBlock(item, idx) {
       const _curTitle = (_curScaled !== null && String(_curScaled) !== String(_curVal))
         ? `Масштаб (scale ${_scale}): ${_curScaled}` : "";
       const _curOriginIcon = _curFrom === "cloud" ? "☁" : (_curFrom === "cache" ? "📦" : "");
-      const _srcIcon = { cloud: "☁", tuya_local: "📚", cache: "⚙️", heuristic: "⚠️", auto: "🤖", unknown: "❓" };
+      const _srcIcon = { cloud: "☁", tuya_local: "📚", cache: "⚙️", local_db: "📦", heuristic: "⚠️", auto: "🤖", unknown: "❓" };
       // v1.28.70: показываем РЕАЛЬНЫЙ источник, из которого будет взято
       // сопоставление (у «Авто» — вычисленный), а не слово «Авто».
       const _origin = (_res.src === "auto") ? _previewResolvedOrigin(item, dp) : _res.src;
@@ -5677,9 +6763,10 @@ function renderPreviewMobile(body) {
   html += _renderPreviewSourceBar();
   html += _renderPresetLangRadio();
   html += `<p class="muted">Устройство ${PREVIEW_CURRENT + 1} из ${PREVIEW_DEVICES.length}</p>`;
+  // v1.33.4: нижнюю кнопку «🔍 Проверить устройство (probe)» убрали — на
+  // мобиле показываем ту же кнопку, что и на ПК, в строке инструментов
+  // карточки (она сама скрыта для устройств, уже добавленных в конфиг).
   html += renderPreviewDeviceBlock(PREVIEW_DEVICES[PREVIEW_CURRENT], PREVIEW_CURRENT);
-  html += `<button onclick="probeCurrentDevice()" style="margin-top:12px;">🔍 Проверить устройство (probe)</button>`;
-  html += `<div id="probe-result" class="muted" style="margin-top:8px; font-size:12px;"></div>`;
   body.innerHTML = html;
 }
 
@@ -5767,15 +6854,8 @@ function closePreview(evt) {
   }
 }
 
-async function probeCurrentDevice() {
-  if (isMobile()) {
-    const item = PREVIEW_DEVICES[PREVIEW_CURRENT];
-    if (!item) return;
-    await probeDeviceItem(item, PREVIEW_CURRENT);
-  } else {
-    await probeAllInPreview();
-  }
-}
+// v1.33.4: probeCurrentDevice больше не нужна — нижней кнопки на мобиле нет,
+// опрос идёт кнопкой в инструментах карточки (как на ПК).
 
 // v1.23.0: прогресс probe с pending/ok/fail в заголовке + подсветка карточки
 let _probeStats = { ok: 0, fail: 0, total: 0 };
@@ -5805,14 +6885,14 @@ async function probeAllInPreview() {
   const btn = document.getElementById("preview-probe-all-btn");
   const title = document.getElementById("preview-title");
   const oldTitle = title ? title.textContent : "";
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> probe…'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Опрашиваю…'; }
   const total = PREVIEW_DEVICES.length;
   // v1.26.0: pending вычисляется в _updateProbeTitle() как
   // total - ok - fail, отдельное поле не нужно.
   _probeStats = { ok: 0, fail: 0, total: total };
   _updateProbeTitle();
   // v1.19: try/finally — иначе при синхронном исключении внутри
-  // probeDeviceItem кнопка осталась бы навсегда «probe…».
+  // probeDeviceItem кнопка осталась бы навсегда «Опрашиваю…».
   // v1.22.1: параллельный probe — по 5 одновременно.
   // v1.23.0: pending / ok / fail в заголовке, подсветка карточки.
   try {
@@ -5826,7 +6906,7 @@ async function probeAllInPreview() {
         // пока шёл probe (удаление карточки сдвигало индексы).
         const item = PREVIEW_DEVICES[my];
         if (!item) return;
-        _setDeviceProbeStatus(my, '<span class="muted">⏳ в очереди</span>');
+        _setDeviceProbeStatus(my, '<span class="muted">⏳ в очереди на опрос</span>');
         _setDeviceProbeClass(my, "probing");
         _updateProbeTitle();
         try {
@@ -5834,7 +6914,9 @@ async function probeAllInPreview() {
         } catch (e) {
           console.error("probe item failed", e);
         }
-        if (!item.needs_probe) {
+        // v1.32.4: считаем по факту опроса — раньше у устройств с готовыми DP
+        // (needs_probe не задан) неудачный probe попадал в счётчик ok.
+        if (item.probe_ok) {
           _probeStats.ok++;
           _setDeviceProbeClass(my, "probe-ok");
         } else {
@@ -5849,7 +6931,7 @@ async function probeAllInPreview() {
     for (let w = 0; w < Math.min(CONCURRENCY, total); w++) workers.push(runOne());
     await Promise.allSettled(workers);
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "🔍 Probe все"; }
+    if (btn) { btn.disabled = false; btn.textContent = "🔍 Опросить все"; }
     if (!isMobile()) renderImportPreview();
     if (title) {
       title.textContent = `Probe завершён: ✅ ${_probeStats.ok} / ❌ ${_probeStats.fail}`;
@@ -5858,17 +6940,116 @@ async function probeAllInPreview() {
   }
 }
 
+// v1.29.2: ручной выбор версии протокола в карточке превью импорта
+// (probe может не сработать — устройство спит; и бывает, что отвечают
+// несколько версий — тогда пользователь выбирает нужную).
+function setPreviewVersion(idx, value) {
+  const item = PREVIEW_DEVICES[idx];
+  if (!item || !item.device) return;
+  item.device.version = value;
+  item.device.version_confirmed = true;
+  item.device.version_source = "выбрана вручную";
+  renderImportPreview();
+}
+
+// v1.30.0: ручной выбор типа устройства (платформа HA) в карточке превью.
+function setPreviewType(idx, value) {
+  const item = PREVIEW_DEVICES[idx];
+  if (!item || !item.device) return;
+  item.device.type = value;
+  item.device.type_confirmed = true;
+  renderImportPreview();
+}
+
+// v1.32.0: строки карточки превью — «Тип устройства» (сверху) и
+// «Версия протокола». У уже добавленных устройств — только бейджи
+// (менять нечего, селекты и опрос недоступны), у новых — селекты.
+function _previewTypeInner(item, idx) {
+  const d = item.device || {};
+  const _typeSel = d.type || "switch";
+  const _head = `<span class="muted" style="font-size:11px;">Тип устройства:</span> `;
+  if (_isCloudDeviceInConfig(d._cloud_ref)) {
+    return _head + `${typeBadge(_typeSel)}`;
+  }
+  if (d.type_confirmed) {
+    // v1.31.2: тип угадался — показываем результат, а не селект
+    // (поменять можно в ✏️ после импорта)
+    return _head + `${typeBadge(_typeSel)} `
+      + `<span style="color:var(--green); font-size:11px;">✓ определено</span>`;
+  }
+  const _typeOpts = ["light", "switch", "climate", "sensor", "binary_sensor", "cover", "fan"]
+    .map(t => `<option value="${t}"${t === _typeSel ? " selected" : ""}>${t}</option>`).join("");
+  return _head
+    + `<span class="preview-ver-unknown">✕ не определено</span> `
+    + `<span class="muted" style="font-size:11px;">— укажите вручную:</span> `
+    + `<select class="preview-type-select" data-idx="${idx}" onchange="setPreviewType(${idx}, this.value)" title="Платформа Home Assistant (тип сущностей)">${_typeOpts}</select>`;
+}
+
+function _previewVersionInner(item, idx) {
+  const d = item.device || {};
+  const _verSel = d.version || "3.3";
+  if (_isCloudDeviceInConfig(d._cloud_ref)) {
+    // бейдж версии без подписи: у уже добавленного она взята из конфига
+    return `<span class="muted" style="font-size:11px;">Версия протокола:</span> `
+      + `${versionBadge(_verSel)}`;
+  }
+  const _verAll = ["3.1", "3.2", "3.3", "3.4", "3.5"];
+  const _verList = (Array.isArray(d.version_all) && d.version_all.length)
+    ? d.version_all : _verAll;
+  const _verOpts = _verList.map(v =>
+    `<option value="${v}"${v === _verSel ? " selected" : ""}>${v}</option>`).join("");
+  const _verState = d.version_confirmed
+    ? `${versionBadge(_verSel)} <span style="color:var(--green); font-size:11px;">✓ ${escapeHtml(d.version_source || "определена опросом")}</span>`
+    : `<span class="preview-ver-unknown" title="Версию протокола облако не отдаёт: нажмите 🔍 Опросить устройство или выберите вручную">не определена</span>`;
+  const _verSelect = (d.version_confirmed && _verList.length < 2)
+    ? ""
+    : ` <select class="preview-version-select" data-idx="${idx}" onchange="setPreviewVersion(${idx}, this.value)" title="Версия протокола Tuya (3.1–3.5)">${_verOpts}</select>`;
+  return `<span class="muted" style="font-size:11px;">Версия протокола:</span> `
+    + `${_verState}${_verSelect}`
+    + (d.version_confirmed ? ""
+       : ` <span class="muted" style="font-size:11px;">— 🔍 Опросить определит точно</span>`);
+}
+
+function _previewDeviceRowsInner(item, idx) {
+  return `<div class="preview-device-row">${_previewTypeInner(item, idx)}</div>`
+    + `<div class="preview-device-row">${_previewVersionInner(item, idx)}</div>`;
+}
+
+// v1.30.1: точечно обновить строки и RAW-блок карточки — карточка целиком
+// на десктопе не перерисовывается, поэтому без этого не появлялись ни бейдж
+// определённой версии, ни результат опроса.
+function previewRefreshProbeUi(idx) {
+  const item = PREVIEW_DEVICES[idx];
+  if (!item) return;
+  const card = document.querySelector(`.preview-device[data-idx="${idx}"]`);
+  if (!card) return;
+  const rows = card.querySelector(".preview-rows-slot");
+  if (rows) rows.innerHTML = _previewDeviceRowsInner(item, idx);
+  const slot = card.querySelector(".preview-raw-slot");
+  if (slot) slot.innerHTML = item.probe_raw_html || "";
+}
+
+// v1.30.0: раскрывающийся блок с raw-результатом опроса устройства.
+function _renderProbeRaw(obj) {
+  try {
+    return `<div class="preview-device-row"><details><summary class="muted" `
+      + `style="font-size:11px; cursor:pointer;">RAW: результат опроса</summary>`
+      + `<pre class="preview-raw-pre">${escapeHtml(JSON.stringify(obj, null, 2))}</pre>`
+      + `</details></div>`;
+  } catch (e) { return ""; }
+}
+
 async function probeDeviceItem(item, idx) {
   const d = item.device;
   const cloudRef = d._cloud_ref || {};
-  const resultEl = document.getElementById("probe-result");
+  // v1.33.4: #probe-result больше нет (нижняя кнопка удалена) — статус опроса
+  // идёт в строку инструментов карточки.
   const statusEl = document.querySelector(`.preview-probe-status[data-idx="${idx}"]`);
   const setStatus = (html) => {
-    if (resultEl) resultEl.innerHTML = html;
     if (statusEl) statusEl.innerHTML = html;
   };
   try {
-    setStatus('<span class="spin"></span> probe…');
+    setStatus('<span class="spin"></span> Опрашиваю устройство…');
 
     // v1.18.11: таймаут 15 сек — защита от вечного зависания fetch.
     const controller = new AbortController();
@@ -5879,8 +7060,10 @@ async function probeDeviceItem(item, idx) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: d.id, ip: d.ip, local_key: d.local_key, version_hint: d.version,
+          name: d.friendly_name || d.name || "",
           cloud_status_meta: cloudRef._cloud_status_meta || [],
           cloud_current_values: cloudRef.cloud_status || {},
+          cloud_mapping: cloudRef.mapping || {},
         }),
         signal: controller.signal,
       });
@@ -5890,7 +7073,19 @@ async function probeDeviceItem(item, idx) {
     }
 
     if (data.ok) {
-      d.version = data.version || d.version;
+      // v1.29.2: probe перебирает ВСЕ версии и возвращает список ответивших.
+      // Если ответили несколько — пользователь выбирает нужную в карточке.
+      const _vers = Array.isArray(data.versions)
+        ? data.versions
+        : (data.version ? [data.version] : []);
+      if (_vers.length) {
+        d.version = data.version || _vers[0];
+        d.version_all = _vers;
+        d.version_confirmed = true;
+        d.version_source = (_vers.length > 1)
+          ? `опрос: отвечают ${_vers.join(", ")}`
+          : "определена опросом";
+      }
       if (data.dps_map && Object.keys(data.dps_map).length > 0) {
         d.dps_map = data.dps_map;
         const dp_to_code = data.dp_to_code || {};
@@ -5914,20 +7109,48 @@ async function probeDeviceItem(item, idx) {
         }
         item.needs_probe = false;
       }
-      const okHtml = `<span style="color:var(--green);">✅ v${d.version}, DP ${data.matched_count || 0}</span>`;
+      const _vAll = (d.version_all && d.version_all.length > 1)
+        ? ` (отвечают: ${d.version_all.join(", ")})` : "";
+      // v1.31.2: показываем именно КОЛИЧЕСТВО найденных DP (не значение)
+      const _found = data.matched_count || 0;
+      const _total = data.dps_count || 0;
+      const _dpsTxt = (_total && _total !== _found)
+        ? `найдено DP: ${_found} из ${_total}` : `найдено DP: ${_found}`;
+      const okHtml = `<span style="color:var(--green);">✅ v${d.version}${_vAll} · ${_dpsTxt}</span>`;
       item.probe_status_html = okHtml;
+      item.probe_ok = true;   // v1.32.4: для счётчика ok/fail в шапке превью
+      // v1.30.0: raw-результат опроса (раскрывающийся блок в карточке).
+      item.probe_raw_html = _renderProbeRaw({
+        "версии (ответили)": _vers,
+        "DP от устройства": data.dps || {},
+        "сопоставлено (DP → code)": data.dp_to_code || {},
+      });
       setStatus(okHtml);
+      // v1.32.0: строки версии/типа и RAW-блок обновляются на месте —
+      // на десктопе карточка целиком не перерисовывается.
       if (isMobile()) renderImportPreview();
+      else previewRefreshProbeUi(idx);
     } else {
       const failHtml = `<span style="color:var(--red);">❌ ${escapeHtml(data.error || "ошибка")}</span>`;
       item.probe_status_html = failHtml;
+      item.probe_ok = false;   // v1.32.4: неудачный probe больше не считается успехом
+      item.probe_raw_html = _renderProbeRaw({
+        "версии (ответили)": data.versions || [],
+        "ошибка": data.error || "ответ без данных",
+      });
       setStatus(failHtml);
+      if (isMobile()) renderImportPreview();
+      else previewRefreshProbeUi(idx);
     }
   } catch (e) {
     const msg = (e && e.name === "AbortError") ? "таймаут 15 сек" : (e.message || String(e));
     const errHtml = `<span style="color:var(--red);">❌ ${escapeHtml(msg)}</span>`;
     item.probe_status_html = errHtml;
+    item.probe_ok = false;   // v1.32.4
+    item.probe_raw_html = _renderProbeRaw({ "ошибка": msg });
     setStatus(errHtml);
+    if (isMobile()) renderImportPreview();
+    else previewRefreshProbeUi(idx);
   }
 }
 
@@ -5950,7 +7173,17 @@ async function confirmImport() {
     );
     if (!ok) return;
   }
+  // v1.31.2: «Отмена»/подсказка живут в этой функции — объявляем до всех
+  // ранних выходов, чтобы не остались в «идёт импорт».
   const btn = document.getElementById("preview-import-btn");
+  const _cancelBtn = document.getElementById("preview-cancel-btn");
+  const _footerHint = document.getElementById("preview-footer-hint");
+  const _resetFooter = () => {
+    if (_cancelBtn) _cancelBtn.disabled = false;
+    if (_footerHint) _footerHint.textContent = "Закрыть окно — крестиком ✕ справа сверху";
+  };
+  if (_cancelBtn) _cancelBtn.disabled = true;
+  if (_footerHint) _footerHint.textContent = "Идёт импорт — окно можно закрыть крестиком ✕ справа сверху";
   // v1.27.7d: сбрасываем старые ошибки в превью.
   _clearPreviewErrors();
   // v1.27.7d: исключаем устройства, уже находящиеся в конфиге.
@@ -5971,6 +7204,7 @@ async function confirmImport() {
     _showPreviewErrors([
       `Нечего импортировать: все выбранные (${_n}) уже есть в конфиге.`,
     ], "Ничего не импортируется");
+    _resetFooter();
     // Помечаем карточки, чтобы пользователь видел причину.
     for (const item of _skippedAlreadyInConfig) {
       item.import_error = "Уже в конфиге — будет пропущено";
@@ -6065,6 +7299,7 @@ async function confirmImport() {
       renderImportPreview();
       btn.disabled = false;
       btn.textContent = "📦 Импортировать всё";
+      _resetFooter();
       return;
     }
 
@@ -6078,7 +7313,7 @@ async function confirmImport() {
     const _bannerLines = [
       `Добавлено: ${_added}, обновлено: ${_updated}` +
         (_skipped ? `, пропущено (уже в конфиге): ${_skipped}` : ""),
-      "Закройте окно крестиком или кнопкой «Отмена».",
+      "Импорт завершён — закройте окно крестиком ✕ справа сверху.",
     ];
     _showPreviewErrors(_bannerLines, _bannerTitle);
     // Перекрашиваем баннер в зелёный (успех).
@@ -6096,6 +7331,9 @@ async function confirmImport() {
     // Кнопка импорта → disabled.
     btn.disabled = true;
     btn.textContent = "✅ Импортировано";
+    // v1.31.2: после успешного импорта закрывать окно — только крестиком
+    if (_cancelBtn) _cancelBtn.disabled = true;
+    if (_footerHint) _footerHint.textContent = "Импорт завершён — закройте окно крестиком ✕ справа сверху";
     return;
   } catch (e) {
     _showPreviewErrors(["Сеть: " + e.message], "Импорт не удался");
@@ -6174,7 +7412,7 @@ function classifyHost(h) {
   if (known) return {cls: "known", name: known.friendly_name || known.name, type: known.type};
   // v1.28.78: имя из конфига могло ещё не приехать (LAST_DEVICES) —
   // но bridge проставил флаг known при скане, показываем хотя бы это.
-  if (h.known) return {cls: "known", name: "из конфига"};
+  if (h.known || h.known_bridge) return {cls: "known", name: "из конфига"};
   // v1.18.15: если bridge 1.8.3 подтвердил Tuya UDP-пробой —
   // показываем жёстко.
   if (h.tuya && h.tuya.udp_port) {
@@ -6192,13 +7430,16 @@ function renderScanResults(subnet) {
   const res = document.getElementById("scan-result");
   if (!res) return;
   res.style.display = "block";
+  // v1.33.18: сохраняем прокрутку — автоперерисовка (раз в 5 с и после
+  // обновления статуса) раньше «подбрасывала» список к началу.
+  const _savedScanScroll = res.scrollTop;
   if (SCAN_RESULTS.length === 0) {
     res.innerHTML = `<div style="padding:12px;" class="muted">Ничего не найдено. Нажми «Безопасный скан».</div>`;
     return;
   }
   let html = "";
   html += `<div class="scan-toolbar">
-    <button class="primary" id="bridge-scan-btn" onclick="doBridgeScan()" title="Опрос через bridge: неизвестные IP проверяются TCP-коннектом на порт 6668 (находит устройства, которые не отвечают на ICMP), известные — только ICMP (правило «один TCP-сокет»). Плюс UDP-проба Tuya 6666/6667.">📡 Скан через Bridge</button>
+    <button class="primary" id="bridge-scan-btn" onclick="doBridgeScan()" title="Опрос через bridge: неизвестные IP проверяются TCP-коннектом на порт 6668 (находит устройства, которые не отвечают на ICMP), известные — только ICMP, чтобы не мешать bridge и не рвать его соединение. Плюс UDP-проба Tuya 6666/6667.">📡 Скан через Bridge</button>
     <span class="scan-toolbar-info" style="margin-left:8px; font-size:11px;">находит больше (TCP 6668)</span>
     <span class="scan-toolbar-info" id="bridge-scan-status"></span>
     <span class="scan-toolbar-info" style="margin-left:auto;">Найдено: ${SCAN_RESULTS.length} (сеть ${escapeHtml(subnet)}.x)${SCAN_TS ? " · измерено " + escapeHtml(fmtAgo(SCAN_TS)) : ""}</span>
@@ -6236,6 +7477,7 @@ function renderScanResults(subnet) {
     </div>`;
   }
   res.innerHTML = html;
+  if (_savedScanScroll) res.scrollTop = _savedScanScroll;   // v1.33.18
 }
 
 async function doBridgeScan() {
@@ -6346,7 +7588,9 @@ function _updateToolsToolbar(view) {
   const raw = document.getElementById("tools-copy-raw-btn");
   const dev = document.getElementById("tools-copy-dev-btn");
   const aud = document.getElementById("tools-audit-cleanup-btn");
+  const rst = document.getElementById("tools-restore-btn");
   if (raw) raw.style.display = (v === "raw") ? "" : "none";
+  if (rst) rst.style.display = (v === "raw") ? "" : "none";
   if (dev) dev.style.display = (v === "bydev") ? "" : "none";
   if (aud) aud.style.display = (v === "audit") ? "" : "none";
 }
@@ -6429,6 +7673,7 @@ const HELP_SECTIONS = {
     { id: "diag",      label: "🩺 Диагностика" },
     { id: "ha",        label: "🏠 Home Assistant" },
     { id: "api",       label: "🔌 API (HTTP)" },
+    { id: "news",      label: "🆕 Что нового" },
   ],
 };
 const HELP_TEXT = {
@@ -6440,8 +7685,8 @@ const HELP_TEXT = {
       в Home Assistant через MQTT Discovery.</p>
       <h3>Архитектура</h3>
       <ul>
-        <li><b>tuya-bridge</b> (<code>main.py</code>) — воркеры устройств, MQTT-клиент, кэш состояний;</li>
-        <li><b>tuya-webui</b> (<code>webui.py</code>) — HTTP <code>:5386</code>, SQLite, SSE-логи, настройка;</li>
+        <li><b>tuya-bridge</b> — воркеры устройств, MQTT-клиент, кэш состояний;</li>
+        <li><b>tuya-webui</b> — HTTP <code>:5386</code>, SQLite, SSE-логи, настройка;</li>
         <li>Связь между контейнерами — через MQTT и общие файлы; Home Assistant подхватывает Discovery.</li>
         <li>WebUI не имеет доступа к Docker и не управляет устройствами напрямую.</li>
       </ul>
@@ -6458,8 +7703,8 @@ const HELP_TEXT = {
       <code>os.replace</code>. <code>webui_state/</code> — обязательный volume.</p>
       <h3>Структура проекта</h3>
       <ul>
-        <li><code>bridge/</code> — <code>main.py</code> и Dockerfile;</li>
-        <li><code>webui/</code> — <code>webui.py</code> и Dockerfile;</li>
+        <li><code>bridge/</code> — исходники моста;</li>
+        <li><code>webui/</code> — исходники WebUI;</li>
         <li><code>config/</code> — <code>devices_config.json</code> (общий: bridge — rw, webui — ro);</li>
         <li><code>state/</code> — кэш состояний bridge (<code>state_cache.json</code>);</li>
         <li><code>webui_state/</code> — SQLite, Cloud-кэш, tuya-local, quiet, audit;</li>
@@ -6494,10 +7739,13 @@ const HELP_TEXT = {
         <li><code>friendly_name</code> — человеческое имя для Home Assistant;</li>
         <li><code>ip</code> — локальный IP устройства;</li>
         <li><code>local_key</code> — локальный ключ Tuya;</li>
-        <li><code>version</code> — версия протокола: <code>3.1</code>, <code>3.3</code>, <code>3.4</code>, <code>3.5</code>;</li>
+        <li><code>version</code> — версия протокола (локальное свойство устройства): <code>3.1</code>, <code>3.2</code>, <code>3.3</code>, <code>3.4</code>, <code>3.5</code>.
+            Облако её не отдаёт: определяется кнопкой «🔍 Probe» (перебор версий) или задаётся вручную
+            (✏️ Редактирование → Версия протокола). Неверная версия = устройство не отвечает (ошибка 904);</li>
         <li><code>type</code> — <code>light</code> / <code>switch</code> / <code>climate</code> /
             <code>sensor</code> / <code>binary_sensor</code> / <code>cover</code> /
-            <code>fan</code>;</li>
+            <code>fan</code> — платформа Home Assistant. Меняется в
+            ✏️ Редактирование → Тип устройства (смена пересоздаёт сущности);</li>
         <li><code>model</code> — необязательно, отображается в Home Assistant;</li>
         <li><code>battery_powered</code> — необязательно, <code>true</code> для батарейных;</li>
         <li><code>enabled</code> — необязательно, <code>false</code> чтобы пропустить устройство;</li>
@@ -6547,7 +7795,7 @@ const HELP_TEXT = {
             меняет смысл значения.</li>
       </ul>`,
     settings: `
-      <h3>main.py — параметры bridge</h3>
+      <h3>Переменные окружения bridge</h3>
       <ul>
         <li><code>MQTT_BROKER</code> — адрес MQTT-брокера;</li>
         <li><code>MQTT_PORT</code> — порт брокера (по умолчанию 1883);</li>
@@ -6559,10 +7807,12 @@ const HELP_TEXT = {
         <li><code>AVAILABILITY_EXPIRE=120</code> — <code>expire_after</code> в Discovery (Home Assistant сам пометит недоступным);</li>
         <li><code>SOCKET_TIMEOUT_CMD=0.3</code> — таймаут сокета при отправке команды, сек;</li>
         <li><code>SOCKET_TIMEOUT_WORKER=0.1</code> — таймаут <code>receive()</code> в воркере, сек;</li>
-        <li><code>CMD_POOL_SIZE=32</code> — размер пула потоков для команд;</li>
         <li><code>WORKER_IDLE_SLEEP=0.4</code> — пауза между <code>receive()</code> в воркере, сек;</li>
         <li><code>LOCK_ACQUIRE_TIMEOUT=0.05</code> — сколько секунд ждать блокировку сокета;</li>
         <li><code>MIN_CMD_INTERVAL_STREAM=0.15</code> — минимальный интервал команд для light/climate/number, сек;</li>
+        <li><code>SWITCH_DEBOUNCE_MS=0</code> — дебаунс (склейка) быстрых команд switch/light:
+            первая команда уходит сразу, хвост серии — одной финальной; <code>0</code> = выключено;</li>
+        <li><code>SWITCH_DEBOUNCE_MAX_MS=1200</code> — потолок ожидания финальной команды при спаме;</li>
         <li><code>MIN_CMD_INTERVAL_SWITCH=0</code> — то же для switch/select (без ограничения);</li>
         <li><code>DEBOUNCE_BY_TYPE</code> — окна дебаунса команд по типу устройства (гасят дребезг);</li>
         <li><code>REPEAT_RESET_SECONDS=120</code> — через сколько секунд сбрасывать счётчики повторов 914/905;</li>
@@ -6586,8 +7836,7 @@ const HELP_TEXT = {
         <li><code>TOPIC_PREFIX</code>, <code>DISCOVERY_PREFIX</code>, <code>LOG_LEVEL</code>;</li>
         <li><code>TZ</code> — часовой пояс контейнера (влияет на время в логах).</li>
       </ul>
-      <p class="help-note">Если переменная не задана — берётся значение по умолчанию из
-      <code>main.py</code>.</p>
+      <p class="help-note">Если переменная не задана — берётся значение по умолчанию.</p>
       <p class="help-note">Батарейное устройство (<code>battery_powered</code>) bridge обслуживает
       отдельным воркером, который слушает сообщения устройства; проводное — периодическим опросом.</p>`,
     mqtt: `
@@ -6608,7 +7857,18 @@ const HELP_TEXT = {
         <li><code>tuya/bridge/edit_config</code> — JSON <code>{device, changes, validate, request_id}</code>;</li>
         <li><code>tuya/bridge/delete_device</code> — JSON <code>{device, request_id}</code>;</li>
         <li><code>tuya/bridge/import_devices</code> — JSON <code>{devices, overwrite, request_id}</code>;</li>
-        <li><code>tuya/bridge/scan_network</code> — JSON <code>{subnet, request_id}</code>.</li>
+        <li><code>tuya/bridge/scan_network</code> — JSON <code>{subnet, request_id}</code>;</li>
+        <li><code>tuya/bridge/cleanup_orphans</code> — удалить только «зависшие» retained
+            Discovery (живые сущности не трогаются);</li>
+        <li><code>tuya/bridge/restore_config</code> — JSON <code>{backup, request_id}</code>:
+            откат конфига из бэкапа без перезапуска контейнера;</li>
+        <li><b>Инструменты конфига</b> (1.11–1.12): <code>tuya/bridge/config_report</code>,
+            <code>expire_clear</code>, <code>expire_fill</code>, <code>config_normalize</code>,
+            <code>config_backups</code> — JSON <code>{…, request_id}</code>, ответ в
+            <code>*_result</code>;</li>
+        <li><code>tuya/bridge/quiet_config</code> — <b>служебный</b>: сюда WebUI публикует окна
+            тишины (retained). По ним мост пишет <code>905</code>/offline для «тихих»
+            устройств в <b>DEBUG</b>.</li>
       </ul>
       <h3>Состояние (bridge → Home Assistant)</h3>
       <ul>
@@ -6619,7 +7879,10 @@ const HELP_TEXT = {
         <li><code>tuya/climate/&lt;dev&gt;/temp/state</code> — уставка;</li>
         <li><code>tuya/climate/&lt;dev&gt;/current/state</code> — текущая температура;</li>
         <li><code>tuya/climate/&lt;dev&gt;/preset/state</code> — текущий пресет;</li>
-        <li><code>tuya/select|number/&lt;dev&gt;/&lt;entity&gt;/state</code> — значение;</li>
+        <li><code>tuya/select|number/&lt;dev&gt;/&lt;entity&gt;/state</code> — значение.
+            Для <code>select</code> с картой <code>map</code> (<b>Tuya→HA</b>, например
+            <code>{"off":"power_off"}</code>) публикуется <b>метка HA</b> — и она же
+            принимается в командах (обратный мэппинг);</li>
         <li><code>tuya/&lt;type&gt;/&lt;dev&gt;/dps/&lt;dp&gt;/state</code> — сенсоры (с учётом <code>scale</code>);</li>
         <li><code>tuya/&lt;type&gt;/&lt;dev&gt;/phase_a/voltage/state</code> — вольты;</li>
         <li><code>tuya/&lt;type&gt;/&lt;dev&gt;/phase_a/current/state</code> — амперы;</li>
@@ -6630,17 +7893,45 @@ const HELP_TEXT = {
         <li><code>tuya/bridge/status</code> — <code>online</code> / <code>offline</code> (LWT при старте и падении);</li>
         <li><code>tuya/bridge/uptime</code> — аптайм в секундах (раз в 30 сек);</li>
         <li><code>tuya/bridge/version</code> — версия bridge при старте;</li>
+        <li><code>tuya/&lt;dev&gt;/battery_alert</code> — <code>ok</code> / <code>no_data</code>
+            (только батарейные);</li>
+        <li><code>tuya/&lt;dev&gt;/last_seen</code> — время последнего пробуждения, unix
+            (только батарейные);</li>
         <li><code>tuya/&lt;dev&gt;/status</code> — <code>online</code> / <code>offline</code> при изменении;</li>
         <li><code>tuya/&lt;dev&gt;/last_seen</code> — unix-timestamp последнего успешного ответа;</li>
         <li><code>tuya/&lt;dev&gt;/cache_snapshot</code> — снимок всех DP (JSON) при каждом успешном опросе.</li>
       </ul>
       <h3>Результаты команд (bridge → WebUI)</h3>
-      <p>Все <code>*_result</code> содержат <code>request_id</code> — даже в ошибочных ветках.</p>
+      <p>Все <code>*_result</code> содержат <code>request_id</code> — даже в ошибочных
+         ветках, поэтому ответ всегда сопоставим с запросом. Общий вид:
+         <code>{request_id, ok, error, ts, …}</code>.</p>
       <ul>
         <li><code>tuya/bridge/edit_config_result</code> — <code>{request_id, device, ok, error, changes, ts}</code>;</li>
         <li><code>tuya/bridge/delete_device_result</code> — <code>{request_id, ok, error, device, ts}</code>;</li>
         <li><code>tuya/bridge/import_devices_result</code> — <code>{request_id, ok, added, updated, skipped, errors, ts}</code>;</li>
-        <li><code>tuya/bridge/scan_network_result</code> — <code>{request_id, ok, hosts, subnet, ts}</code>.</li>
+        <li><code>tuya/bridge/scan_network_result</code> — <code>{request_id, ok, hosts, subnet, ts}</code>;</li>
+        <li><b>Инструменты конфига</b> — тот же общий вид плюс поля по команде:
+          <ul>
+            <li><code>config_report_result</code> — отчёт по секциям конфига;</li>
+            <li><code>config_backups_result</code> — <code>{backups: […]}</code>;</li>
+            <li><code>config_normalize_result</code> — <code>{dry_run, before, removed, …}</code>;</li>
+            <li><code>expire_clear_result</code> — <code>{cleared: […]}</code>;</li>
+            <li><code>expire_fill_result</code> — <code>{changed: […], value}</code>;</li>
+            <li><code>restore_config_result</code> — <code>{backup, devices, removed, started, stopped, republished}</code>;</li>
+            <li><code>cleanup_result</code> — <code>{removed, republished}</code>;</li>
+            <li><code>cleanup_orphans_result</code> — <code>{removed, kept, …}</code>.</li>
+          </ul>
+        </li>
+      </ul>
+      <h3>Отклик команд (bridge → WebUI, retained)</h3>
+      <ul>
+        <li><code>tuya/bridge/cmd_ack</code> — статистика отклика команд (retained,
+            публикуется не чаще 1 раза в 30 с):
+            <code>{ts, default_sec, min_sec, max_sec, min_samples,
+            devices:{"&lt;dev&gt;":{n, p50, p90, last, guard}}}</code> —
+            <code>p50</code>/<code>p90</code>/<code>last</code> в мс, <code>guard</code> —
+            фактическое окно защиты от «эха» для устройства. По <code>p90</code> мост
+            адаптивно подстраивает окно; WebUI показывает это в таблице задержки.</li>
       </ul>
       <h3>Структура hosts[i] в скане</h3>
       <ul>
@@ -6691,7 +7982,6 @@ const HELP_TEXT = {
       </ul>
       <h3>За счёт чего</h3>
       <ul>
-        <li><code>CMD_POOL_SIZE=32</code> — пул потоков команд с запасом на 40+ устройств;</li>
         <li><code>SOCKET_TIMEOUT_CMD=0.3</code> — команды не ждут долго;</li>
         <li>Rate-limit только для «стримовых» DP (light/climate/number);</li>
         <li>Post-command status — состояние обновляется сразу после команды.</li>
@@ -6765,11 +8055,74 @@ const HELP_TEXT = {
         <li>Нет управления Tuya Cloud (только локально); нет Prometheus-метрик;</li>
         <li>История в SQLite хранится ~3 дня;</li>
         <li>WebUI без аутентификации (рассчитан на локальную сеть); PWA устанавливается вручную;</li>
-        <li>Режим тишины — без дней недели (только часы) и влияет только на WebUI;</li>
+        <li>Режим тишины — без дней недели (только часы); окна передаются мосту
+            (retained-топик <code>tuya/bridge/quiet_config</code>), и для «тихих» устройств
+            905/offline уходят в <b>DEBUG</b>;</li>
         <li>Cloud-кэш и tuya-local живут в <code>webui_state/</code> — нужен volume.</li>
       </ul>`,
   },
   webui: {
+    news: `
+      <h3>🆕 Что нового (после релиза 1.0)</h3>
+      <h3>Мост (Bridge 1.9 → 1.12.21)</h3>
+      <ul>
+        <li><b>Батарейные устройства</b> (1.9–1.10): отдельный listener, <code>battery_alert</code> /
+            <code>battery_last_seen</code>, публикация при каждом пробуждении, диагностика CAP_NET_RAW;</li>
+        <li><b>Инструменты конфига</b> (1.11–1.12): отчёт, нормализация, массовое проставление
+            <code>expire_after</code> (<code>null</code> = удалить поле);</li>
+        <li><b>Откат из бэкапа без рестарта</b> (1.12.0): воркеры перезапускаются на свежем
+            конфиге, хранится 20 бэкапов;</li>
+        <li><b>Очистка Discovery</b> (1.12.1–1.12.2): полная и «только зависшие» (orphan) —
+            живые сущности не трогаются;</li>
+        <li><b>Состояние сразу после команды</b> (1.12.3–1.12.6): окно против «эха»,
+            опрос отложен примерно на секунду;</li>
+        <li><b>Окно «эха» подстраивается само</b> (1.12.19): мост замеряет реальный отклик
+            «команда → отчёт» и берёт <code>p90 × 1.5</code> в пределах 0.6…3 с
+            (по умолчанию 1.2 с, пока проб меньше 5). В таблице задержки — «↩ N мс → окно X с»;</li>
+        <li><b>Надёжность</b> (1.12.7–1.12.9): очистка учитывает выключенные устройства,
+            валидация конфига на старте, retained-дубли по последней команде, мусор в конфиге
+            больше не блокирует запуск;</li>
+        <li><b><code>select.map</code></b> (1.12.8): карта задаётся как Tuya→HA, в HA показываются метки;</li>
+        <li><b>Тихие часы</b> (1.12.10): окна приходят из WebUI, 905/offline для таких устройств
+            пишутся в DEBUG (см. «Режим тишины»);</li>
+        <li><b>DEBUG без шума библиотек</b> (1.12.11): paho/tinytuya остаются на INFO;</li>
+        <li><b>Понятные ошибки удаления/импорта</b> (1.12.20): на неверный запрос приходит
+            текст ошибки, а не «молчание» с таймаутом.</li>
+      </ul>
+      <h3>WebUI (1.27 → 1.33.23)</h3>
+      <ul>
+        <li><b>Дашборд</b>: плашка состояния (CPU/RAM, версии), «Проблемные», секция «⛔ Отключённые»;</li>
+        <li><b>Импорт</b>: превью с опросом устройств, выбор версии/DP, «Отмена», RAW-результат;</li>
+        <li><b>Аналитика</b>: «мерцания», задержки, timeline; БД SQLite с очисткой по периоду;</li>
+        <li><b>Режим тишины</b>: окна на устройство (теперь передаются мосту);</li>
+        <li><b>Логи</b>: живой хвост (SSE), фильтры по источнику и уровню, пауза;</li>
+        <li><b>Инструменты</b>: отчёт/нормализация/expire_*, бэкапы и откат, очистка Discovery,
+            <b>локальные базы DP</b> (tuya-local + пересборка tinytuya, у каждой свой прогресс), Cloud-кэш;</li>
+        <li><b>Мобильная вёрстка</b> и тёмная/светлая тема;</li>
+        <li><b>Фиксы 1.31.19–1.32.40</b>: валидация тел POST, grace после рестарта моста,
+            модалка отката, горизонтальный скролл Cloud, кэш облака и <code>/api/status</code>
+            без файлового I/O, раздельные прогресс-бары баз DP, прогресс скачивания tuya-local
+            в МБ, отчёт пересборки плитками (добавлено/обновлено/без изменений/удалено),
+            кнопки A−/A+ для логов, <code>Release &lt;N&gt;</code> в подвале и значок «!»
+            при новом релизе на GitHub, мини-подвал;
+            <b>аналитика</b> — KPI-плитки, скрытие пустых секций, настройка вида,
+            доступность и подсказки по батарейным, CSV-экспорт, равные карточки в ряду;
+            <b>дашборд</b> — KPI-плитки и широкая полоса поиска;
+            обновлённые разделы справки «MQTT-топики», «API (HTTP)» и «Аналитика».</li>
+        <li><b>Новое в 1.32.41–1.33.23</b>: график «Активность и мерцания» переделан — ось
+            строится по данным (линия идёт от края до края), подсветка ночи, сглаживание,
+            аккуратные точки наведения; <b>tuya-local</b> — прогресс в МБ с номером попытки и
+            карточки после обновления (YAML-файлов, product_id, МБ, попытки), индекс собирается
+            один раз (быстрее); <b>пинг</b> — среднее из 5 проб, кнопка не дублирует замер и
+            переживает перезагрузку страницы; <b>нормализация конфига</b> — окно с галочками
+            («синтаксис» / «формат») и предпросмотром; <b>на мобильном</b> — уровни логов и
+            A−/A+ в одной строке (если не влезают — A−/A+ уходят вниз, чипы уровней занимают
+            строку целиком), значок «!» сразу за названием; кнопка опроса в карточке превью
+            (как на ПК), имя устройства в таблице Cloud не переносится; <b>подвал</b> прижат
+            к низу окна; <b>справка «MQTT-топики»</b> — полный список <code>*_result</code>
+            и retained-топик <code>cmd_ack</code>; <b>доступность</b> — все поля связаны
+            с подписями.</li>
+      </ul>`,
     overview: `
       <h3>Что такое WebUI</h3>
       <p>Отдельный контейнер для настройки, диагностики и контроля моста. Открывается по
@@ -6827,9 +8180,12 @@ const HELP_TEXT = {
       <ul>
         <li><b>☁ Cloud</b> — mapping из Tuya Cloud;</li>
         <li><b>📚 tuya-local</b> — локальная база шаблонов;</li>
+        <li><b>📦 Локальная база</b> — собранный mapping устройства из
+            <code>tinytuya_devices.json</code> (пересборка — в «Локальные базы DP»);
+            используется, когда Cloud и tuya-local ничего не дали;</li>
         <li><b>🔗 similar</b> — совпал <code>product_id</code> с уже настроенным устройством;</li>
         <li><b>⚙️ Текущий</b> — как уже сохранено в конфиге;</li>
-        <li><b>⚠️ эвристика</b> — догадка по имени или значению (проверяйте).</li>
+        <li><b>⚠️ Эвристика</b> — догадка по имени или значению (проверяйте).</li>
       </ul>
       <h3>Превью</h3>
       <ul>
@@ -6837,8 +8193,13 @@ const HELP_TEXT = {
         <li><b>Выбор</b> — источник для конкретного DP; источник в шапке управляет новыми устройствами;</li>
         <li><b>🧪 Песочница</b> — посмотреть все DP и значения известного устройства
             (изменения не сохраняются);</li>
-        <li><b>🔍 Опросить устройство</b> — локальный probe, если Cloud не дал mapping
-            (таймаут 15 секунд);</li>
+        <li><b>🔍 Опросить устройство</b> — локальный probe (таймаут 15 секунд): перебирает
+            версии протокола и сопоставляет DP. Ответила одна версия — показывается бейдж,
+            несколько — селект; результат опроса (в том числе ошибка) раскрывается в RAW-блоке
+            под кнопкой. У устройств, уже добавленных в конфиг, кнопки нет — известный IP
+            не опрашивается по TCP — иначе bridge теряет соединение с устройством;</li>
+        <li><b>Версия и тип</b> — селекты в карточке: версию можно выбрать вручную, если probe
+            не удался (иконка «не определена»), тип — платформа Home Assistant;</li>
         <li>Мусорные DP выключены по умолчанию; <b>Δ +/−/~</b> — изменения относительно
             текущего конфига;</li>
         <li>Переключатели: приоритет батарейного устройства и язык пресетов.</li>
@@ -6851,8 +8212,16 @@ const HELP_TEXT = {
       <h3>Локальные базы DP</h3>
       <ul>
         <li><b>tinytuya_devices.json</b> — список устройств с DP; <b>tuya-local</b> — 1700+ YAML; оба в <code>webui_state/</code>;</li>
-        <li><b>⬇ Обновить tuya-local</b> — скачать базу из GitHub (2 фазы: скачивание и импорт/индекс);</li>
-        <li><b>🔄 Пересобрать tinytuya.json</b> — фоновый probe и слияние mapping;</li>
+        <li><b>⬇ Обновить tuya-local</b> — скачать базу из GitHub (2 фазы: скачивание и
+            импорт/индекс). У операции <b>свой прогресс-бар</b>: её можно запускать одновременно
+            с пересборкой — полосы не перетираются и показываются друг под другом;</li>
+        <li><b>🔄 Пересобрать tinytuya.json</b> — открывает диалог с опциями:
+            <b>не опрашивать батарейные</b> (спят и не отвечают) и <b>останавливаться на первой
+            ответившей версии</b> протокола. Для каждого устройства открывается отдельное
+            TCP-подключение конкурирует с опросом bridge — запускайте в тихое время;</li>
+        <li>По окончании — отчёт: «опрошено / проверено / расхождений / неоднозначных /
+            из прошлой базы» и время сбора. База пишется атомарно (старая не портится);</li>
+        <li>Эта база используется как источник <b>📦 Локальная база</b> при импорте;</li>
         <li>Счётчики обновляются сами раз в 15 секунд.</li>
       </ul>
       <h3>Скан сети</h3>
@@ -6861,12 +8230,36 @@ const HELP_TEXT = {
     analytics: `
       <h3>Что показывает</h3>
       <ul>
+        <li><b>KPI-плитки</b> сверху: <code>online X/Y</code>, средний ping, мерцаний за 24 ч,
+            тихих сейчас, <b>самый медленный</b> и <b>мерцает больше всех</b>;</li>
         <li><b>Задержка (ICMP ping)</b> — период <code>[30мин][1час][6час][Сутки][Всё]</code>,
-            средний ping, сортировка и цветовой индикатор (timeout выделяется);</li>
+            средний ping, сортировка и цветовой индикатор (timeout выделяется).
+            Замер — <b>среднее из 5 проб</b> (одиночный замер часто врёт);</li>
         <li><b>Хронология событий</b> — до 500 записей online/offline с очисткой по режимам;</li>
         <li><b>Мерцающие устройства (24ч)</b> — сортировка по клику;</li>
         <li><b>Активность и мерцания (24ч)</b> — два графика в одной карточке;</li>
         <li><b>Здоровье</b> — CPU, RAM и диск WebUI и bridge.</li>
+      </ul>
+      <h3>Детали таблицы задержки (1.32.12–1.32.13)</h3>
+      <ul>
+        <li>если замеров нет — вместо «нет данных» показывается причина:
+            <code>🔇 в тишине</code>, <code>🔋 батарейное</code> или <code>⏳ нет ответа</code>;</li>
+        <li>под значением — период, число пингов, <b>доступность</b> и число таймаутов
+            (<code>1ч · 40p · 97%ut · ⚠2</code>, где <code>%ut</code> — доля успешных
+            ответов за период);</li>
+        <li>у батарейных — <code>🔋 выход 3ч назад</code>; если молчит больше 12 часов,
+            подпись подсвечивается и добавляется «— давно молчит».</li>
+      </ul>
+      <h3>Пустые секции и настройка вида</h3>
+      <ul>
+        <li>секции без данных <b>скрываются полностью</b> (не занимают место); если в ряду
+            остаётся одна карточка — она растягивается на всю ширину;</li>
+        <li><b>⚙ Настроить аналитику</b> — что показывать: KPI-плитки, «Мерцающие»,
+            «Хронологию», графики и «Скрывать тихие устройства». Выбор хранится в браузере
+            (<code>localStorage</code>). Пока панель настроек открыта, все секции видны —
+            даже пустые, чтобы было понятно, что включаешь;</li>
+        <li><b>⬇ CSV задержки</b> — выгрузка таблицы (устройство, IP, средний ping, пинги,
+            таймауты, время проверки) для Excel/Sheets.</li>
       </ul>
       <p class="help-note">Устройства в тишине не пингуются и исключаются из мерцаний,
       хронологии и «Проблемных».</p>
@@ -6895,6 +8288,12 @@ const HELP_TEXT = {
         <li>✅ статус на дашборде и бейдж 🔇 показываются;</li>
         <li>✅ «Online по часам» и снапшоты — без изменений.</li>
       </ul>
+      <h3>И в логах моста</h3>
+      <p>Окна тишины передаются мосту (топик <code>tuya/bridge/quiet_config</code>, retained),
+      поэтому для таких устройств он <b>не пишет WARNING</b> про <code>905</code> и
+      «нет данных … offline» — эти строки уходят в <b>DEBUG</b>. Устройство выключено
+      намеренно, так что «недоступно» здесь — ожидаемое состояние, а не проблема.
+      Увидеть такие строки можно, подняв <code>LOG_LEVEL=DEBUG</code> у bridge.</p>
       <h3>Как настроить</h3>
       <p>Карточка устройства → «🔈 Режим тишины» → «+ Добавить окно» → задать
       <code>from</code> и <code>to</code> (например <code>23:00</code>–<code>08:00</code>).
@@ -6905,8 +8304,9 @@ const HELP_TEXT = {
       окна — <code>{"from":"HH:MM","to":"HH:MM"}</code>. Файл можно править руками — изменения
       подхватятся при следующем старте контейнера.</p>
       <p class="help-note">Grace: после окончания окна устройство ещё 2 минуты
-      (<code>QUIET_GRACE_SEC</code>) не считается проблемным. Bridge при этом не меняется —
-      режим тишины работает только на уровне WebUI.</p>
+      (<code>QUIET_GRACE_SEC</code>) не считается проблемным. Окна передаются мосту
+      (retained-топик <code>tuya/bridge/quiet_config</code>): для «тихих» устройств
+      905/offline уходят в <b>DEBUG</b>. На команды и публикацию состояния это не влияет.</p>
       <h3>API</h3>
       <p><code>POST /api/device/&lt;name&gt;/quiet</code> с телом
       <code>{"windows":[{"from":"23:00","to":"08:00"}]}</code>; пустой список удаляет окна.</p>`,
@@ -6932,8 +8332,30 @@ const HELP_TEXT = {
         <li><b>📋 По устройствам</b> — по одному устройству; кнопка
             <b>📋 Копировать JSON выбранного</b>;</li>
         <li><b>📜 История конфига</b> — журнал изменений (<code>config_audit.log</code>, JSONL)
-            и кнопка <b>🗑 Очистить</b>.</li>
+            и кнопка <b>🗑 Очистить</b>;</li>
+        <li><b>↩️ Откатить из бэкапа</b> — восстановить конфиг из бэкапа bridge
+            (список с датой и размером). Текущий конфиг тоже сохраняется в бэкап, поэтому
+            откат обратим; bridge перезапустит воркеры и перепубликует сущности в HA.</li>
       </ul>
+      <h3>Параметры и нормализация конфига</h3>
+      <ul>
+        <li><b>🔎 Проверить конфиг</b> — отчёт: что bridge читает, а что игнорирует
+            (лишние поля у устройств и DP);</li>
+        <li><b>🧹 Очистить expire_after</b> — удалить поле у всех устройств; батарейные
+            вернутся к значению по умолчанию;</li>
+        <li><b>⏳ Проставить батарейным</b> — записать одно значение <code>expire_after</code>
+            всем батарейным устройствам;</li>
+        <li><b>⚠️ Нормализовать конфиг</b> — открывает окно с галочками:
+            <b>1) исправить синтаксис</b> (убрать лишние/неизвестные поля, <code>role</code>,
+            <code>expire_after</code> у проводных) и <b>2) исправить формат</b>
+            (проверка и починка типов значений: <code>bool</code>/строка/число, пробелы,
+            битый <code>dps_map</code>). Кнопка <b>🔍 Проверить</b> показывает отчёт,
+            запись — только после подтверждения; делается бэкап, операция попадает
+            в «📜 Историю конфига».</li>
+      </ul>
+      <p class="help-note"><code>expire_after</code> — «время жизни» сущностей в Home Assistant;
+      применяется <b>только к батарейным</b> (у проводных bridge всегда использует своё значение).
+      Пусто в ✏️ или кнопка «По умолчанию» — поле удаляется из конфига.</p>
       <h3>Обслуживание</h3>
       <ul>
         <li><b>🗑 Очистить БД</b> — удаляет старые записи истории задержек и снапшотов
@@ -6941,7 +8363,7 @@ const HELP_TEXT = {
         <li><b>🧹 Очистить Discovery</b> — перепубликация сущностей в Home Assistant.</li>
       </ul>`,
     settings: `
-      <h3>webui.py — параметры WebUI</h3>
+      <h3>Переменные окружения WebUI</h3>
       <ul>
         <li><code>WEBUI_PORT=5386</code> — HTTP-порт WebUI;</li>
         <li><code>WEBUI_HOST=0.0.0.0</code> — адрес прослушивания;</li>
@@ -6974,8 +8396,8 @@ const HELP_TEXT = {
         <li><code>WEBUI_PORT</code>, <code>WEBUI_HOST</code>;</li>
         <li><code>TZ</code> — часовой пояс контейнера (влияет на окна тишины и время в логах).</li>
       </ul>
-      <p class="help-note">Если переменная не задана — берётся значение по умолчанию из
-      <code>webui.py</code>. Требуется перезапуск контейнера WebUI.</p>`,
+      <p class="help-note">Если переменная не задана — берётся значение по умолчанию.
+      Требуется перезапуск контейнера WebUI.</p>`,
     diag: `
       <h3>WebUI не измеряет задержку</h3>
       <ul>
@@ -7049,6 +8471,14 @@ const HELP_TEXT = {
     api: `
       <h3>HTTP API WebUI</h3>
       <p>Все методы — на порту <code>5386</code>. Пример: <code>http://&lt;host&gt;:5386/api/status</code>.</p>
+      <h3>Правила POST (с 1.31.19)</h3>
+      <ul>
+        <li>тело — только JSON: <code>Content-Type: application/json</code>, иначе <code>415</code>;</li>
+        <li>тело — <b>объект</b> (не массив), иначе <code>400</code>; невалидный JSON — <code>400</code>;</li>
+        <li>размер тела — до <b>1 МБ</b>, иначе <code>413</code> (защита от «заявленного» гигабайта);</li>
+        <li>ошибки всегда приходят JSON-ом (<code>{"ok": false, "error": "…"}</code>) —
+            соединение не рвётся.</li>
+      </ul>
       <h3>Страницы и служебное (GET)</h3>
       <ul>
         <li><code>/</code> — HTML-страница дашборда;</li>
@@ -7063,7 +8493,9 @@ const HELP_TEXT = {
       </ul>
       <h3>Данные (GET)</h3>
       <ul>
-        <li><code>/api/status</code> — состояние bridge и список устройств (JSON);</li>
+        <li><code>/api/status</code> — состояние bridge и список устройств (JSON).
+            С 1.32.2 у устройств нет поля <code>history</code> (UI берёт историю из своего
+            кэша), а у <code>/api/health/full</code> — мёртвого <code>last_flush_sec</code>;</li>
         <li><code>/api/config/raw</code> — полный <code>devices_config.json</code>;</li>
         <li><code>/api/config/audit?limit=N</code> — история изменений конфига (последние N);</li>
         <li><code>/api/device/&lt;name&gt;/secret</code> — локальный ключ устройства;</li>
@@ -7083,7 +8515,16 @@ const HELP_TEXT = {
       <ul>
         <li><code>/api/cleanup</code> — очистить и переопубликовать Discovery;</li>
         <li><code>/api/latency/refresh</code> — запустить ручной замер задержки;</li>
-        <li><code>/api/db/cleanup</code> — очистить SQLite (по периоду или полностью);</li>
+        <li><code>/api/db/cleanup</code> — очистить SQLite (по периоду или полностью).
+            Нечисловые <code>keep_days</code>/<code>keep_hours</code> → <code>400</code>;
+            «полностью» дополнительно чистит буферы в памяти;</li>
+        <li><code>/api/scan/extended</code> — расширенный скан сети; выполняется <b>по одному</b>:
+            если скан уже идёт, вернётся <code>{"ok": false, "error": "скан уже выполняется"}</code>;</li>
+        <li><code>/api/device/&lt;name&gt;/quiet</code> — окна тишины устройства: сохраняются и
+            <b>публикуются мосту</b> (см. MQTT-топики) — поэтому 905/offline для «тихих»
+            устройств идут в DEBUG, а не в WARNING;</li>
+        <li><code>/api/cloud/probe_and_match</code> — <code>cloud_mapping</code> (если передан)
+            должен быть объектом не длиннее 1000 записей, иначе <code>400</code>;</li>
         <li><code>/api/config/audit/cleanup</code> — очистить историю конфига;</li>
         <li><code>/api/device/&lt;name&gt;/config</code> — изменить устройство (ip, key, name, enabled…);</li>
         <li><code>/api/device/&lt;name&gt;/delete</code> — удалить устройство из конфига;</li>
@@ -7191,9 +8632,208 @@ function updateFlapperSortIndicators() {
 }
 
 let _firstAnalyticsLoad = true;
+// v1.32.12: KPI-плитки дашборда (единый стиль с аналитикой).
+function renderDashboardKpi() {
+  const box = document.getElementById("dashboard-kpi");
+  if (!box) return;
+  const devs = (LAST_DEVICES || []).filter(d => d.enabled !== false);
+  const online = devs.filter(d => d.status === "online").length;
+  const quiet = devs.filter(d => d.quiet).length;
+  // v1.32.40: как в computeProblems — в grace-периоде после рестарта моста
+  // «проблемных» не показываем (иначе плитка горела красным сразу после старта).
+  const _bs = BRIDGE_STATE.bridge_started_at || 0;
+  const _grace = _bs > 0
+    && (Math.floor(Date.now() / 1000) - _bs) < BRIDGE_STARTUP_GRACE_SEC;
+  const bad = _grace ? 0 : devs.filter(d =>
+    d.status !== "online" && !d.quiet && !d.battery_powered).length;
+  const tile = (label, val, cls) =>
+    `<div class="rstat ${cls || ""}"><span>${label}</span><b title="${String(val).replace(/"/g, "&quot;")}">${val}</b></div>`;
+  box.innerHTML = [
+    tile("устройств", String(devs.length)),
+    tile("online", `${online}/${devs.length}`, online === devs.length ? "ok" : "warn"),
+    tile("проблемных", String(bad), bad ? "warn" : "ok"),
+    tile("тихих сейчас", String(quiet), quiet ? "soft" : ""),
+  ].join("");
+}
+
+
+// v1.32.37: имя устройства для плиток — friendly_name, а код только если имени нет.
+function deviceLabelByKey(dev) {
+  const d = (LAST_DEVICES || []).find(x => x.name === dev) || {};
+  return d.friendly_name || dev || "?";
+}
+
+
+// v1.32.12: KPI-плитки аналитики — единый стиль с плитками отчёта (.rstat).
+function renderAnalyticsKpi() {
+  const box = document.getElementById("analytics-kpi");
+  if (!box) return;
+  const devs = (LAST_DEVICES || []).filter(d => d.enabled !== false);
+  const total = devs.length;
+  const online = devs.filter(d => d.status === "online").length;
+  const quiet = devs.filter(d => d.quiet).length;
+  const lat = devs.map(d => d.latency_ms)
+                   .filter(v => typeof v === "number" && v > 0);
+  const avg = lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null;
+  const flaps = (FLAPPER_DATA || []).reduce((a, x) => a + (x.flaps || 0), 0);
+  // v1.32.13: топ-1 по задержке и по мерцаниям — сразу видно, кто «портит» картину.
+  const slow = devs.filter(d => typeof d.latency_ms === "number" && d.latency_ms > 0)
+                   .sort((a, b) => b.latency_ms - a.latency_ms)[0];
+  const flapTop = [...(FLAPPER_DATA || [])].sort((a, b) => (b.flaps || 0) - (a.flaps || 0))[0];
+  const tile = (label, val, cls) =>
+    `<div class="rstat ${cls || ""}"><span>${label}</span><b title="${String(val).replace(/"/g, "&quot;")}">${val}</b></div>`;
+  box.innerHTML = [
+    tile("online", `${online}/${total}`, online === total ? "ok" : "warn"),
+    tile("средний ping", avg === null ? "—" : `${avg} ms`,
+         avg === null ? "" : (avg < 60 ? "ok" : (avg < 150 ? "" : "warn"))),
+    tile("мерцаний 24ч", String(flaps),
+         flaps === 0 ? "ok" : (flaps <= 5 ? "soft" : "warn")),
+    tile("тихих сейчас", String(quiet), quiet ? "soft" : ""),
+    // v1.33.2: только имя — «· 167 ms» убрано (дублировало «средний ping»).
+    tile("самый медленный",
+         slow ? escapeHtml(slow.friendly_name || slow.name) : "—",
+         slow && slow.latency_ms > 150 ? "warn" : ""),
+    tile("мерцает больше всех",
+         (flapTop && flapTop.flaps)
+           ? `${escapeHtml(deviceLabelByKey(flapTop.dev))} · ${flapTop.flaps}` : "—",
+         (flapTop && flapTop.flaps) ? "warn" : ""),
+  ].join("");
+}
+
+
+// v1.32.12: настройка вида аналитики (панели + «скрывать тихие»), хранится в localStorage.
+function _anCfgLoad() {
+  try { return JSON.parse(localStorage.getItem("an_cfg") || "{}") || {}; }
+  catch (e) { return {}; }
+}
+function toggleAnalyticsCfg() {
+  const p = document.getElementById("an-cfg-panel");
+  if (!p) return;
+  const open = p.style.display !== "none";
+  p.style.display = open ? "none" : "block";
+  // v1.32.22: пока настройки открыты — показываем все настраиваемые секции,
+  // даже пустые (CSS #view-analytics.an-cfg-open), чтобы было видно, что включаешь.
+  const v = document.getElementById("view-analytics");
+  if (v) v.classList.toggle("an-cfg-open", !open);
+  if (typeof reflowAnalyticsGrid === "function") reflowAnalyticsGrid();
+}
+function applyAnalyticsCfg(fromUser) {
+  const cfg = {
+    kpi: document.getElementById("an-cfg-kpi")?.checked !== false,
+    flappers: document.getElementById("an-cfg-flappers")?.checked !== false,
+    timeline: document.getElementById("an-cfg-timeline")?.checked !== false,
+    charts: document.getElementById("an-cfg-charts")?.checked !== false,
+    hidequiet: document.getElementById("an-cfg-hidequiet")?.checked === true,
+  };
+  if (fromUser) { try { localStorage.setItem("an_cfg", JSON.stringify(cfg)); } catch (e) {} }
+  const show = (id, on) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const card = el.closest(".card") || el.closest(".chart-block") || el;
+    card.style.display = on ? "" : "none";
+  };
+  show("analytics-kpi", cfg.kpi);
+  show("flappers-body", cfg.flappers);
+  show("timeline-list", cfg.timeline);
+  show("chart-activity", cfg.charts);
+  show("chart-flaps", cfg.charts);
+  // «скрывать тихие» — перерисовываем таблицу задержки с фильтром
+  // v1.32.40: не перерисовываем таблицу пустым списком — иначе затирается skeleton.
+  if (Array.isArray(LATENCY_DATA) && LATENCY_DATA.length) {
+    renderLatencyTable(LATENCY_DATA);
+  }
+  if (typeof reflowAnalyticsGrid === "function") reflowAnalyticsGrid();
+}
+// v1.32.13: экспорт таблицы задержки в CSV (Excel/Sheets; BOM + «;»).
+function exportLatencyCsv() {
+  const rows = [["device", "ip", "avg_ms", "pings", "timeouts", "last_check"]];
+  (LATENCY_DATA || []).forEach(d => rows.push([
+    d.friendly_name || d.name || "", d.ip || "",
+    (d.avg_ms_24h === null || d.avg_ms_24h === undefined) ? "" : d.avg_ms_24h,
+    d.latency_count || 0, d.latency_timeouts || 0,
+    d.latency_ts ? new Date(d.latency_ts * 1000).toISOString() : "",
+  ]));
+  const csv = rows
+    .map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(";"))
+    .join("\r\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "latency.csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function _anCfgInit() {
+  const cfg = _anCfgLoad();
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.checked = val; };
+  set("an-cfg-kpi", cfg.kpi !== false);
+  set("an-cfg-flappers", cfg.flappers !== false);
+  set("an-cfg-timeline", cfg.timeline !== false);
+  set("an-cfg-charts", cfg.charts !== false);
+  set("an-cfg-hidequiet", cfg.hidequiet === true);
+  applyAnalyticsCfg(false);
+}
+
+
+// v1.32.19: если в ряду осталась одна карточка (сосед скрыт как пустой) —
+// растягиваем её на всю ширину, чтобы не оставалось пустой половины.
+function reflowAnalyticsGrid() {
+  document.querySelectorAll("#view-analytics .analytics-grid").forEach(g => {
+    const cards = [...g.children].filter(el => el.classList && el.classList.contains("analytics-card"));
+    cards.forEach(c => c.classList.remove("solo"));
+    const visible = cards.filter(c => !c.classList.contains("is-empty") && c.style.display !== "none");
+    if (visible.length === 1) visible[0].classList.add("solo");
+  });
+}
+
+
+// v1.32.27: размер шрифта лога (A− / A+) — компактно, перед «Скачать»; в localStorage.
+const LOG_FONTS = [10, 11, 12, 13, 14, 16, 18];
+function _logFontIdx() {
+  const v = parseInt(localStorage.getItem("log_font") || "12", 10);
+  const i = LOG_FONTS.indexOf(v);
+  return i >= 0 ? i : 2;
+}
+function applyLogFont() {
+  const px = LOG_FONTS[_logFontIdx()];
+  document.documentElement.style.setProperty("--log-font", px + "px");
+}
+function changeLogFont(delta) {
+  const i = Math.min(LOG_FONTS.length - 1, Math.max(0, _logFontIdx() + delta));
+  try { localStorage.setItem("log_font", String(LOG_FONTS[i])); } catch (e) {}
+  applyLogFont();
+  showCopiedToast("Шрифт лога: " + LOG_FONTS[i] + " px");
+}
+applyLogFont();   // v1.32.27: применяем сохранённый размер шрифта лога при загрузке
+
+// v1.32.34: раз в час проверяем, нет ли на GitHub релиза новее — значок «!» у темы.
+async function checkNewRelease() {
+  const badge = document.getElementById("release-new");
+  if (!badge) return;
+  try {
+    const r = await fetch("/api/update/check");
+    const d = await r.json();
+    if (d && d.newer) {
+      badge.style.display = "inline-flex";
+      badge.title = `Доступен релиз ${d.latest}` + (d.url ? " — нажмите, чтобы открыть" : "");
+      if (d.url) badge.onclick = () => window.open(d.url, "_blank", "noopener");
+    } else {
+      badge.style.display = "none";
+    }
+  } catch (e) { /* нет сети — молчим */ }
+}
+checkNewRelease();
+setInterval(checkNewRelease, 3600 * 1000);
+
+
 async function loadAnalytics() {
   if (!ANALYTICS_ENABLED) return;
   if (_firstAnalyticsLoad) {
+    // v1.33.18: настройки вида применяем ДО skeleton — иначе отрисованный
+    // «скелет» на миг показывал скрытые секции и мелькал раскладкой.
+    _anCfgInit();   // v1.32.12: настройки вида аналитики из localStorage
     renderSkeleton(document.getElementById("latency-body"), 4, 5);
     renderSkeleton(document.getElementById("flappers-body"), 2, 3);
   }
@@ -7212,6 +8852,8 @@ async function loadAnalytics() {
     if (summaryEl) summaryEl.textContent = "";
     renderActivity(data.activity || []);
     renderFlapsChart(data.flaps_hourly || []);
+    renderAnalyticsKpi();
+    reflowAnalyticsGrid();
     updateLatencySortIndicators();
     updateFlapperSortIndicators();
     _firstAnalyticsLoad = false;
@@ -7221,6 +8863,13 @@ async function loadAnalytics() {
 function renderLatencyTable(devs) {
   const tb = document.getElementById("latency-body");
   if (!tb) return;
+  // v1.32.12: «скрывать тихие устройства» из настроек аналитики
+  if (_anCfgLoad().hidequiet) {
+    devs = devs.filter(d => {
+      const ld = (LAST_DEVICES || []).find(x => x.name === d.name);
+      return !(ld && ld.quiet);
+    });
+  }
   if (devs.length === 0) { tb.innerHTML = '<tr><td colspan="3" class="muted">Нет данных</td></tr>'; return; }
   const s = [...devs].sort((a, b) => {
     let av, bv;
@@ -7250,15 +8899,69 @@ function renderLatencyTable(devs) {
     const avg = d.avg_ms_24h;
     const cnt = d.latency_count || 0;
     const timeouts = d.latency_timeouts || 0;
+    // v1.32.12: понятная причина вместо «нет данных · 0p»:
+    // тишина / батарейное / просто не отвечает.
+    const _ld = (LAST_DEVICES || []).find(x => x.name === d.name) || {};
+    const _why = (_ld.quiet && "🔇 в тишине")
+              || (_ld.battery_powered && "🔋 батарейное")
+              || "⏳ нет ответа";
     // v1.23.6: плашка с мс сверху, счётчики — под ней.
     const avgHtml = (avg === null || avg === undefined)
-      ? `<span class="latency lat-timeout">нет данных</span>`
+      ? `<span class="latency lat-timeout" title="замеров нет: ${_why}">нет данных · ${_why}</span>`
       : `<span class="latency ${latencyClass(avg)}">${avg} ms</span>`;
     // v1.28.87: компактно — период · кол-во пингов (+ ⚠timeout).
-    const metaLine = `<div class="muted" style="font-size:11px; margin-top:2px;">${escapeHtml(periodLabel)} · ${cnt}p${timeouts > 0 ? ` · <span style="color:var(--red)" title="${timeouts} timeout">⚠${timeouts}</span>` : ""}</div>`;
+    // v1.32.13: доступность за период и подсказка по батарейным.
+    const _up = cnt > 0 ? Math.round((cnt - timeouts) * 100 / cnt) : null;
+    const _batt = _ld.battery_powered ? (() => {
+      const ts = _ld.last_seen;
+      const age = ts ? (Date.now() / 1000 - ts) : null;
+      const warn = age !== null && age > 12 * 3600;
+      const txt = age === null ? "🔋 пробуждений не видели" : `🔋 выход ${fmtAgo(ts)}`;
+      return `<span style="${warn ? "color:var(--yellow)" : ""}" title="батарейное устройство: последнее пробуждение">${txt}${warn ? " — давно молчит" : ""}</span>`;
+    })() : "";
+    const _parts = [];
+    if (!(cnt === 0 && (avg === null || avg === undefined))) {
+      _parts.push(`${escapeHtml(periodLabel)} · ${cnt}p`);
+      // v1.32.25: доступность показываем всегда и коротко — «97%ut».
+      if (_up !== null) _parts.push(`${_up}%ut`);
+      if (timeouts > 0) {
+        _parts.push(`<span style="color:var(--red)" title="${timeouts} timeout">⚠${timeouts}</span>`);
+      }
+    }
+    if (_batt) _parts.push(_batt);
+    // v1.33.24: медиана и 95-й перцентиль за период. p95 показывает редкие
+    // всплески, которые среднее «размазывает» и потому скрывает.
+    if (d.median_ms_24h !== null && d.median_ms_24h !== undefined) {
+      const _p95v = (d.p95_ms_24h === null || d.p95_ms_24h === undefined) ? "—" : d.p95_ms_24h;
+      const _maxv = (d.max_ms_24h === null || d.max_ms_24h === undefined) ? "—" : d.max_ms_24h;
+      const _spike = (typeof d.p95_ms_24h === "number" && d.median_ms_24h > 0
+                      && d.p95_ms_24h > d.median_ms_24h * 3);
+      _parts.push(`<span style="${_spike ? "color:var(--yellow)" : ""}" `
+        + `title="Медиана и 95-й перцентиль за «${escapeHtml(periodLabel)}»: половина замеров быстрее медианы, 5% — медленнее p95. Максимум: ${_maxv} мс${_spike ? ". Видны редкие всплески (p95 > 3× медианы)" : ""}">`
+        + `мед ${d.median_ms_24h} · p95 ${_p95v}${_spike ? " ⚠" : ""}</span>`);
+    }
+    // v1.33.8: реальный отклик прибора на команду и текущее окно защиты от «эха»
+    // (bridge 1.12.19 подстраивает окно сам — здесь только показываем).
+    const _ca = (BRIDGE_STATE.cmd_ack && BRIDGE_STATE.cmd_ack.devices)
+      ? BRIDGE_STATE.cmd_ack.devices[d.name] : null;
+    if (_ca && _ca.n >= 5) {
+      _parts.push(`<span title="Отклик на команду (команда → отчёт): `
+        + `p50 ${_ca.p50} мс, p90 ${_ca.p90} мс, последний ${_ca.last} мс `
+        + `(проб: ${_ca.n}). Окно защиты от «эха»: ${_ca.guard} с `
+        + `(p90 × 1.5, в пределах ${BRIDGE_STATE.cmd_ack.min_sec}…${BRIDGE_STATE.cmd_ack.max_sec} с)">`
+        + `↩ ${_ca.p90} мс → окно ${_ca.guard} с</span>`);
+    }
+    const metaLine = _parts.length
+      ? `<div class="muted" style="font-size:11px; margin-top:2px;">${_parts.join(" · ")}</div>`
+      : "";
     const ipLine = d.ip ? `<div class="muted" style="font-size:11px; font-family:ui-monospace,monospace;">${escapeHtml(d.ip)}</div>` : "";
+    // v1.32.13: на мобиле колонка «последняя проверка» скрыта (CSS), поэтому
+    // время показываем подстрокой под именем устройства.
+    const _mobTime = (typeof isMobile === "function" && isMobile() && d.latency_ts)
+      ? `<div class="muted" style="font-size:11px;">проверка ${escapeHtml(fmtAgo(d.latency_ts))}</div>`
+      : "";
     return `<tr>
-      <td><div>${escapeHtml(d.friendly_name || d.name)}</div>${ipLine}</td>
+      <td><div>${escapeHtml(d.friendly_name || d.name)}</div>${ipLine}${_mobTime}</td>
       <td>${avgHtml}${metaLine}</td>
       <td class="muted">${d.latency_ts ? fmtAgo(d.latency_ts) : "—"}</td>
     </tr>`;
@@ -7268,13 +8971,20 @@ function renderLatencyTable(devs) {
 function renderFlappers(f) {
   const tb = document.getElementById("flappers-body");
   if (!tb) return;
-  if (f.length === 0) { tb.innerHTML = '<tr><td colspan="2" class="muted">Ничего не мерцало 🎉</td></tr>'; return; }
+  const _fcard = tb.closest(".card");
+  if (!f || f.length === 0) {
+    // v1.32.12: пусто — карточка схлопывается в тонкую плашку (CSS .is-empty).
+    tb.innerHTML = "";
+    if (_fcard) _fcard.classList.add("is-empty");
+    return;
+  }
+  if (_fcard) _fcard.classList.remove("is-empty");
   const s = [...f].sort((a, b) => {
     if (FLAPPER_SORT_KEY === "dev") return (a.dev || "").localeCompare(b.dev || "") * FLAPPER_SORT_DIR;
     return ((a.flaps || 0) - (b.flaps || 0)) * FLAPPER_SORT_DIR;
   }).slice(0, 50);  // v1.25.13: сортируем весь набор, показываем топ-50
   // v1.22.4: friendly_name + серое name
-  tb.innerHTML = s.map(x => `<tr><td>${deviceNameCell(x.dev)}</td><td><strong>${x.flaps}</strong></td></tr>`).join("");
+  tb.innerHTML = s.map(x => `<tr><td>${deviceNameCell(x.dev)}</td><td class="num"><strong>${x.flaps}</strong></td></tr>`).join("");
 }
 
 function renderTimeline(t, total) {
@@ -7289,7 +8999,14 @@ function renderTimeline(t, total) {
     else counter.textContent = "";
   }
   if (!list) return;
-  if (shown.length === 0) { list.innerHTML = '<div class="muted" style="padding:16px;">Нет событий</div>'; return; }
+  const _tcard = list.closest(".card");
+  if (shown.length === 0) {
+    // v1.32.12: пусто — карточка схлопывается в тонкую плашку.
+    list.innerHTML = "";
+    if (_tcard) _tcard.classList.add("is-empty");
+    return;
+  }
+  if (_tcard) _tcard.classList.remove("is-empty");
   // v1.22.4: friendly_name + серое name
   list.innerHTML = shown.map(x => `<div class="timeline-item">
     <span class="timeline-ts">${fmtDateTime(x.ts)}</span>
@@ -7299,86 +9016,183 @@ function renderTimeline(t, total) {
 }
 
 let _ACTIVITY_HITS = [];
+let _ACTIVITY_POINTS = null;   // v1.33.7: последние данные — перерисовка при resize
+let _ACTIVITY_RANGE = null;    // v1.33.12: диапазон оси (общий с графиком мерцаний)
+
+// v1.33.7: графики рисуем в РЕАЛЬНЫХ пикселях (SVG без viewBox): раньше
+// preserveAspectRatio="none" растягивал по горизонтали текст (подписи часов
+// «размазывались» и сливались) и превращал точки в эллипсы.
+function _chartW(svg) {
+  // getBoundingClientRect — надёжнее, чем clientWidth (у SVG он есть не везде).
+  let w = 0;
+  try { w = svg.getBoundingClientRect().width; } catch (e) { w = 0; }
+  if (!w && svg.parentElement) {
+    try { w = svg.parentElement.getBoundingClientRect().width; } catch (e) { w = 0; }
+  }
+  return Math.max(280, Math.round(w || svg.clientWidth || 800));
+}
+
+// v1.32.48 + v1.33.7: сглаживание Catmull-Rom → кубический Безье.
+function _smoothPath(arr) {
+  if (!arr || arr.length === 0) return "";
+  if (arr.length < 3) {
+    return arr.map(([x, y], i) =>
+      (i ? "L" : "M") + ` ${x.toFixed(1)} ${y.toFixed(1)}`).join(" ");
+  }
+  let d = `M ${arr[0][0].toFixed(1)} ${arr[0][1].toFixed(1)}`;
+  for (let i = 0; i < arr.length - 1; i++) {
+    const p0 = arr[i - 1] || arr[i];
+    const p1 = arr[i];
+    const p2 = arr[i + 1];
+    const p3 = arr[i + 2] || p2;
+    const c1x = p1[0] + (p2[0] - p0[0]) / 6;
+    const c1y = p1[1] + (p2[1] - p0[1]) / 6;
+    const c2x = p2[0] - (p3[0] - p1[0]) / 6;
+    const c2y = p2[1] - (p3[1] - p1[1]) / 6;
+    d += ` C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ` +
+         `${p2[0].toFixed(1)} ${p2[1].toFixed(1)}`;
+  }
+  return d;
+}
 
 function renderActivity(points) {
+  _ACTIVITY_POINTS = points || null;
   const svg = document.getElementById("chart-activity");
   if (!svg) return;
-  if (svg.dataset.ttBound === "1" && _chartTooltip.isOpen()) return;
+  // v1.33.29: пропускаем перерисовку, только если tooltip открыт на ЭТОМ
+  // графике (иначе SVG удалится и tooltip «отвяжется»). Tooltip на
+  // chart-flaps больше не блокирует перерисовку chart-activity.
+  if (svg.dataset.ttBound === "1" && _chartTooltip.isOpenFor(svg)) return;
   const summaryEl = document.getElementById("activity-summary");
   if (!points || points.length === 0) {
-    svg.innerHTML = '<text x="400" y="90" text-anchor="middle" fill="var(--muted)" font-size="13">Нет данных (нужно минимум 2 часа работы)</text>';
+    const _w0 = _chartW(svg);
+    svg.innerHTML = `<text x="${(_w0 / 2).toFixed(0)}" y="90" text-anchor="middle" fill="var(--muted)" font-size="13">Нет данных (нужно минимум 2 часа работы)</text>`;
     if (summaryEl) summaryEl.textContent = "";
     return;
   }
 
-  const W = 800, H = 180;
-  const PAD = {top:16, bottom:26, left:34, right:14};
+  const H = 180;
+  const W = _chartW(svg);
+  const PAD = {top:14, bottom:30, left:36, right:16};
   const iw = W - PAD.left - PAD.right;
   const ih = H - PAD.top - PAD.bottom;
   const maxTotal = Math.max(...points.map(p => p.total || 0), 1);
 
-  const now = Math.floor(Date.now() / 1000);
-  const tsEnd = now;
-  // v1.22.7: округляем tsStart до целого часа, иначе первый/последний
-  // столбик/точка обрезается при now не ровно в :00 (M4 follow-up).
-  const tsStart = Math.floor((now - 24 * 3600) / 3600) * 3600;
-  const tsSpan = tsEnd - tsStart;
+  // v1.33.12: ось строим ПО ДАННЫМ, а не «последние 24 ч от now». Раньше
+  // tsEnd = now, из-за чего диапазон (24 ч + минуты текущего часа) был длиннее
+  // данных: первая и последняя точки не доходили до краёв (пустые полосы ~час
+  // с каждой стороны), а хит-боксы уходили в пустоту — тултип последнего часа
+  // появлялся правее конца линии.
+  const tsStart = points[0].ts;
+  const tsEnd = points[points.length - 1].ts;
+  const tsSpan = Math.max(3600, tsEnd - tsStart);
+  // график мерцаний ниже рисуется по этой же шкале (иначе часы не совпадают)
+  _ACTIVITY_RANGE = { start: tsStart, end: tsEnd };
+  const X = (ts) => PAD.left + ((ts - tsStart) / tsSpan) * iw;
+  const Y = (v) => PAD.top + ih - (v / maxTotal) * ih;
 
-  let pathOnline = "";
-  let pathTotal = "";
+  const _pts = points.map(p => [X(p.ts), Y(p.online || 0)]);
+  const pathOnline = _smoothPath(_pts);
+  const pathTotal = points.map((p, i) =>
+    (i ? "L" : "M") + ` ${X(p.ts).toFixed(1)} ${Y(p.total || 0).toFixed(1)}`).join(" ");
+  const firstX = _pts.length ? _pts[0][0] : null;
+  const lastX = _pts.length ? _pts[_pts.length - 1][0] : null;
   let areaOnline = "";
-  let firstX = null, lastX = null;
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    const x = PAD.left + ((p.ts - tsStart) / tsSpan) * iw;
-    const yO = PAD.top + ih - (p.online / maxTotal) * ih;
-    const yT = PAD.top + ih - (p.total / maxTotal) * ih;
-    if (firstX === null) firstX = x;
-    lastX = x;
-    pathOnline += (i === 0 ? "M" : "L") + ` ${x.toFixed(1)} ${yO.toFixed(1)}`;
-    pathTotal += (i === 0 ? "M" : "L") + ` ${x.toFixed(1)} ${yT.toFixed(1)}`;
-  }
   if (firstX !== null && lastX !== null) {
     areaOnline = `M ${firstX.toFixed(1)} ${(PAD.top + ih).toFixed(1)} ` +
                  pathOnline.replace(/^M/, "L") +
                  ` L ${lastX.toFixed(1)} ${(PAD.top + ih).toFixed(1)} Z`;
   }
 
-  const yLines = [0, maxTotal / 2, maxTotal];
+  // v1.33.11: линию для 0 рисует рамка (axis) — раньше она дублировалась
+  // (сетка + ось). Значения дедуплицируем: при maxTotal=1 «середина»
+  // совпадала с максимумом и получались две одинаковые линии и две подписи.
+  const yLines = [...new Set([0, Math.round(maxTotal / 2), maxTotal])];
   let grid = "";
   for (const val of yLines) {
-    const y = PAD.top + ih - (val / maxTotal) * ih;
-    grid += `<line x1="${PAD.left}" y1="${y.toFixed(1)}" x2="${W - PAD.right}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="2,2"/>`;
-    grid += `<text x="${PAD.left - 4}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="var(--muted)" font-size="10">${Math.round(val)}</text>`;
+    const y = Y(val);
+    if (val > 0) {
+      grid += `<line x1="${PAD.left}" y1="${y.toFixed(1)}" x2="${(W - PAD.right).toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="2,3" opacity="0.7"/>`;
+    }
+    grid += `<text x="${(PAD.left - 5).toFixed(1)}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" fill="var(--muted)" font-size="10">${val}</text>`;
   }
+  // v1.33.7: рамка графика — низ и лево (раньше границы «разъезжались»).
+  const axis = `<line x1="${PAD.left}" y1="${PAD.top}" x2="${PAD.left}" y2="${(PAD.top + ih).toFixed(1)}" stroke="var(--border)"/>`
+    + `<line x1="${PAD.left}" y1="${(PAD.top + ih).toFixed(1)}" x2="${(W - PAD.right).toFixed(1)}" y2="${(PAD.top + ih).toFixed(1)}" stroke="var(--border)"/>`;
 
   let xLabels = "";
-  const stepSec = 2 * 3600;
+  // v1.32.46: шаг подписей X зависит от ширины — на узком экране реже,
+  // чтобы «05:00 07:00 09:00…» не слипалось в кашу.
+  const stepSec = (W < 420 ? 6 : (W < 700 ? 4 : 2)) * 3600;
   let t = Math.ceil(tsStart / 3600) * 3600;
+  let _firstLab = true;
   while (t <= tsEnd) {
-    const x = PAD.left + ((t - tsStart) / tsSpan) * iw;
+    const x = X(t);
     const d = new Date(t * 1000);
-    xLabels += `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle" fill="var(--muted)" font-size="10">${String(d.getHours()).padStart(2,'0')}:00</text>`;
+    // v1.33.11: крайние подписи прижимаем внутрь области — раньше последняя
+    // «16:00» вылезала за правую границу на ~7 px (а первая — за левую).
+    const _anchor = _firstLab ? "start" : ((t + stepSec) > tsEnd ? "end" : "middle");
+    xLabels += `<text x="${x.toFixed(1)}" y="${H - 9}" text-anchor="${_anchor}" fill="var(--muted)" font-size="10">${String(d.getHours()).padStart(2,'0')}:00</text>`;
+    _firstLab = false;
     t += stepSec;
   }
 
+  // v1.32.45 (1.33.0): подсветка «ночи» 23:00–07:00 — провалы видно сразу.
+  // v1.33.11: соседние ночные часы объединяем в ОДИН прямоугольник — раньше
+  // каждый час рисовался отдельно, на стыках копилась прозрачность и были
+  // видны вертикальные «швы» (выглядело как артефакт вёрстки).
+  let night = "";
+  {
+    const stepH = 3600;
+    let tN = Math.ceil(tsStart / stepH) * stepH;
+    let segStart = null;
+    const _flush = (endTs) => {
+      if (segStart === null) return;
+      const x1 = X(segStart), x2 = X(endTs);
+      night += `<rect x="${x1.toFixed(1)}" y="${PAD.top}" width="${Math.max(0, x2 - x1).toFixed(1)}" height="${ih}" fill="var(--fg)" opacity="0.05"/>`;
+      segStart = null;
+    };
+    while (tN < tsEnd) {
+      const hr = new Date(tN * 1000).getHours();
+      if (hr >= 23 || hr < 7) {
+        if (segStart === null) segStart = tN;
+      } else {
+        _flush(tN);
+      }
+      tN += stepH;
+    }
+    _flush(tsEnd);
+  }
+
   svg.innerHTML = `
+    <defs>
+      <linearGradient id="act-online-grad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" style="stop-color:var(--green);stop-opacity:0.30"/>
+        <stop offset="100%" style="stop-color:var(--green);stop-opacity:0.02"/>
+      </linearGradient>
+    </defs>
+    ${night}
     ${grid}
-    <path d="${areaOnline}" fill="var(--green)" opacity="0.15"/>
-    <path d="${pathTotal}" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.8"/>
+    ${axis}
+    <path d="${areaOnline}" fill="url(#act-online-grad)" stroke="none"/>
+    <path d="${pathTotal}" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4,3" opacity="0.75"/>
     <path d="${pathOnline}" fill="none" stroke="var(--green)" stroke-width="2"/>
     ${xLabels}
   `;
 
-  _ACTIVITY_HITS = [];
-  const hourW = iw / 24;
-  for (const p of points) {
-    const x = PAD.left + ((p.ts - tsStart) / tsSpan) * iw;
-    _ACTIVITY_HITS.push({
-      x: x, w: hourW, ts: p.ts,
-      online: p.online || 0, total: p.total || 0,
-    });
-  }
+  // v1.32.47: доступность — график описывается текстом (скринридеры, тесты).
+  const _last = points[points.length - 1] || {};
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label",
+    `Online по часам за 24 ч: сейчас ${_last.online || 0} из ${_last.total || 0} устройств онлайн`);
+
+  _ACTIVITY_HITS = points.map(p => ({
+    // v1.33.12: шаг = ширина области / (n−1) — ровно по шкале; раньше жёсткие
+    // iw/24 не совпадали с осью и последний бокс уходил за границу области.
+    x: X(p.ts), w: iw / Math.max(1, points.length - 1), ts: p.ts,
+    online: p.online || 0, total: p.total || 0,
+    yOnline: Y(p.online || 0), yTotal: Y(p.total || 0),
+  }));
   // v1.25.14: bind() сам снимает старых слушателей через
   // AbortController (см. bindDesktop/bindMobile). delete ttBound
   // больше не нужен — он приводил к накоплению слушателей.
@@ -7391,34 +9205,41 @@ function renderActivity(points) {
       return null;
     },
     onHover: (svgEl, hit) => {
-      svgEl.querySelectorAll("circle.activity-marker").forEach(c => c.remove());
+      svgEl.querySelectorAll("circle.activity-marker, line.activity-guide").forEach(c => c.remove());
       const h = hit.data;
-      const maxTotal = Math.max(..._ACTIVITY_HITS.map(x => x.total || 0), 1);
-      const yO = PAD.top + ih - (h.online / maxTotal) * ih;
-      const yT = PAD.top + ih - (h.total / maxTotal) * ih;
-      const cx = h.x + h.w / 2;
+      // v1.33.11: центр колонки, но НЕ вылезаем за границы области — раньше
+      // маркер последней колонки «высовывался» на 3 px за правую рамку.
+      const cx = Math.min(Math.max(h.x + h.w / 2, PAD.left + 5), W - PAD.right - 5);
       const ns = "http://www.w3.org/2000/svg";
-      const c1 = document.createElementNS(ns, "circle");
-      c1.setAttribute("class", "activity-marker");
-      c1.setAttribute("cx", cx);
-      c1.setAttribute("cy", yO);
-      c1.setAttribute("r", 5);
-      c1.setAttribute("fill", "var(--green)");
-      c1.setAttribute("stroke", "var(--fg)");
-      c1.setAttribute("stroke-width", "1.5");
-      svgEl.appendChild(c1);
-      const c2 = document.createElementNS(ns, "circle");
-      c2.setAttribute("class", "activity-marker");
-      c2.setAttribute("cx", cx);
-      c2.setAttribute("cy", yT);
-      c2.setAttribute("r", 4);
-      c2.setAttribute("fill", "var(--muted)");
-      c2.setAttribute("stroke", "var(--fg)");
-      c2.setAttribute("stroke-width", "1.2");
-      svgEl.appendChild(c2);
+      // v1.33.7: направляющая и точки — в реальных пикселях; у точек «вырез»
+      // под цвет карточки, поэтому они аккуратные, а не размазанные.
+      const gl = document.createElementNS(ns, "line");
+      gl.setAttribute("class", "activity-guide");
+      gl.setAttribute("x1", cx);
+      gl.setAttribute("y1", PAD.top);
+      gl.setAttribute("x2", cx);
+      gl.setAttribute("y2", (PAD.top + ih).toFixed(1));
+      gl.setAttribute("stroke", "var(--muted)");
+      gl.setAttribute("stroke-width", "1");
+      gl.setAttribute("stroke-dasharray", "3 3");
+      gl.setAttribute("opacity", "0.5");
+      svgEl.appendChild(gl);
+      const mk = (y, r, fill) => {
+        const c = document.createElementNS(ns, "circle");
+        c.setAttribute("class", "activity-marker");
+        c.setAttribute("cx", cx);
+        c.setAttribute("cy", y);
+        c.setAttribute("r", r);
+        c.setAttribute("fill", fill);
+        c.setAttribute("stroke", "var(--card)");
+        c.setAttribute("stroke-width", "2");
+        svgEl.appendChild(c);
+      };
+      mk(h.yOnline, 4, "var(--green)");
+      mk(h.yTotal, 3, "var(--muted)");
     },
     onLeave: (svgEl) => {
-      svgEl.querySelectorAll("circle.activity-marker").forEach(c => c.remove());
+      svgEl.querySelectorAll("circle.activity-marker, line.activity-guide").forEach(c => c.remove());
     },
     render: (hit) => {
       const h = hit.data;
@@ -7439,30 +9260,50 @@ function renderActivity(points) {
     const onlineDev = last.online || 0;
     summaryEl.textContent = `${onlineDev}/${totalDev} online сейчас`;
   }
+  // v1.33.7: первый рендер мог случиться до раскладки (clientWidth=0) —
+  // перерисуем уже с реальной шириной карточки.
+  requestAnimationFrame(() => {
+    const cw = Math.round(svg.getBoundingClientRect().width || 0);
+    if (cw > 0 && Math.abs(cw - W) > 2) renderActivity(_ACTIVITY_POINTS);
+  });
 }
 
 let _FLAPS_HITS = [];
+let _FLAPS_POINTS = null;   // v1.33.7: последние данные — перерисовка при resize
 
 function renderFlapsChart(points) {
+  _FLAPS_POINTS = points || null;
   const svg = document.getElementById("chart-flaps");
   if (!svg) return;
-  if (svg.dataset.ttBound === "1" && _chartTooltip.isOpen()) return;
+  // v1.33.29: см. renderActivity — guard по своему svg, а не по «любому
+  // открытому tooltip». Иначе tooltip на chart-activity не давал мерцаниям
+  // перерисоваться (ждали 30 с).
+  if (svg.dataset.ttBound === "1" && _chartTooltip.isOpenFor(svg)) return;
+  const _cblock = svg.closest(".chart-block");
   if (!points || points.length === 0) {
-    svg.innerHTML = '<text x="400" y="70" text-anchor="middle" fill="var(--muted)" font-size="13">Нет переходов за 24ч</text>';
+    // v1.32.12: пусто — подграфик не рисуем, блок схлопывается в плашку.
+    svg.innerHTML = "";
+    if (_cblock) _cblock.classList.add("is-empty");
     return;
   }
+  if (_cblock) _cblock.classList.remove("is-empty");
 
-  const W = 800, H = 140;
-  const PAD = {top:16, bottom:26, left:34, right:14};
+  const H = 140;
+  const W = _chartW(svg);
+  const PAD = {top:14, bottom:30, left:36, right:16};
   const iw = W - PAD.left - PAD.right;
   const ih = H - PAD.top - PAD.bottom;
 
-  const now = Math.floor(Date.now() / 1000);
-  const tsEnd = now;
-  // v1.22.7: округляем tsStart до целого часа, чтобы все hour_ts из БД
-  // (целые часы) попадали в [tsStart, tsEnd] (M4 follow-up).
-  const tsStart = Math.floor((now - 24 * 3600) / 3600) * 3600;
-  const tsSpan = tsEnd - tsStart;
+  // v1.33.12: та же шкала, что у графика активности — иначе подписи часов у
+  // двух графиков не совпадают (у активности ось теперь строится по данным).
+  const _rng = (_ACTIVITY_RANGE && _ACTIVITY_RANGE.end > _ACTIVITY_RANGE.start)
+    ? _ACTIVITY_RANGE
+    : { start: points[0].ts, end: points[points.length - 1].ts + 3600 };
+  const tsStart = _rng.start;
+  const tsEnd = _rng.end;
+  const tsSpan = Math.max(3600, tsEnd - tsStart);
+  const X = (ts) => PAD.left + ((ts - tsStart) / tsSpan) * iw;
+  const Y = (v) => PAD.top + ih - (v / maxFlaps) * ih;
 
   const byHour = {};
   const byHourDevices = {};
@@ -7490,7 +9331,7 @@ function renderFlapsChart(points) {
   // а не по фиксированным 24 часам. Раньше hourTs округлялся
   // от tsStart=now-24ч, и при now не ровно в :00 столбики
   // сдвигались/терялись.
-  const barWidth = iw / 24;
+  const barWidth = iw * (3600 / tsSpan);   // v1.33.12: час по текущей шкале
   let bars = "";
   let totalFlaps = 0;
   const sortedHours = Object.keys(byHour).map(k => parseInt(k, 10)).sort((a, b) => a - b);
@@ -7499,33 +9340,44 @@ function renderFlapsChart(points) {
     const v = byHour[hTs] || byHour[String(hTs)] || 0;
     totalFlaps += v;
     if (v === 0) continue;
-    const x = PAD.left + ((hTs - tsStart) / tsSpan) * iw;
-    const h = (v / maxFlaps) * ih;
+    const x = X(hTs);
+    const h = Math.max(2, (v / maxFlaps) * ih);   // v1.33.7: тонкий столбик виден
     const y = PAD.top + ih - h;
     const hitIdx = _FLAPS_HITS.length;
     _FLAPS_HITS.push({ x: x, y: y, w: barWidth, h: h,
                        ts: hTs, flaps: v, devices: byHourDevices[hTs] || [] });
-    bars += `<rect class="bar-hover hoverable" data-hit="${hitIdx}" x="${(x + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${(barWidth - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="var(--yellow)" opacity="0.75" rx="1"/>`;
+    bars += `<rect class="bar-hover hoverable" data-hit="${hitIdx}" x="${(x + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1, barWidth - 2).toFixed(1)}" height="${h.toFixed(1)}" fill="var(--yellow)" opacity="0.8" rx="2"/>`;
   }
 
   let grid = "";
   for (const val of [0, maxFlaps]) {
-    const y = PAD.top + ih - (val / maxFlaps) * ih;
-    grid += `<line x1="${PAD.left}" y1="${y.toFixed(1)}" x2="${W - PAD.right}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="2,2"/>`;
-    grid += `<text x="${PAD.left - 4}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="var(--muted)" font-size="10">${val}</text>`;
+    const y = Y(val);
+    // v1.33.11: линию для 0 рисует рамка — не дублируем.
+    if (val > 0) {
+      grid += `<line x1="${PAD.left}" y1="${y.toFixed(1)}" x2="${(W - PAD.right).toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="2,3" opacity="0.7"/>`;
+    }
+    grid += `<text x="${(PAD.left - 5).toFixed(1)}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" fill="var(--muted)" font-size="10">${val}</text>`;
   }
+  const axis = `<line x1="${PAD.left}" y1="${PAD.top}" x2="${PAD.left}" y2="${(PAD.top + ih).toFixed(1)}" stroke="var(--border)"/>`
+    + `<line x1="${PAD.left}" y1="${(PAD.top + ih).toFixed(1)}" x2="${(W - PAD.right).toFixed(1)}" y2="${(PAD.top + ih).toFixed(1)}" stroke="var(--border)"/>`;
 
   let xLabels = "";
+  const stepSec = (W < 420 ? 6 : (W < 700 ? 4 : 2)) * 3600;
   let t = Math.ceil(tsStart / 3600) * 3600;
+  let _firstLab = true;
   while (t <= tsEnd) {
-    const x = PAD.left + ((t - tsStart) / tsSpan) * iw;
+    const x = X(t);
     const d = new Date(t * 1000);
-    xLabels += `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle" fill="var(--muted)" font-size="10">${String(d.getHours()).padStart(2,'0')}:00</text>`;
-    t += 2 * 3600;
+    // v1.33.11: крайние подписи — внутрь области (как на графике online).
+    const _anchor = _firstLab ? "start" : ((t + stepSec) > tsEnd ? "end" : "middle");
+    xLabels += `<text x="${x.toFixed(1)}" y="${H - 9}" text-anchor="${_anchor}" fill="var(--muted)" font-size="10">${String(d.getHours()).padStart(2,'0')}:00</text>`;
+    _firstLab = false;
+    t += stepSec;
   }
 
   svg.innerHTML = `
     ${grid}
+    ${axis}
     ${bars}
     ${xLabels}
   `;
@@ -7583,7 +9435,24 @@ function renderFlapsChart(points) {
     const prev = summaryEl.textContent;
     summaryEl.textContent = prev ? `${prev} · переходов: ${totalFlaps} (${avg}/ч)` : `переходов: ${totalFlaps} (${avg}/ч)`;
   }
+  // v1.33.7: если ширина была неизвестна при первом рендере — перерисуем.
+  requestAnimationFrame(() => {
+    const cw = Math.round(svg.getBoundingClientRect().width || 0);
+    if (cw > 0 && Math.abs(cw - W) > 2) renderFlapsChart(_FLAPS_POINTS);
+  });
 }
+
+// v1.33.7: графики активности/мерцаний зависят от реальной ширины карточки —
+// при изменении окна перерисовываем (с дебаунсом), чтобы не «плыли».
+let _CHART_RESIZE_TIMER = null;
+window.addEventListener("resize", () => {
+  if (_CHART_RESIZE_TIMER) clearTimeout(_CHART_RESIZE_TIMER);
+  _CHART_RESIZE_TIMER = setTimeout(() => {
+    if (VIEW !== "analytics") return;
+    if (_ACTIVITY_POINTS) renderActivity(_ACTIVITY_POINTS);
+    if (_FLAPS_POINTS) renderFlapsChart(_FLAPS_POINTS);
+  }, 200);
+});
 
 // v1.21.2: health-widget
 let HEALTH_DETAIL_OPEN = false;
@@ -7607,36 +9476,48 @@ async function refreshHealthWidget(force) {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const h = await r.json();
 
+    // v1.31.11: плашка — версии + индикатор онлайна у каждой; метрики только в развороте
     document.getElementById("hw-webui").textContent = "WebUI v" + (h.webui?.version || "?");
     document.getElementById("hw-bridge").textContent = "Bridge v" + (h.bridge?.version || "?");
-    const st = document.getElementById("hw-status");
     const okBridge = h.bridge?.status === "online";
-    // v1.28.17: hw-status — только точка. Слово online убрано (title — тултип).
-    st.innerHTML = `<span class="dot ${okBridge ? "online" : "offline"}" title="${okBridge ? "online" : "offline"}"></span>`;
-    st.className = okBridge ? "hw-dim" : "hw-err";
-
-    const up = fmtUptimeShort(h.bridge?.uptime || 0);
-    const total = h.devices?.total || 0;
-    const online = h.devices?.online || 0;
-    const quietNow = h.quiet?.now || 0;
-    const cpu = h.webui?.cpu_pct;
-    const ram = h.webui?.rss_mb;
-    const cpuStr = (cpu !== null && cpu !== undefined) ? cpu + "%" : "\u2014";
-    const ramStr = (ram !== null && ram !== undefined) ? ram + "\u041c\u0411" : "\u2014";
-    // v1.23.0: на мобиле (hw-opt) скрываются uptime, quiet, cpu/ram.
-    // Остаётся: Bridge vX · ● online · N/M.
-    const quietHtml = quietNow > 0 ? `<span class="hw-quiet hw-opt">\ud83d\udd07 ${quietNow}</span>` : "";
-    document.getElementById("hw-rest").innerHTML =
-      `<span class="hw-sep hw-opt">\u00b7</span> <span class="hw-opt">${up}</span> ` +
-      `<span class="hw-sep">\u00b7</span> ${online}/${total} ` +
-      (quietHtml ? `<span class="hw-sep hw-opt">\u00b7</span> ${quietHtml} ` : "") +
-      `<span class="hw-sep hw-opt">\u00b7</span> <span class="hw-dim hw-opt">\u2699 ${cpuStr} / ${ramStr}</span>`;
+    const dotW = document.getElementById("hw-webui-dot");
+    const dotB = document.getElementById("hw-bridge-dot");
+    if (dotW) dotW.className = "dot online";           // сам WebUI ответил — значит живой
+    if (dotB) dotB.className = "dot " + (okBridge ? "online" : "offline");
+    if (dotB) dotB.title = okBridge ? "Bridge online" : "Bridge offline";
+    const rest = document.getElementById("hw-rest");
+    // v1.31.16: ПК — закрыто = версии+метрики, открыто = только версии (метрики
+    // и так в панели «СОСТОЯНИЕ СИСТЕМЫ»); мобиле — наоборот (метрики при раскрытии).
+    const _showMetrics = isMobile() ? HEALTH_DETAIL_OPEN : !HEALTH_DETAIL_OPEN;
+    const _endDot = document.getElementById("hw-line1-end");
+    if (_endDot) _endDot.style.display = _showMetrics ? "none" : "";
+    if (rest) {
+      if (!_showMetrics) {
+        if (rest.innerHTML !== "") rest.innerHTML = "";
+      } else {
+        const _f = (v, suf) => (v === null || v === undefined) ? "\u2014" : (v + suf);
+        const w = h.webui || {}, b = h.bridge || {};
+        // v1.31.15: как просили — обоими значками ⚙ и через «·»:
+        // · ⚙ cpu% · ramМБ · ⚙ cpu% · ramМБ ·
+        const _html =
+          `<span class="hw-sep">·</span> <span class="hw-meter" title="WebUI: CPU · RAM">\u2699 `
+          + `${_f(w.cpu_pct, "%")} <span class="hw-sep">\u00b7</span> ${_f(w.rss_mb, "\u041c\u0411")}</span>`
+          + ` <span class="hw-sep">\u00b7</span> <span class="hw-meter" title="Bridge: CPU · RAM">\u2699 `
+          + `${_f(b.cpu_pct, "%")} <span class="hw-sep">\u00b7</span> ${_f(b.rss_mb, "\u041c\u0411")}</span>`
+          + ` <span class="hw-sep">\u00b7</span>`;
+        // v1.32.24: обновляем только при реальном изменении — иначе плашка
+        // перерисовывалась на каждом опросе и на мобиле «мерцал» текст.
+        if (rest.innerHTML !== _html) rest.innerHTML = _html;
+      }
+    }
 
     // v1.23.8: рендерим деталку, если открыта ИЛИ принудительно.
     if (HEALTH_DETAIL_OPEN || force) renderHealthDetail(h);
   } catch (e) {
-    const st = document.getElementById("hw-status");
-    if (st) { st.innerHTML = '<span class="dot offline" title="\u043e\u0448\u0438\u0431\u043a\u0430"></span>'; st.className = "hw-err"; }
+    const dotW = document.getElementById("hw-webui-dot");
+    const dotB = document.getElementById("hw-bridge-dot");
+    if (dotW) dotW.className = "dot offline";
+    if (dotB) { dotB.className = "dot offline"; dotB.title = "\u043e\u0448\u0438\u0431\u043a\u0430"; }
     const rest = document.getElementById("hw-rest");
     if (rest) rest.innerHTML = "";
     // v1.23.8: если деталка открыта — покажем ошибку.
@@ -7735,11 +9616,13 @@ function toggleHealthDetail() {
                  + '<span class="muted">загрузка…</span></div>';
     if (widget) widget.classList.add("hw-expanded");
     // v1.23.8: фикс — при простое >30 сек деталка была пустой.
-    // Всегда дёргаем refreshHealthWidget(true).
+    // Всегда дёргаем refreshHealthWidget(true) — он же и метрики в плашке рисует.
     refreshHealthWidget(true);
   } else {
     el.style.display = "none";
     if (widget) widget.classList.remove("hw-expanded");
+    // v1.31.17: при сворачивании возвращаем полный вид плашки (на ПК — с метриками)
+    refreshHealthWidget(false);
   }
 }
 
@@ -7749,16 +9632,18 @@ async function loadAudit() {
   if (!c) return;
   c.innerHTML = '<div class="muted" style="padding:16px;"><span class="spin"></span> \u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430\u2026</div>';
   try {
-    const r = await fetch("/api/config/audit?limit=100&_=" + Date.now());
+    const r = await fetch("/api/config/audit?limit=30&_=" + Date.now());
     const data = await r.json();
     const items = data.items || [];
-    if (info) info.textContent = `\u0417\u0430\u043f\u0438\u0441\u0435\u0439: ${items.length}`;
+    if (info) info.textContent = `\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 ${items.length} (\u043c\u0430\u043a\u0441. 30, \u0441\u043a\u0440\u043e\u043b\u043b)`;
     if (items.length === 0) {
       c.innerHTML = '<div class="audit-empty">\u0418\u0441\u0442\u043e\u0440\u0438\u044f \u043f\u0443\u0441\u0442\u0430 \u2014 \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0439 \u043a\u043e\u043d\u0444\u0438\u0433\u0430 \u0447\u0435\u0440\u0435\u0437 WebUI \u0435\u0449\u0451 \u043d\u0435 \u0431\u044b\u043b\u043e.</div>';
       return;
     }
     // v1.28.7: обёртка .audit-wrap — горизонтальный скролл на мобиле.
-    let html = '<div style="padding:0 16px 16px 16px;"><div class="audit-wrap"><table class="audit-table"><thead><tr>'
+    // v1.31.11: не больше 30 строк и вертикальный скролл (было 100 без скролла)
+    let html = '<div style="padding:0 16px 16px 16px; max-height:60vh; overflow-y:auto;">'
+      + '<div class="audit-wrap"><table class="audit-table"><thead><tr>'
       + '<th style="width:160px;">\u0412\u0440\u0435\u043c\u044f</th>'
       + '<th style="width:90px;">\u041e\u043f\u0435\u0440\u0430\u0446\u0438\u044f</th>'
       + '<th style="width:180px;">\u0423\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u043e</th>'
@@ -7798,7 +9683,14 @@ async function loadAudit() {
       } else if (op === "import") {
         changes = `+${it.added || 0} / ~${it.updated || 0} / skip ${it.skipped || 0}`;
       } else if (op === "delete") {
-        changes = "\u0443\u0434\u0430\u043b\u0435\u043d\u043e \u0438\u0437 \u043a\u043e\u043d\u0444\u0438\u0433\u0430";
+        changes = "удалено из конфига";
+      } else if (op === "expire_clear") {
+        changes = "очищено устройств: " + ((it.changes && it.changes.cleared) || 0);
+      } else if (op === "expire_fill") {
+        changes = "проставлено: " + ((it.changes && it.changes.changed) || 0)
+          + " устройств · " + ((it.changes && it.changes.value) || "?") + " с";
+      } else if (op === "normalize") {
+        changes = "удалено полей: " + ((it.changes && it.changes.removed) || 0);
       }
       const okHtml = it.ok
         ? '<span style="color:var(--green);">\u2705</span>'
@@ -8093,9 +9985,6 @@ function _dpsRenderSection(d) {
   }
   rows2.sort((a, b) => parseInt(a.dp) - parseInt(b.dp));
 
-  // v1.28.32: rows3 оставлен пустым для совместимости.
-  const rows3 = [];
-
   // v1.27.5: разделяем на обычные и мусорные
   const rows2_normal = [];
   const rows2_junk = [];
@@ -8285,14 +10174,15 @@ function _dpsRenderSection(d) {
         _dpsSrcReason = "источник не определён";
       }
       const _SRC_ICON = {
-        cloud: '☁', tuya_local: '📚', similar: '🔗',
-        cache_only: '📦', config_only: '⚙️', removed: '🗑',
+        cloud: '☁', tuya_local: '📚', similar: '🔗', local_db: '📦',
+        cache_only: '❔', config_only: '⚙️', removed: '🗑',
         heuristic: '⚠️', unknown: '❓'
       };
       const _SRC_LABEL = {
         cloud: 'Tuya Cloud', tuya_local: 'tuya-local', similar: 'similar',
+        local_db: 'Локальная база',
         cache_only: 'нет сопоставления', config_only: 'из конфига',
-        removed: 'удалён', heuristic: 'эвристика', unknown: 'не определён'
+        removed: 'удалён', heuristic: 'Эвристика', unknown: 'не определён'
       };
       const _srcIcon = _SRC_ICON[_dpsSrc] || '❓';
       const _srcTipLines = [];
@@ -8373,7 +10263,6 @@ function _dpsRenderSection(d) {
         const code = info.code || info.name || "—";
         const comp = info.component || "—";
         const src = row.source || "";
-        const srcCls = src.replace("+", "-");
         const addBtn = `<button class="junk-add" onclick="dpsMoveIn('${escapeAttr(dp)}')" title="Добавить (не рекомендуется)">➕</button>`;
         const _type3 = info._cloud_type ? typeBadge(info._cloud_type) : '<span class="muted">—</span>';
         const _values3 = _valuesCellHtml(info.values);
@@ -9211,7 +11100,7 @@ function dpsFillToggleSource(src) {
 // v1.28.66: короткий ярлык источника для кнопок.
 function _srcLabelRu(s) {
   const m = { cloud: "☁ Cloud", tuya_local: "📚 tuya-local", similar: "🔗 similar",
-              heuristic: "⚠️ эвристика" };
+              local_db: "📦 Локальная база", heuristic: "⚠️ Эвристика" };
   return m[s] || s;
 }
 
@@ -9221,6 +11110,7 @@ function _srcReasonText(src, entry) {
   const r = (entry && entry._dps_source_reason) || "";
   if (s === "cloud")      return r ? "Tuya Cloud (" + r + ")" : "Tuya Cloud";
   if (s === "tuya_local") return "локальная база tuya-local";
+  if (s === "local_db")   return "локальная база tinytuya_devices.json";
   if (s === "similar")    return "такое же устройство (тот же product_id)";
   if (s === "cache")      return "нет сопоставления — только значение из кэша bridge";
   if (s === "heuristic")  return "компонент угадан по имени/значению";
@@ -9601,7 +11491,6 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
   if (isView) submitLabel = "Закрыть";
 
   // datalist для name (light)
-  const nameListId = (_devTypeSafe() === "light") ? "dps-fill-name-list" : "";
   let nameListHtml = "";
   if (_devTypeSafe() === "light") {
     nameListHtml = `<datalist id="dps-fill-name-list">${
@@ -9987,7 +11876,7 @@ function dpsFillValidateCodeLive() {
   _dpsFillCodeTimer = setTimeout(() => dpsFillValidateCode(false), 300);
 }
 
-function dpsFillValidateCode(isBlur) {
+function dpsFillValidateCode() {
   const inp = document.getElementById("dps-fill-code");
   if (!inp || inp.disabled) return;   // bridge-forced — не проверяем
   const errEl = document.getElementById("dps-fill-code-err");
