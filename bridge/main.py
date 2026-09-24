@@ -75,14 +75,24 @@ OFFLINE_TIMEOUT = 120
 BATTERY_PING_INTERVAL = 0.5            # как часто пингуем (сек)
 BATTERY_PING_TIMEOUT = 1.0             # таймаут ICMP
 
-BATTERY_UPDATEDPS_COUNT = 6            # сколько раз за окно UP
+BATTERY_UPDATEDPS_COUNT = 30           # v1.12.39: жёсткий предел попыток в окне
 BATTERY_UPDATEDPS_INTERVAL = 1         # пауза между вызовами (сек)
 BATTERY_UPDATEDPS_FAST = 0.3           # v1.12.33: пауза первых быстрых попыток (сек)
 BATTERY_UPDATEDPS_TIMEOUT = 1.5        # socket timeout для updatedps/status
+# v1.12.39: окно сбора ограничено ВРЕМЕНЕМ, а не числом попыток. У спящих
+# датчиков (temperature/humidity) TCP-стек готов не мгновенно, и 6 быстрых
+# попыток (~3.6с) не укладывались в реальное окно пробуждения → данные
+# терялись, и на графиках HA появлялись разрывы.
+BATTERY_WINDOW_SEC = 20                # сколько секунд пытаемся собрать данные
 
 # v1.9.6: BATTERY_OFFLINE_AFTER_DOWN удалена — после 1.9.4
 # offline для батарейных НЕ публикуется, HA полагается на expire_after.
 
+# v1.12.39: дефолт оставлен 1 ч — ставка на надёжный сбор данных
+# в окне пробуждения (см. BATTERY_WINDOW_SEC ниже). Если конкретному
+# спящему датчику 1 ч мало — ему задаётся expire_after в
+# devices_config.json (например, 54000 = 15 ч), и Discovery берёт
+# значение оттуда (per-device).
 BATTERY_EXPIRE_AFTER = 3600            # HA Discovery expire для батарейных (1 час)
 BATTERY_ALERT_AFTER_SEC = 86400         # 24 часа без UP → battery_alert=no_data
 
@@ -136,7 +146,7 @@ _ORPHAN_SUFFIXES = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.12.37"
+DISCOVERY_VERSION = "1.12.39"
 RETAINED_DUP_WINDOW = 10
 
 # v1.12.32: пул команд — per-device (DEVICE_EXECS, команды и повторы отдельно),
@@ -3047,6 +3057,16 @@ def _handle_cleanup_orphans(payload_str=""):
     log.info(f"[Orphan] Слушаем retained Discovery (ожидаем {len(expected)} топиков)...")
     ORPHAN_MODE["active"] = True
     ORPHAN_MODE["topics"] = []
+    # v1.12.38: retained брокер отдаёт только при (пере)подписке. Мост подписан
+    # на discovery ещё при старте (тогда ORPHAN_MODE был неактивен и топики не
+    # копились), поэтому за окно ожидания повторной доставки не происходило и
+    # seen всегда был 0 при живом брокере. Переподписываемся — брокер заново
+    # пришлёт all retained, и on_message их соберёт в ORPHAN_MODE["topics"].
+    try:
+        mqtt_client.subscribe(f"{DISCOVERY_PREFIX}/#", qos=1)
+        log.debug("[Orphan] re-subscribe на discovery (повтор retained)")
+    except Exception as e:
+        log.debug(f"[Orphan] re-subscribe: {e}")
     try:
         for _ in range(50):
             if STOP_EVENT.is_set():
@@ -6561,9 +6581,19 @@ def run_battery_listener(dev):
             # видимо (раньше это были только строки log.debug).
             got_dps = False
             last_err = None
+            _answered = False
+            _win_t0 = time.time()
 
             try:
-                for i in range(BATTERY_UPDATEDPS_COUNT):
+                # v1.12.39: окно ограничено ВРЕМЕНЕМ, а не числом попыток.
+                # Пока устройство отвечает на ping — пробуем ещё; выходим
+                # сразу, как только получили данные, или когда окно истекло.
+                # BATTERY_UPDATEDPS_COUNT оставлен как жёсткий предел.
+                _win_deadline = _win_t0 + BATTERY_WINDOW_SEC
+                i = -1
+                while (time.time() < _win_deadline
+                       and i + 1 < BATTERY_UPDATEDPS_COUNT):
+                    i += 1
                     if STOP_EVENT.is_set():
                         break
 
@@ -6593,40 +6623,60 @@ def run_battery_listener(dev):
                         if STOP_EVENT.wait(BATTERY_UPDATEDPS_INTERVAL):
                             break
                         continue
-                    _via_status = False
                     try:
                         d = get_device_conn(dev)
                         d.set_socketTimeout(BATTERY_UPDATEDPS_TIMEOUT)
                         dps = None
 
-                        # v1.12.34: на ПЕРВОЙ попытке сначала status() (0x0a) —
-                        # на многих батарейных PIR updatedps (0x12) отдаёт None,
-                        # а статус даёт DP сразу; это экономит ~3 с таймаута.
-                        if i == 0:
-                            _t0 = time.time()
+                        # v1.12.39: сначала updatedps (0x12) — просим устройство
+                        # отдать DP. Если ответа нет или он пустой, в ТОЙ ЖЕ
+                        # попытке пробуем status() (0x0a) как fallback: на части
+                        # батарейных PIR updatedps отдаёт None, а status даёт DP.
+                        _t0 = time.time()
+                        try:
+                            result = d.updatedps(dp_list)
+                        except Exception as e:
+                            log.debug(f"[Battery] {name}: updatedps #{i + 1} err: {e}")
+                            result = None
+                        log.debug(
+                            f"[Battery] {name}: updatedps raw #{i + 1}: "
+                            f"{json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else result} "
+                            f"({time.time() - _t0:.2f}s)"
+                        )
+                        if isinstance(result, dict):
+                            if "dps" in result:
+                                dps = result["dps"]
+                            elif result.get("Err"):
+                                last_err = str(result.get("Err"))
+
+                        if not dps:
+                            _t1 = time.time()
                             try:
                                 extra = _status_socket(d, timeout=BATTERY_UPDATEDPS_TIMEOUT)
                             except Exception as e:
-                                log.debug(f"[Battery] {name}: status() first err: {e}")
+                                log.debug(f"[Battery] {name}: status() fallback err: {e}")
                                 extra = None
                             log.debug(
-                                f"[Battery] {name}: status() first -> "
+                                f"[Battery] {name}: status() fallback -> "
                                 f"{json.dumps(extra, ensure_ascii=False) if isinstance(extra, dict) else extra} "
-                                f"({time.time() - _t0:.2f}s)"
+                                f"({time.time() - _t1:.2f}s)"
                             )
                             if (isinstance(extra, dict) and "dps" in extra
                                     and "Error" not in extra):
                                 dps = extra.get("dps")
-                                _via_status = True
 
-                        if dps is None:
-                            result = d.updatedps(dp_list)
-                            log.debug(f"[Battery] {name}: updatedps raw #{i + 1}: {result}")
-                            if isinstance(result, dict):
-                                if "dps" in result:
-                                    dps = result["dps"]
-                                elif result.get("Err"):
-                                    last_err = str(result.get("Err"))
+                        if isinstance(dps, dict):
+                            # Устройство ответило (даже если пустым dps) —
+                            # это не «тишина», а «нет изменений».
+                            _answered = True
+
+                        # v1.12.39: пустой ответ — это НЕ данные (у спящих
+                        # датчиков так выглядит «ещё не готов»). Раньше он
+                        # считался успехом: окно закрывалось, реальные значения
+                        # не публиковались → дырка на графике. Теперь пробуем
+                        # ещё, пока не истечёт окно.
+                        if isinstance(dps, dict) and not dps:
+                            dps = None
 
                         if dps is not None:
                             got_dps = True
@@ -6634,7 +6684,7 @@ def run_battery_listener(dev):
                                 _LAST_BATT_STATE.pop(name, None)
                             if dps != last_dps:
                                 log.info(
-                                    f"[Battery] {name}: updatedps → "
+                                    f"[Battery] {name}: данные → "
                                     f"{json.dumps(dps, ensure_ascii=False)}"
                                 )
                                 last_dps = dps
@@ -6660,18 +6710,37 @@ def run_battery_listener(dev):
                     finally:
                         _lock.release()
 
-                    if _via_status:
-                        # status() вернул полный снимок DP — окно можно закрывать
+                    if got_dps:
+                        # v1.12.39: как только данные получены — окно можно
+                        # закрывать. Раньше после status() окно закрывалось, а
+                        # после updatedps — нет, и лишние попытки могли
+                        # перезаписать состояние частичным ответом.
                         break
                     # v1.12.33: первые попытки — быстрее (успеть в короткое окно PIR).
                     _wait = BATTERY_UPDATEDPS_FAST if i < 2 else BATTERY_UPDATEDPS_INTERVAL
                     if STOP_EVENT.wait(_wait):
                         break
 
-                # v1.10.21: окно закрылось без данных — одна видимая запись
-                # с антиспамом (раньше тут были только строки log.debug).
-                if not got_dps:
-                    if last_err:
+                # v1.12.39: итог окна. Если данные есть — видно, с какой попытки
+                # и за сколько собрали; если нет — почему (ошибка Tuya / тишина).
+                if got_dps:
+                    # v1.12.39: видно, с какой попытки удалось собрать данные
+                    # и сколько это заняло — помогает ловить «узкие» окна.
+                    if i > 0:
+                        log.info(f"[Battery] {name}: данные получены с "
+                                 f"{i + 1}-й попытки "
+                                 f"({time.time() - _win_t0:.1f}с)")
+                    else:
+                        log.debug(f"[Battery] {name}: данные получены "
+                                  f"с 1-й попытки")
+                else:
+                    if _answered and not last_err:
+                        # Устройство живо и ответило, но изменений DP нет —
+                        # это норма (например, PIR без движения). Не шумим
+                        # «нет данных».
+                        log.debug(f"[Battery] {name}: ответ без изменений DP "
+                                  f"({time.time() - _win_t0:.1f}с)")
+                    elif last_err:
                         _log_repeat(
                             name,
                             code_label=f"Tuya error {last_err}",
@@ -6692,7 +6761,8 @@ def run_battery_listener(dev):
                             prefix="[Battery]",
                         )
                     log.debug(f"[Battery] {name}: за окно данных нет "
-                              f"(updatedps + status)")
+                              f"(updatedps + status, "
+                              f"{time.time() - _win_t0:.1f}с)")
 
                 # Закрываем соединение — устройство засыпает
                 drop_device_conn(name)
