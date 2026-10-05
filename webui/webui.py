@@ -52,17 +52,17 @@ def _env_int(name, default):
         return default
 
 
-MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.1.10"
+MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.0.3"
 MQTT_PORT = _env_int("MQTT_PORT", 1883)
 MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 WEBUI_PORT = _env_int("WEBUI_PORT", 5386)
 WEBUI_HOST = os.getenv("WEBUI_HOST") or "0.0.0.0"
-WEBUI_VERSION = "1.33.29"
+WEBUI_VERSION = "1.34.4"
 # v1.32.33: публичный номер релиза (совпадает с тегом релиза на GitHub).
 # Подвал показывает «Release X», а WebUI сверяет по нему наличие новой версии.
-RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.2"
+RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.3"
 
 # v1.32.34: проверка «есть ли релиз новее» на GitHub (публичный репозиторий, без токена;
 # GITHUB_TOKEN поддержан на случай, если репозиторий останется приватным).
@@ -845,7 +845,7 @@ def _check_tz_for_quiet():
         # явно UTC/GMT и НЕ задан TZ через env.
         env_tz = os.environ.get("TZ", "")
         if off_h == 0 and off_m == 0 and not env_tz and tzname.upper() in ("UTC", "GMT"):
-            log.warning("[Quiet] TZ=UTC — часовой пояс контейнера не задан (TZ в .env)")
+            log.warning("[Quiet] TZ=UTC — проверь docker-compose (TZ=Asia/Novosibirsk)")
     except Exception as e:
         log.warning(f"[Quiet] TZ check: {e}")
 
@@ -2278,6 +2278,8 @@ def _on_connect(client, userdata, flags, rc, properties=None):
             # v1.28.6: battery_alert / battery_last_up (bridge 1.9.4+)
             f"{TOPIC_PREFIX}/+/battery_alert", f"{TOPIC_PREFIX}/+/battery_last_up",
             f"{TOPIC_PREFIX}/+/last_seen", f"{TOPIC_PREFIX}/+/cache_snapshot",
+            # v1.34.1 (B): UDP-статус «прибор вещает» (bridge 1.14.0+)
+            f"{TOPIC_PREFIX}/+/udp_alive",
         ]:
             client.subscribe(t)
         log.info("[MQTT] Подключён, подписки OK")
@@ -2379,7 +2381,8 @@ def _on_message(client, userdata, msg):
         with STATE_LOCK:
             if dev not in STATE["devices"]:
                 STATE["devices"][dev] = {"status": "unknown", "last_seen": None,
-                                          "cache": {}, "latency_ms": None, "latency_ts": None}
+                                          "cache": {}, "latency_ms": None, "latency_ts": None,
+                                          "udp_alive": False}
             if key == "status":
                 old = STATE["devices"][dev].get("status")
                 STATE["devices"][dev]["status"] = payload
@@ -2465,6 +2468,9 @@ def _on_message(client, userdata, msg):
                         # не показывал). Функция оставлена в коде на будущее.
                         # db_insert_snapshot(dev, cd)
                 except: pass
+            elif key == "udp_alive":
+                # v1.34.1 (B): прибор вещает по UDP (жив), даже если TCP молчит.
+                STATE["devices"][dev]["udp_alive"] = (payload == "true")
 
 
 _mqtt.on_connect = _on_connect
@@ -4188,6 +4194,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     "min_temp": m.get("min_temp"), "max_temp": m.get("max_temp"), "temp_step": m.get("temp_step"),
                     "status": info.get("status", "unknown"),
                     "last_seen": info.get("last_seen"),
+                    # v1.34.1 (B): прибор вещает по UDP (жив).
+                    "udp_alive": bool(info.get("udp_alive", False)),
                     # v1.28.6: battery_alert / battery_last_up
                     # (для батарейных; для остальных None).
                     "battery_alert": info.get("battery_alert"),

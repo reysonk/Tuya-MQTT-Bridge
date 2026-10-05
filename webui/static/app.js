@@ -1775,8 +1775,8 @@ function _dpsSourceBadge(src, info) {
 function _powerBadge(d) {
   if (!d) return "";
   return (d.battery_powered === true)
-    ? ' <span class="power-glyph" title="Батарейное устройство">🔋</span>'
-    : ' <span class="power-glyph" title="Проводное устройство">🔌</span>';
+    ? '&nbsp;<span class="power-glyph" title="Батарейное устройство">🔋</span>'
+    : '&nbsp;<span class="power-glyph" title="Проводное устройство">🔌</span>';
 }
 // v1.25.0 (fix3): цветной бейдж для component DP.
 function componentBadge(c) {
@@ -2076,23 +2076,24 @@ function renderDeviceTable(devs) {
     let quietBadge = '';
     if (d.battery_powered !== true) {
       const quietNow = d.quiet || (d.quiet_until && d.quiet_until > Math.floor(Date.now()/1000));
-      if (quietNow) quietBadge = ' <span class="badge quiet" title="Режим тишины">🔇</span>';
+      if (quietNow) quietBadge = '&nbsp;<span class="badge quiet" title="Режим тишины" style="flex:0 0 auto;">🔇</span>';
     }
     // v1.28.74: время — в одну строку после online/offline, без «назад».
     const agoShort = d.last_seen ? fmtAgoShort(d.last_seen) : '—';
+    const udpBadge = d.udp_alive ? '&nbsp;<span class="badge" title="Прибор вещает по UDP (жив)" style="white-space:nowrap;">📡</span>' : '';
     let statusCell;
     if (isMobile()) {
       statusCell = `<span class="dot ${on ? 'online' : 'offline'}"></span>` +
-                   `<span class="muted" style="font-size:12px;">${escapeHtml(agoShort)}</span>`;
+                   `<span class="muted" style="font-size:12px;">${escapeHtml(agoShort)}</span>` + udpBadge;
     } else {
       statusCell = `<span class="dot ${on ? 'online' : 'offline'}"></span>
           <span style="color:${on ? 'var(--green)' : 'var(--red)'}">${on ? 'online' : 'offline'}</span>
-          <span class="muted" style="font-size:11px; margin-left:6px;">${escapeHtml(agoShort)}</span>`;
+          <span class="muted" style="font-size:11px; margin-left:6px;">${escapeHtml(agoShort)}</span>${udpBadge}`;
     }
     return `<tr class="device-row" onclick="showDevice(${realIdx})">
-      <td><div style="font-weight:500;">${escapeHtml(d.friendly_name || d.name)}${quietBadge}</div>${ip}</td>
-      <td>${typeBadge(d.type)}${_powerBadge(d)}</td>
-      <td>${statusCell}</td>
+      <td><div style="font-weight:500;display:flex;align-items:center;gap:4px;min-width:0;"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(d.friendly_name || d.name)}</span>${quietBadge}</div>${ip}</td>
+      <td style="white-space:nowrap;">${typeBadge(d.type)}${_powerBadge(d)}</td>
+      <td style="white-space:nowrap;">${statusCell}</td>
       <td>${lat}</td>
     </tr>`;
   }).join("");
@@ -2131,8 +2132,8 @@ function _renderDisabledSection(disabled) {
     const realIdx = LAST_DEVICES.indexOf(d);
     const ip = d.ip ? `<div class="device-ip">${escapeHtml(d.ip)}</div>` : "";
     return `<tr class="device-row device-row-disabled" onclick="showDevice(${realIdx})">
-      <td><div style="font-weight:500;">${escapeHtml(d.friendly_name || d.name)} <span class="badge enabled-off" style="font-size:10px;">⛔</span></div>${ip}</td>
-      <td>${typeBadge(d.type)}${_powerBadge(d)}</td>
+      <td><div style="font-weight:500;display:flex;align-items:center;gap:4px;min-width:0;"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(d.friendly_name || d.name)}</span><span class="badge enabled-off" style="font-size:10px;flex:0 0 auto;">⛔</span></div>${ip}</td>
+      <td style="white-space:nowrap;">${typeBadge(d.type)}${_powerBadge(d)}</td>
     </tr>`;
   }).join("");
   // v1.27.9: обновить индикаторы сортировки disabled.
@@ -5924,7 +5925,7 @@ async function importSelected() {
 
   // v1.27.6: пресет IP — по локальной подсети из конфига (fallback MQTT).
   const prefix = _guessSubnetPrefix();
-  const placeholder = prefix ? `${prefix}.100` : "192.168.1.100";
+  const placeholder = prefix ? `${prefix}.100` : "192.168.0.100";
   const preValue = prefix ? `${prefix}.` : "";
   const netHint = prefix ? `Сеть: ${prefix}.x` : "";
 
@@ -7803,7 +7804,7 @@ const HELP_TEXT = {
         <li><code>TOPIC_PREFIX</code> — префикс всех MQTT-топиков (по умолчанию <code>tuya</code>);</li>
         <li><code>DISCOVERY_PREFIX=homeassistant</code> — префикс топиков Discovery для Home Assistant;</li>
         <li><code>POLL_INTERVAL=15</code> — период опроса проводных устройств, сек;</li>
-        <li><code>OFFLINE_TIMEOUT=120</code> — сколько секунд без данных считать устройство offline;</li>
+        <li><code>OFFLINE_TIMEOUT=45</code> — сколько секунд без данных считать устройство offline;</li>
         <li><code>AVAILABILITY_EXPIRE=120</code> — <code>expire_after</code> в Discovery (Home Assistant сам пометит недоступным);</li>
         <li><code>SOCKET_TIMEOUT_CMD=0.3</code> — таймаут сокета при отправке команды, сек;</li>
         <li><code>SOCKET_TIMEOUT_WORKER=0.1</code> — таймаут <code>receive()</code> в воркере, сек;</li>
@@ -7813,6 +7814,12 @@ const HELP_TEXT = {
         <li><code>SWITCH_DEBOUNCE_MS=0</code> — дебаунс (склейка) быстрых команд switch/light:
             первая команда уходит сразу, хвост серии — одной финальной; <code>0</code> = выключено;</li>
         <li><code>SWITCH_DEBOUNCE_MAX_MS=1200</code> — потолок ожидания финальной команды при спаме;</li>
+        <li><code>UDP_ENABLED=0</code> — пассивный UDP-детектор вещаний Tuya (порт 6667):
+            прибор считается живым, пока вещает; <code>0</code> = выключено (v1.14.0);</li>
+        <li><code>UDP_PORT=6667</code> — порт приёма UDP-вещаний Tuya;</li>
+        <li><code>UDP_ALIVE_WINDOW=30</code> — окно «жив», сек (сколько секунд после вещания считать устройство живым);</li>
+        <li><code>UDP_NO_TCP_MAX_CYCLES=3</code> — потолок продления offline при живом UDP (против «вечного online»);</li>
+        <li><code>UDP_RECONNECT_COOLDOWN=120</code> — минимальный интервал форс-реконнекта TCP, сек;</li>
         <li><code>MIN_CMD_INTERVAL_SWITCH=0</code> — то же для switch/select (без ограничения);</li>
         <li><code>DEBOUNCE_BY_TYPE</code> — окна дебаунса команд по типу устройства (гасят дребезг);</li>
         <li><code>REPEAT_RESET_SECONDS=120</code> — через сколько секунд сбрасывать счётчики повторов 914/905;</li>

@@ -25,6 +25,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import tinytuya
 import paho.mqtt.client as mqtt
 
+# v1.14.0 (п.10): свой модуль рядом (Dockerfile копирует его в /app).
+# Пассивный слушатель UDP-вещаний Tuya — только приём, TCP не затрагивает.
+try:
+    import udp_detect
+except ImportError:
+    # Тесты/нестандартный путь загрузки: main.py читается по абсолютному пути,
+    # поэтому модуль ищем рядом с ним.
+    import importlib.util as _ilu
+    import os as _os
+    _udp_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                              "udp_detect.py")
+    _udp_spec = _ilu.spec_from_file_location("udp_detect", _udp_path)
+    udp_detect = _ilu.module_from_spec(_udp_spec)
+    _udp_spec.loader.exec_module(udp_detect)
+
 # ==================== SETTINGS ====================
 # v1.10.18: значения можно переопределить переменными окружения
 # (docker-compose `environment:`); иначе берутся значения по умолчанию.
@@ -35,12 +50,19 @@ def _env_int(name, default):
         return default
 
 
-MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.1.10"
+MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.0.3"
 MQTT_PORT = _env_int("MQTT_PORT", 1883)
 MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 DISCOVERY_PREFIX = os.getenv("DISCOVERY_PREFIX") or "homeassistant"
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
+# v1.14.0 (B): кэш последнего UDP-статуса устройства (для публикации в MQTT).
+_udp_alive_cache = {}
+
+
+def _config_topic(component, unique_id):
+    """Единственный источник строки config-топика discovery (V1)."""
+    return f"{DISCOVERY_PREFIX}/{component}/{unique_id}/config"
 
 # POLL_INTERVAL — как часто воркер делает status() под lock'ом.
 POLL_INTERVAL = 15
@@ -66,7 +88,18 @@ RECONNECT_SETTLE_SEC = 0.5
 
 DISCOVERY_CLEANUP_WAIT = 3
 AVAILABILITY_EXPIRE = 120
-OFFLINE_TIMEOUT = 120
+# v1.13.13: 120 → 45 с. Опрос идёт каждые POLL_INTERVAL=15 с, значит три пропущенных
+# опроса подряд — это уже реальный отвал, а не «медленный прибор»: раньше HA показывал
+# offline только через 2 минуты после фактической потери связи.
+OFFLINE_TIMEOUT = 45
+
+# v1.14.0 (п.10): пассивный UDP-детектор вещаний Tuya (порт 6667).
+# 0 = выключен → мгновенный откат одним env, без пересборки образа.
+UDP_ENABLED = _env_int("UDP_ENABLED", 0)
+UDP_PORT = _env_int("UDP_PORT", 6667)
+UDP_ALIVE_WINDOW = _env_int("UDP_ALIVE_WINDOW", 30)
+UDP_NO_TCP_MAX_CYCLES = _env_int("UDP_NO_TCP_MAX_CYCLES", 3)
+UDP_RECONNECT_COOLDOWN = _env_int("UDP_RECONNECT_COOLDOWN", 120)
 
 # v1.9.0: батарейные устройства (device22, low-power)
 # Они спят, просыпаются по событию (дверь) или heartbeat.
@@ -75,7 +108,7 @@ OFFLINE_TIMEOUT = 120
 BATTERY_PING_INTERVAL = 0.5            # как часто пингуем (сек)
 BATTERY_PING_TIMEOUT = 1.0             # таймаут ICMP
 
-BATTERY_UPDATEDPS_COUNT = 30           # v1.12.39: жёсткий предел попыток в окне
+BATTERY_UPDATEDPS_COUNT = 240          # v1.13.5: жёсткий предел попыток (страховка)
 BATTERY_UPDATEDPS_INTERVAL = 1         # пауза между вызовами (сек)
 BATTERY_UPDATEDPS_FAST = 0.3           # v1.12.33: пауза первых быстрых попыток (сек)
 BATTERY_UPDATEDPS_TIMEOUT = 1.5        # socket timeout для updatedps/status
@@ -83,7 +116,9 @@ BATTERY_UPDATEDPS_TIMEOUT = 1.5        # socket timeout для updatedps/status
 # датчиков (temperature/humidity) TCP-стек готов не мгновенно, и 6 быстрых
 # попыток (~3.6с) не укладывались в реальное окно пробуждения → данные
 # терялись, и на графиках HA появлялись разрывы.
-BATTERY_WINDOW_SEC = 20                # сколько секунд пытаемся собрать данные
+BATTERY_WINDOW_SEC = 180               # v1.13.5: предел окна (фактически — пока отвечает пинг)
+BATTERY_POLL_UP_INTERVAL_DOOR = 0.0    # v1.13.5: дверные — опрос подряд (~1 замер/с; раунд-трип ~1.0 с)
+BATTERY_POLL_UP_INTERVAL_OTHER = 1.5   # прочие батарейные — пауза между опросами, пока не уснут
 
 # v1.9.6: BATTERY_OFFLINE_AFTER_DOWN удалена — после 1.9.4
 # offline для батарейных НЕ публикуется, HA полагается на expire_after.
@@ -95,6 +130,11 @@ BATTERY_WINDOW_SEC = 20                # сколько секунд пытае�
 # значение оттуда (per-device).
 BATTERY_EXPIRE_AFTER = 3600            # HA Discovery expire для батарейных (1 час)
 BATTERY_ALERT_AFTER_SEC = 86400         # 24 часа без UP → battery_alert=no_data
+
+# v1.13.5: диагностика окна пробуждения (opt-in). DEBUG_BATTERY_TRACE=1 — в INFO
+# пишем каждый шаг окна: сырые ответы updatedps/status(), тайминги и наличие
+# непрочитанных данных на сокете (проверка гипотезы «устройство отдаёт отчёт само»).
+DEBUG_BATTERY_TRACE = (os.getenv("DEBUG_BATTERY_TRACE") or "").strip() not in ("", "0", "false", "False")
 
 # ======================================================================
 # ⚠️⚠️⚠️ ОПАСНО: при CLEANUP_DISCOVERY = 1 bridge при старте
@@ -122,10 +162,11 @@ CLEANUP_DISCOVERY = 0
 # Каждое удаление логируется. См. sync_discovery_registry().
 CLEANUP_ORPHAN_RETAINED = 1
 
-# Известные суффиксы unique_id, которые создаёт bridge.
-# Используются _filter_orphan_by_suffix() для распознавания «своих»
-# retained. Список должен покрывать все ветки _discovery_topics_for_device.
-_ORPHAN_SUFFIXES = (
+# ВНИМАНИЕ: эвристика для ЧУЖИХ/старых retained (прошлые версии моста, presence-oracle,
+# эксперименты). Для НАШИХ сущностей список берётся из реестра (см. _discovery_topics_for_device).
+# Удалять нельзя: в живом брокере такие retained реально есть.
+# Нужна _filter_orphan_by_suffix() как fallback.
+_LEGACY_ORPHAN_FALLBACK = (
     # battery / датчики
     "_battery_alert", "_battery_last_seen", "_battery_percentage", "_battery",
     "_moisture", "_door", "_motion", "_fault",
@@ -146,7 +187,7 @@ _ORPHAN_SUFFIXES = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.12.39"
+DISCOVERY_VERSION = "1.14.1"
 RETAINED_DUP_WINDOW = 10
 
 # v1.12.32: пул команд — per-device (DEVICE_EXECS, команды и повторы отдельно),
@@ -155,6 +196,37 @@ RETAINED_DUP_WINDOW = 10
 LOG_LEVEL = os.getenv("LOG_LEVEL") or "INFO"
 
 MAX_CONSECUTIVE_904 = 3
+
+# v1.13.11: карта кодов ответа Tuya (сверено с tinytuya `error_helper` и localtuya
+# `pytuya.error_json`). Нужна для понятных сообщений и правильной реакции:
+# 908 — команду надо ПОВТОРИТЬ, 904 — «неожиданный payload» (для протокола 3.4 это
+# частая норма, связь не рвём), 905/914 — сетевые/сессионные.
+TUYA_ERR = {
+    900: "unknown",
+    901: "network error (устройство недоступно)",
+    902: "timeout waiting for device",
+    903: "invalid key (неверный local_key)",
+    904: "unexpected payload (норма для 3.4 — связь не рвём)",
+    905: "network error (offline/флап)",
+    906: "device state error",
+    907: "request not supported",
+    908: "Device22 detected — команду повторить",
+    909: "device not found",
+    910: "device offline",
+    911: "connection refused",
+    912: "data invalid",
+    913: "version mismatch",
+    914: "session key error (второе TCP) — сбросить соединение",
+}
+
+
+def tuya_err_text(code):
+    """v1.13.11: человекочитаемый текст кода ответа Tuya (или сам код)."""
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return str(code)
+    return TUYA_ERR.get(c, f"неизвестный код {c}")
 
 # Rate limit: только для стримовых DP.
 MIN_CMD_INTERVAL_STREAM = 0.15
@@ -503,24 +575,24 @@ def _discovery_topics_for_device(dev):
 
     # battery_alert + battery_last_seen
     if dev.get("battery_powered"):
-        topics.add(f"{DISCOVERY_PREFIX}/sensor/{dev_name}_battery_alert/config")
-        topics.add(f"{DISCOVERY_PREFIX}/sensor/{dev_name}_battery_last_seen/config")
+        topics.add(_config_topic("sensor", f"{dev_name}_battery_alert"))
+        topics.add(_config_topic("sensor", f"{dev_name}_battery_last_seen"))
 
     # phase_a (если dp 6 = phase_a)
     if dev.get("dps_map", {}).get("6", {}).get("component") == "phase_a":
         for suffix in ("voltage", "current", "power"):
-            topics.add(f"{DISCOVERY_PREFIX}/sensor/{dev_name}_output_{suffix}/config")
+            topics.add(_config_topic("sensor", f"{dev_name}_output_{suffix}"))
 
     # light / climate / cover / fan — свои unique_id
     if dtype == "light":
-        topics.add(f"{DISCOVERY_PREFIX}/light/{dev_name}_light/config")
+        topics.add(_config_topic("light", f"{dev_name}_light"))
     elif dtype == "climate":
-        topics.add(f"{DISCOVERY_PREFIX}/climate/{dev_name}_climate/config")
+        topics.add(_config_topic("climate", f"{dev_name}_climate"))
     # v1.10.20
     elif dtype == "cover":
-        topics.add(f"{DISCOVERY_PREFIX}/cover/{dev_name}_cover/config")
+        topics.add(_config_topic("cover", f"{dev_name}_cover"))
     elif dtype == "fan":
-        topics.add(f"{DISCOVERY_PREFIX}/fan/{dev_name}_fan/config")
+        topics.add(_config_topic("fan", f"{dev_name}_fan"))
 
     # DP-уровневые сущности.
     # v1.12.37: набор компонентов зависит от type — publish_discovery
@@ -543,16 +615,16 @@ def _discovery_topics_for_device(dev):
         comp = info.get("component")
         ent = info.get("name", f"dp_{dp_str}")
         if comp == "lock":             # v1.10.20: lock — для любого типа
-            topics.add(f"{DISCOVERY_PREFIX}/lock/{dev_name}_{ent}/config")
+            topics.add(_config_topic("lock", f"{dev_name}_{ent}"))
         elif comp in dp_components:
             if comp == "switch":
-                topics.add(f"{DISCOVERY_PREFIX}/switch/{dev_name}_{ent}/config")
+                topics.add(_config_topic("switch", f"{dev_name}_{ent}"))
             elif comp == "select":
-                topics.add(f"{DISCOVERY_PREFIX}/select/{dev_name}_{ent}/config")
+                topics.add(_config_topic("select", f"{dev_name}_{ent}"))
             elif comp == "number":
-                topics.add(f"{DISCOVERY_PREFIX}/number/{dev_name}_{ent}/config")
+                topics.add(_config_topic("number", f"{dev_name}_{ent}"))
             else:                       # sensor / binary_sensor
-                topics.add(f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{ent}/config")
+                topics.add(_config_topic(comp, f"{dev_name}_{ent}"))
 
     return topics
 
@@ -684,7 +756,7 @@ def _filter_orphan_by_suffix(topics, all_dev_names):
     Orphan = топик homeassistant/<comp>/<unique_id>/config, у которого:
       1. unique_id НЕ совпадает с <dev> и НЕ начинается с <dev>_ ни для
          одного <dev> из (current ∪ history имён bridge);
-      2. unique_id оканчивается на один из _ORPHAN_SUFFIXES, создаваемых
+      2. unique_id оканчивается на один из _LEGACY_ORPHAN_FALLBACK, создаваемых
          bridge, ИЛИ на _<name> любого DP из текущих dps_map.
 
     v1.10.14: добавлена проверка по ИСТОРИИ имён (KNOWN_DEVICE_NAMES_FILE).
@@ -696,7 +768,7 @@ def _filter_orphan_by_suffix(topics, all_dev_names):
     Возвращает set отфильтрованных топиков.
     """
     # Дополняем hardcoded суффиксы — динамическими из dps_map всех
-    # текущих устройств. Ловит DP, которых нет в _ORPHAN_SUFFIXES.
+    # текущих устройств. Ловит DP, которых нет в _LEGACY_ORPHAN_FALLBACK.
     with DEVICES_LOCK:
         devs = list(DEVICES)
     dynamic_suffixes = set()
@@ -706,7 +778,7 @@ def _filter_orphan_by_suffix(topics, all_dev_names):
             if ent:
                 dynamic_suffixes.add(f"_{ent}")
 
-    all_suffixes = tuple(_ORPHAN_SUFFIXES) + tuple(sorted(dynamic_suffixes))
+    all_suffixes = tuple(_LEGACY_ORPHAN_FALLBACK) + tuple(sorted(dynamic_suffixes))
 
     # v1.10.14: история имён — current ∪ persisted.
     history = _load_known_device_names()
@@ -1048,6 +1120,18 @@ def get_device_cmd_lock(name):
         return lk
 
 
+def drop_device_cmd_state(name):
+    """v1.13.16: чистим per-device состояние команд при удалении устройства.
+
+    `DEVICE_LAST_CMD` — данные, чистим по имени (иначе словарь медленно растёт
+    при add/remove/rename). `DEVICE_CMD_LOCKS` НЕ чистим осознанно: лок мог быть
+    выдан `get_device_cmd_lock()` конкурентному потоку, и удаление записи создало бы
+    ВТОРОЙ лок на то же имя — потеря сериализации команд по устройству.
+    """
+    with DEVICE_LAST_CMD_LOCK:
+        DEVICE_LAST_CMD.pop(name, None)
+
+
 def wait_device_rate_limit(name, component=None):
     if component in ("light", "climate", "number"):
         interval = MIN_CMD_INTERVAL_STREAM
@@ -1110,7 +1194,7 @@ def get_select_map(info):
     Команды идут в обратную сторону (HA-метка → Tuya), поэтому в обработчиках
     команд карта разворачивается (`rev`), а в публикации состояния — нет.
     """
-    return info.get("map", {})
+    return info.get("map") or {}   # v1.13.14 (#20): "map": null → None → краш fan-ветки
 
 
 def tuya_to_ha_brightness(tuya_val, bmin, bmax):
@@ -1658,17 +1742,27 @@ def collect_our_unique_ids():
             ids.add(f"{name}_cover")
         if dtype == "fan":
             ids.add(f"{name}_fan")
+        # N2 (v1.13.17): набор DP-компонентов зависит от type — зеркало
+        # `_discovery_topics_for_device` и `publish_discovery`. Раньше мы добавляли
+        # {name}_{ent} для switch/select/number/sensor/binary_sensor у ЛЮБОГО типа,
+        # поэтому OUR_IDS ⊋ фактически публикуемых unique_id (loose overlap:
+        # cleanup/orphan считали «нашими» топики, которых мост не создаёт).
+        # `lock` публикуется для любого типа (v1.10.20).
+        if dtype == "switch":
+            dp_comps = ("switch", "select", "number", "sensor", "binary_sensor")
+        elif dtype in ("light", "climate", "cover", "fan"):
+            dp_comps = ()
+        else:  # sensor / binary_sensor / прочие
+            dp_comps = ("sensor", "binary_sensor")
         for dp_str, info in (dev.get("dps_map") or {}).items():
             if not isinstance(info, dict):
                 # v1.12.12: битый dps_map не должен ронять мост на импорте модуля.
                 continue
             comp = info.get("component")
             ent = info.get("name", f"dp_{dp_str}")
-            if comp in ("switch", "select", "number"):
+            if comp == "lock":             # v1.10.20 — для любого типа
                 ids.add(f"{name}_{ent}")
-            elif comp in ("sensor", "binary_sensor"):
-                ids.add(f"{name}_{ent}")
-            elif comp == "lock":           # v1.10.20
+            elif comp in dp_comps:
                 ids.add(f"{name}_{ent}")
         if dev.get("dps_map", {}).get("6", {}).get("component") == "phase_a":
             for s in ("voltage", "current", "power"):
@@ -1815,7 +1909,11 @@ def on_message(client, userdata, msg):
     if ORPHAN_MODE["active"] and topic.startswith(DISCOVERY_PREFIX + "/"):
         parts = topic.split("/")
         if len(parts) >= 3 and parts[2] in OUR_IDS:
-            ORPHAN_MODE["topics"].append(topic)
+            # v1.13.16: append под локом — список пишет рабочий тред
+            # (_handle_cleanup_orphans), читает/пополняет MQTT-тред; без лока
+            # топик мог потеряться на границе режима.
+            with ORPHAN_MODE_LOCK:
+                ORPHAN_MODE["topics"].append(topic)
         return
 
     if CLEANUP_MODE["active"] and topic.startswith(DISCOVERY_PREFIX + "/"):
@@ -2143,6 +2241,10 @@ CMD_ACK_LOG_SIG = [""]         # лог только при смене набо�
 # этом HA и switch_2 уже показали off (оптимистичная публикация). Переотправляем
 # команду, пока не придёт отчёт с ожидаемым значением или не кончатся попытки.
 CMD_RETRY_AFTER_SEC = 2.5      # через сколько секунд без подтверждения переотправлять
+# v1.13.9: жёсткий потолок удержания «старого» отчёта, даже если команда так и не подтверждена.
+# Нужен, чтобы прибор, который вообще не отвечает, не блокировал правду бесконечно:
+# pending снимается исчерпанием повторов, но у окна должна быть верхняя граница.
+CMD_GUARD_PENDING_MAX_SEC = 8.0
 CMD_RETRY_MAX = 3              # максимум переотправок на команду
 CMD_RETRY_SWEEP_SEC = 0.5      # период проверки
 CMD_PENDING = {}               # {dev_name: {dp_str: {"v": val, "ts": t, "tries": n}}}
@@ -2153,10 +2255,30 @@ CMD_PENDING_LOCK = threading.Lock()
 _NO_RETRY_NAMES = {"bright_value", "temp_value", "colour_data", "temp_set"}
 
 
+def _publish_pending(dev_name, pending):
+    """v1.13.10: признак «команда ещё не подтверждена» отдельным retained-топиком.
+
+    HA при наличии state_topic пессимистична и нашу предпубликацию считает
+    подтверждённой правдой (исходники HA: light/schema_json.py:179-180
+    `_optimistic = optimistic or state_topic is None`). Топик даёт автоматизациям
+    способ проверять ФАКТ, без таймеров и guard-ов:
+      {{ not is_state_attr('switch.vykliuchatel_..._switch_2', 'pending', true) }}
+    Публикуем в оба вида топика (light/switch) — подписан только один.
+    """
+    payload = json.dumps({"pending": bool(pending)}, ensure_ascii=True)
+    for comp in ("light", "switch"):
+        try:
+            mqtt_client.publish(f"{TOPIC_PREFIX}/{comp}/{dev_name}/pending",
+                                payload, qos=0, retain=True)
+        except Exception as e:
+            log.debug(f"[Pending] {dev_name}: {e}")
+
+
 def _pending_mark(dev, updates):
     name = dev["name"]
     dps_map = dev.get("dps_map") or {}
     now = time.time()
+    marked = False
     with CMD_PENDING_LOCK:
         d = CMD_PENDING.setdefault(name, {})
         for dp, v in updates.items():
@@ -2166,9 +2288,13 @@ def _pending_mark(dev, updates):
             if info.get("name") in _NO_RETRY_NAMES:
                 continue
             d[str(dp)] = {"v": v, "ts": now, "tries": 0}
+            marked = True
+    if marked:
+        _publish_pending(name, True)   # v1.13.10: HA видит «не подтверждено»
 
 
 def _pending_clear(dev_name, dp):
+    empty = False
     with CMD_PENDING_LOCK:
         d = CMD_PENDING.get(dev_name)
         if not d:
@@ -2176,6 +2302,16 @@ def _pending_clear(dev_name, dp):
         d.pop(str(dp), None)
         if not d:
             CMD_PENDING.pop(dev_name, None)
+            empty = True
+    if empty:
+        _publish_pending(dev_name, False)   # v1.13.10: подтверждено — снимаем признак
+
+
+def _pending_active(dev_name, dp):
+    """v1.13.8: команда по этому DP ещё не подтверждена прибором (повторы не исчерпаны)."""
+    with CMD_PENDING_LOCK:
+        d = CMD_PENDING.get(dev_name)
+        return bool(d) and str(dp) in d
 
 
 def _val_eq(a, b):
@@ -2241,16 +2377,34 @@ def _cmd_ack_record(dev_name, ms):
 def cmd_guard_sec(dev_name):
     """v1.12.19: окно защиты от «эха» для конкретного устройства (сек).
 
-    Нет статистики (<5 проб) → CMD_GUARD_SEC (1.2 с). Иначе p90 отклика × 1.5,
-    зажатый в [CMD_GUARD_MIN_SEC, CMD_GUARD_MAX_SEC]. Медленному прибору окно
-    больше, шустрому — меньше (не «одно на всех»).
+    Нет статистики (<5 проб) → CMD_GUARD_SEC (1.2 с). Иначе СРЕДНЕЕ по последним
+    CMD_ACK_TAIL_N (6) откликам × CMD_GUARD_ACK_K, зажатое в [MIN, MAX].
+    v1.13.11 (указание заказчика): раньше брали p90 из 50 проб — в него попадали
+    мусорные «подтверждения» (дубли отчёта прибора, отклики вплоть до
+    CMD_ACK_MAX_MS) и раздували окно до потолка 3 с. Среднее по 6 устойчиво к этому.
     """
     with CMD_ACK_LOCK:
         vals = list(CMD_ACK.get(dev_name) or [])
     if len(vals) < CMD_GUARD_ACK_MIN_N:
         return CMD_GUARD_SEC
-    p90 = _percentile(vals, 90) / 1000.0
-    return max(CMD_GUARD_MIN_SEC, min(CMD_GUARD_MAX_SEC, p90 * CMD_GUARD_ACK_K))
+    tail = vals[-6:]         # v1.13.11: последние 6 откликов (указание заказчика)
+    avg = (sum(tail) / len(tail)) / 1000.0
+    return max(CMD_GUARD_MIN_SEC, min(CMD_GUARD_MAX_SEC, avg * CMD_GUARD_ACK_K))
+
+
+def cmd_avg6_sec(dev_name):
+    """v1.13.11: средний отклик устройства по последним 6 пробам (секунды).
+
+    Нужен для интервала повторов: занятому прибору повтор не помогает, а вредит —
+    пока он выполняет первую команду, вторая встаёт в очередь и задержка растёт.
+    Нет статистики (<5 проб) → 0.0 (тогда работает фиксированный backoff).
+    """
+    with CMD_ACK_LOCK:
+        vals = list(CMD_ACK.get(dev_name) or [])
+    if len(vals) < CMD_GUARD_ACK_MIN_N:
+        return 0.0
+    tail = vals[-6:]
+    return (sum(tail) / len(tail)) / 1000.0
 
 
 def _publish_cmd_ack_stats(force=False):
@@ -2270,8 +2424,12 @@ def _publish_cmd_ack_stats(force=False):
     for name, vals in data.items():
         if not vals:
             continue
+        tail6 = vals[-6:]        # v1.13.11: среднее/мин/макс по последним 6 откликам
         devs[name] = {
             "n": len(vals),
+            "avg6": int(round(sum(tail6) / len(tail6))),
+            "min6": int(round(min(tail6))),
+            "max6": int(round(max(tail6))),
             "p50": int(round(_percentile(vals, 50))),
             "p90": int(round(_percentile(vals, 90))),
             "last": int(round(vals[-1])),
@@ -2308,6 +2466,13 @@ def _cmd_guard_filter(dev_name, dps):
 
     v1.12.19: окно — персональное (cmd_guard_sec), а совпавшее значение
     заодно даёт замер реального отклика «команда → отчёт».
+    v1.13.8: окно больше не закрывается «по таймеру» — пока команда НЕ подтверждена
+    прибором (CMD_PENDING жив), противоречащие отчёты всё ещё отбрасываем. Иначе
+    «догоняющий» старый отчёт медленного прибора (панель gostinaya_garderob:
+    p90 2,3 с при потолке окна 3 с, хвосты больше) публиковался как правда и давал
+    ложный триггер автоматизации — лавина встречных команд.
+    v1.13.9: у этого удержания появился жёсткий потолок CMD_GUARD_PENDING_MAX_SEC —
+    молчащий прибор не может держать «старое» бесконечно.
     """
     if not dps:
         return dps
@@ -2322,15 +2487,22 @@ def _cmd_guard_filter(dev_name, dps):
         for dp, v in dps.items():
             rec = g.get(str(dp))
             if rec:
-                if (now - rec["ts"]) < guard:
-                    if not _val_eq(v, rec["v"]):
-                        continue                    # старое значение — не публикуем
+                age = now - rec["ts"]
+                if _val_eq(v, rec["v"]):
                     # значение совпало → это реальный отклик прибора
-                    acks.append((now - rec["ts"]) * 1000.0)
+                    acks.append(age * 1000.0)
                     _pending_clear(dev_name, dp)    # v1.12.29: подтверждено
+                    g.pop(str(dp), None)
+                elif age < guard or (_pending_active(dev_name, dp)
+                                     and age < CMD_GUARD_PENDING_MAX_SEC):
+                    # v1.13.8: старое значение — не публикуем ни в окне эха,
+                    # ни пока команда не подтверждена (см. docstring);
+                    # v1.13.9: удержание ограничено CMD_GUARD_PENDING_MAX_SEC.
+                    continue
                 else:
-                    _pending_clear(dev_name, dp)    # v1.12.29: окно вышло — правда прибора
-                g.pop(str(dp), None)            # окно вышло или значение совпало
+                    # повторы исчерпаны, прибор так и не подтвердил — дальше правда прибора
+                    _pending_clear(dev_name, dp)
+                    g.pop(str(dp), None)
             out[dp] = v
         if not g:
             CMD_GUARD.pop(dev_name, None)
@@ -2342,15 +2514,27 @@ def _cmd_guard_filter(dev_name, dps):
 def optimistic_update_many(dev, updates: dict):
     if not updates:
         return
-    _cache_update(dev["name"], updates)
+    # v1.13.12: если для ВСЕХ DP новое значение уже равно известному — это no-op
+    # (например, панель уже выключена, а массовая сцена шлёт OFF повторно).
+    # Прибор на НЕизменённое состояние отчёт не присылает, поэтому pending ждал бы
+    # исчерпания повторов (~15 с) и раздувал и «дельту команда→подтверждение»,
+    # и шторм [Retry]. Саму команду всё равно отправляем (устройство могло отстать),
+    # но эхо-окно и повторы для неё не нужны.
+    name = dev["name"]
+    with STATE_LOCK:
+        prev = dict(STATE_CACHE.get(name, {}))
+    _is_noop = all(str(dp) in prev and _val_eq(v, prev[str(dp)])
+                   for dp, v in updates.items())
+    _cache_update(name, updates)
     # v1.12.3: публикуем состояние в MQTT СРАЗУ после команды, а не ждём
     # следующего status(). После команды Tuya часто отдаёт 914/905 на status()
     # (устройство занято), и тогда HA видел старое состояние до следующего
     # успешного опроса (до POLL_INTERVAL = 15 с).
     # v1.12.7: guard помечаем ДО публикации — иначе отчёт устройства, пришедший
     # между publish и mark, не фильтруется и перезаписывает свежее значение старым.
-    _cmd_guard_mark(dev["name"], updates)
-    _pending_mark(dev, updates)   # v1.12.29: ждём подтверждения прибора
+    if not _is_noop:
+        _cmd_guard_mark(name, updates)
+        _pending_mark(dev, updates)   # v1.12.29: ждём подтверждения прибора
     try:
         publish_state(dev, {str(k): v for k, v in updates.items()})
     except Exception as e:
@@ -2359,6 +2543,30 @@ def optimistic_update_many(dev, updates: dict):
 
 def optimistic_update(dev, dp, value):
     optimistic_update_many(dev, {str(dp): value})
+
+
+# v1.13.10: общий дроссель отправок в Tuya (пейсинг fan-out).
+# Сцены шлют 7 люстр + 6 панелей одновременно; устройства встают в очередь и
+# вечером отвечают по 6–7 с (замеры 27.09: lyustra_gostinnaya ack p50 7218 мс).
+# Растягиваем отправку по времени — цена: последняя команда пачки уходит на
+# (N-1)*интервал позже, зато пробки на Wi-Fi/у устройствах меньше.
+# 0 — дроссель выключен. Настраивается TUYA_SEND_MIN_INTERVAL_MS.
+TUYA_SEND_MIN_INTERVAL_MS = int(os.environ.get("TUYA_SEND_MIN_INTERVAL_MS", "100") or 0)
+GLOBAL_SEND_LOCK = threading.Lock()
+GLOBAL_SEND_LAST = [0.0]
+
+
+def _send_gate():
+    """Пропустить отправку не чаще, чем раз в TUYA_SEND_MIN_INTERVAL_MS."""
+    if TUYA_SEND_MIN_INTERVAL_MS <= 0:
+        return
+    with GLOBAL_SEND_LOCK:
+        now = time.monotonic()
+        wait = GLOBAL_SEND_LAST[0] + (TUYA_SEND_MIN_INTERVAL_MS / 1000.0) - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        GLOBAL_SEND_LAST[0] = now
 
 
 def _retry_send(dev_name, dp, v, attempt):
@@ -2377,6 +2585,7 @@ def _retry_send(dev_name, dp, v, attempt):
         try:
             tuya = get_device_conn(dev)
             dp_i = int(dp) if str(dp).lstrip("-").isdigit() else dp
+            _send_gate()
             tuya.set_value(dp_i, v)
             return True
         except Exception as e:
@@ -2399,11 +2608,18 @@ def cmd_retry_worker():
             for dev_name, dps in list(CMD_PENDING.items()):
                 for dp, rec in list(dps.items()):
                     age = now - rec["ts"]
-                    if rec["tries"] < CMD_RETRY_MAX and age >= CMD_RETRY_AFTER_SEC:
+                    # v1.13.9: экспоненциальный backoff (2,5 → 5 → 7,5 с) вместо фиксированного
+                    # интервала — меньше шторма команд, когда прибор молчит.
+                    # v1.13.11: и не раньше удвоенного среднего отклика прибора (avg6) —
+                    # не подкидываем работу занятому устройству (иначе повторы копятся
+                    # и прибор отвечает ещё позже).
+                    _backoff = max(CMD_RETRY_AFTER_SEC * (rec["tries"] + 1),
+                                   2.0 * cmd_avg6_sec(dev_name))
+                    if rec["tries"] < CMD_RETRY_MAX and age >= _backoff:
                         rec["tries"] += 1
                         rec["ts"] = now
                         due.append((dev_name, dp, rec["v"], rec["tries"]))
-                    elif rec["tries"] >= CMD_RETRY_MAX and age >= CMD_RETRY_AFTER_SEC * 3:
+                    elif rec["tries"] >= CMD_RETRY_MAX and age >= CMD_RETRY_AFTER_SEC * 6:
                         dps.pop(dp, None)          # сдались — дальше правда прибора
                 if not dps:
                     CMD_PENDING.pop(dev_name, None)
@@ -2440,6 +2656,7 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
         # правду прибора вернёт request_status.
         optimistic_update(dev, dp, value)
         try:
+            _send_gate()
             tuya.set_value(dp, value)
         except Exception as e:
             log.warning(f"[Set] {dev['name']} dp={dp}: {e}")
@@ -2746,11 +2963,13 @@ def handle_light_command(tuya, dev, cmd):
     # устройства — наблюдали 24 с на включение люстры с яркостью/цветом.
     optimistic_update_many(dev, cache)
     try:
+        _send_gate()
         tuya.set_multiple_values(payload)
     except Exception as e:
         log.warning(f"[Light] set_multiple_values failed: {e}; fallback")
         for dp, v in payload.items():
             try:
+                _send_gate()
                 tuya.set_value(dp, v)
             except Exception as ee:
                 log.warning(f"[Light] set_value({dp}) failed: {ee}")
@@ -3016,12 +3235,31 @@ mqtt_client.on_disconnect = on_disconnect
 
 
 # ==================== ОЧИСТКА DISCOVERY ====================
+def _arm_mode_timeout(mode, seconds):
+    """Страховка от «залипания» режима: автосброс active=False по таймеру (v1.12.40).
+
+    Режимы ORPHAN/CLEANUP глушат обычную обработку homeassistant/# — если режим
+    не сбросится (аномалия/исключение), HA-команды перестанут применяться.
+    """
+    try:
+        t = threading.Timer(seconds, lambda: mode.__setitem__("active", False))
+        t.daemon = True
+        t.start()
+        return t
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[Mode] не удалось поставить автосброс: {e}")
+        return None
+
+
 def cleanup_discovery():
     log.info("[Cleanup] Очистка старых Discovery-сообщений (только наших)...")
     CLEANUP_MODE["active"] = True
     CLEANUP_MODE["count"] = 0
-    STOP_EVENT.wait(5)
-    CLEANUP_MODE["active"] = False
+    try:
+        _arm_mode_timeout(CLEANUP_MODE, 30)
+        STOP_EVENT.wait(5)
+    finally:
+        CLEANUP_MODE["active"] = False
     log.info(f"[Cleanup] Удалено сообщений: {CLEANUP_MODE['count']}")
     STOP_EVENT.wait(DISCOVERY_CLEANUP_WAIT)
 
@@ -3031,6 +3269,9 @@ def cleanup_discovery():
 # (удалили DP, устройство, переименовали) — HA держит их как фантомы.
 # В отличие от полной очистки, живые топики не трогаем: HA ничего не теряет.
 ORPHAN_MODE = {"active": False, "topics": []}
+# v1.13.16: ORPHAN_MODE читается в MQTT-треде (on_message) и пишется в рабочем
+# (_handle_cleanup_orphans) — доступ к списку только под этим локом.
+ORPHAN_MODE_LOCK = threading.Lock()
 
 
 def _expected_discovery_topics():
@@ -3055,8 +3296,10 @@ def _handle_cleanup_orphans(payload_str=""):
     req_id = _extract_request_id(payload_str)
     expected = _expected_discovery_topics()
     log.info(f"[Orphan] Слушаем retained Discovery (ожидаем {len(expected)} топиков)...")
-    ORPHAN_MODE["active"] = True
-    ORPHAN_MODE["topics"] = []
+    with ORPHAN_MODE_LOCK:
+        ORPHAN_MODE["active"] = True
+        ORPHAN_MODE["topics"] = []
+    _arm_mode_timeout(ORPHAN_MODE, 60)
     # v1.12.38: retained брокер отдаёт только при (пере)подписке. Мост подписан
     # на discovery ещё при старте (тогда ORPHAN_MODE был неактивен и топики не
     # копились), поэтому за окно ожидания повторной доставки не происходило и
@@ -3073,9 +3316,11 @@ def _handle_cleanup_orphans(payload_str=""):
                 break
             time.sleep(0.1)
     finally:
-        ORPHAN_MODE["active"] = False
-    seen = list(ORPHAN_MODE["topics"])
-    ORPHAN_MODE["topics"] = []
+        with ORPHAN_MODE_LOCK:
+            ORPHAN_MODE["active"] = False
+    with ORPHAN_MODE_LOCK:
+        seen = list(ORPHAN_MODE["topics"])
+        ORPHAN_MODE["topics"] = []
 
     removed = 0
     kept = 0
@@ -3102,11 +3347,14 @@ def _handle_cleanup_command(payload_str=""):
     log.info("[Cleanup] Запуск по команде из MQTT...")
     CLEANUP_MODE["active"] = True
     CLEANUP_MODE["count"] = 0
-    for _ in range(50):
-        if STOP_EVENT.is_set():
-            break
-        time.sleep(0.1)
-    CLEANUP_MODE["active"] = False
+    try:
+        _arm_mode_timeout(CLEANUP_MODE, 30)
+        for _ in range(50):
+            if STOP_EVENT.is_set():
+                break
+            time.sleep(0.1)
+    finally:
+        CLEANUP_MODE["active"] = False
     removed = CLEANUP_MODE["count"]
 
     republished = 0
@@ -3161,25 +3409,25 @@ def _remove_discovery_and_state(dev, dp_str, old_info):
     state_topic = None
 
     if comp == "switch":
-        discovery_topic = f"{DISCOVERY_PREFIX}/switch/{dev_name}_{name}/config"
+        discovery_topic = _config_topic("switch", f"{dev_name}_{name}")
         state_topic = f"{TOPIC_PREFIX}/switch/{dev_name}/{name}/state"
     elif comp == "select":
-        discovery_topic = f"{DISCOVERY_PREFIX}/select/{dev_name}_{name}/config"
+        discovery_topic = _config_topic("select", f"{dev_name}_{name}")
         state_topic = f"{TOPIC_PREFIX}/select/{dev_name}/{name}/state"
     elif comp == "number":
-        discovery_topic = f"{DISCOVERY_PREFIX}/number/{dev_name}_{name}/config"
+        discovery_topic = _config_topic("number", f"{dev_name}_{name}")
         state_topic = f"{TOPIC_PREFIX}/number/{dev_name}/{name}/state"
     elif comp in ("sensor", "binary_sensor"):
-        discovery_topic = f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{name}/config"
+        discovery_topic = _config_topic(comp, f"{dev_name}_{name}")
         state_topic = f"{TOPIC_PREFIX}/{dev_type}/{dev_name}/dps/{dp_str}/state"
     elif comp == "lock":               # v1.10.20
-        discovery_topic = f"{DISCOVERY_PREFIX}/lock/{dev_name}_{name}/config"
+        discovery_topic = _config_topic("lock", f"{dev_name}_{name}")
         state_topic = f"{TOPIC_PREFIX}/lock/{dev_name}/{name}/state"
     elif comp == "phase_a":
         # 3 отдельных сенсора
         for suffix in ("voltage", "current", "power"):
             mqtt_client.publish(
-                f"{DISCOVERY_PREFIX}/sensor/{dev_name}_output_{suffix}/config",
+                _config_topic("sensor", f"{dev_name}_output_{suffix}"),
                 payload=None, qos=1, retain=True,
             )
             mqtt_client.publish(
@@ -3580,6 +3828,11 @@ def _handle_edit_config(payload_str):
                     _d["enabled"] = filtered["enabled"]
                     break
 
+    # v1.13.15: ALL_DEVICES — снимок файла на старте. После любой правки
+    # перечитываем: иначе `_scan_subnet` строит known_ips из устаревшего ip
+    # и делает лишний TCP-connect на живое устройство (нарушение «1 TCP»).
+    _reload_all_devices()
+
     # --- Обработка enabled (v1.8.6) ---
     # v1.10.3: снимок DEVICE_INDEX ДО обработки — для корректного решения
     # о restart (см. ниже). Если enabled false->true — воркер уже стартанул.
@@ -3954,6 +4207,7 @@ def _handle_delete_device(payload_str):
     with DEVICES_LOCK:
         DEVICE_INDEX.pop(dev_name, None)
         drop_device_exec(dev_name)
+        drop_device_cmd_state(dev_name)   # v1.13.16: чистим DEVICE_LAST_CMD
         # v1.10.15: удаляем по имени, а не по равенству dict. publish_discovery
         # мутирует in-memory dict (friendly_name/name), поэтому dev_to_remove
         # (из файла) уже не равен ему — remove() падал, призрак оставался.
@@ -3964,7 +4218,12 @@ def _handle_delete_device(payload_str):
     # возвращает retained уже после _remove_discovery_for_device.
     drop_device_conn(dev_name)
     request_worker_restart(dev_name)
-    _wait_worker_exit(dev_name, timeout=3.0)
+    if not _wait_worker_exit(dev_name, timeout=3.0):
+        # v1.13.16: воркер не подтвердил выход за 3 с — даём ещё попытку и
+        # предупреждаем. Иначе он может вернуть retained state/cache_snapshot
+        # ПОСЛЕ очистки → призрачная сущность в HA.
+        log.warning(f"[Delete] {dev_name}: воркер не вышел за 3с — повторная попытка")
+        _wait_worker_exit(dev_name, timeout=2.0)
 
     # cleanup всегда — по dev_to_remove из конфига.
     try:
@@ -4028,14 +4287,14 @@ def _remove_discovery_for_device(dev):
     # только state-топики; retained homeassistant/sensor/<dev>_battery_*
     # висели до orphan cleanup при следующем рестарте.
     if dev.get("battery_powered"):
-        discovery_topics.append(f"{DISCOVERY_PREFIX}/sensor/{dev_name}_battery_alert/config")
-        discovery_topics.append(f"{DISCOVERY_PREFIX}/sensor/{dev_name}_battery_last_seen/config")
+        discovery_topics.append(_config_topic("sensor", f"{dev_name}_battery_alert"))
+        discovery_topics.append(_config_topic("sensor", f"{dev_name}_battery_last_seen"))
 
     if dtype == "light":
-        discovery_topics.append(f"{DISCOVERY_PREFIX}/light/{dev_name}_light/config")
+        discovery_topics.append(_config_topic("light", f"{dev_name}_light"))
         state_topics.append(f"{TOPIC_PREFIX}/light/{dev_name}/state")
     elif dtype == "climate":
-        discovery_topics.append(f"{DISCOVERY_PREFIX}/climate/{dev_name}_climate/config")
+        discovery_topics.append(_config_topic("climate", f"{dev_name}_climate"))
         state_topics.extend([
             f"{TOPIC_PREFIX}/climate/{dev_name}/mode/state",
             f"{TOPIC_PREFIX}/climate/{dev_name}/temp/state",
@@ -4044,13 +4303,13 @@ def _remove_discovery_for_device(dev):
         ])
     # v1.10.20
     elif dtype == "cover":
-        discovery_topics.append(f"{DISCOVERY_PREFIX}/cover/{dev_name}_cover/config")
+        discovery_topics.append(_config_topic("cover", f"{dev_name}_cover"))
         state_topics.extend([
             f"{TOPIC_PREFIX}/cover/{dev_name}/state",
             f"{TOPIC_PREFIX}/cover/{dev_name}/position/state",
         ])
     elif dtype == "fan":
-        discovery_topics.append(f"{DISCOVERY_PREFIX}/fan/{dev_name}_fan/config")
+        discovery_topics.append(_config_topic("fan", f"{dev_name}_fan"))
         state_topics.extend([
             f"{TOPIC_PREFIX}/fan/{dev_name}/state",
             f"{TOPIC_PREFIX}/fan/{dev_name}/preset/state",
@@ -4062,24 +4321,24 @@ def _remove_discovery_for_device(dev):
         comp = info.get("component")
         ent = info.get("name", f"dp_{dp_str}")
         if comp == "switch":
-            discovery_topics.append(f"{DISCOVERY_PREFIX}/switch/{dev_name}_{ent}/config")
+            discovery_topics.append(_config_topic("switch", f"{dev_name}_{ent}"))
             state_topics.append(f"{TOPIC_PREFIX}/switch/{dev_name}/{ent}/state")
         elif comp == "select":
-            discovery_topics.append(f"{DISCOVERY_PREFIX}/select/{dev_name}_{ent}/config")
+            discovery_topics.append(_config_topic("select", f"{dev_name}_{ent}"))
             state_topics.append(f"{TOPIC_PREFIX}/select/{dev_name}/{ent}/state")
         elif comp == "number":
-            discovery_topics.append(f"{DISCOVERY_PREFIX}/number/{dev_name}_{ent}/config")
+            discovery_topics.append(_config_topic("number", f"{dev_name}_{ent}"))
             state_topics.append(f"{TOPIC_PREFIX}/number/{dev_name}/{ent}/state")
         elif comp in ("sensor", "binary_sensor"):
-            discovery_topics.append(f"{DISCOVERY_PREFIX}/{comp}/{dev_name}_{ent}/config")
+            discovery_topics.append(_config_topic(comp, f"{dev_name}_{ent}"))
             state_topics.append(f"{TOPIC_PREFIX}/{dtype}/{dev_name}/dps/{dp_str}/state")
         elif comp == "lock":           # v1.10.20
-            discovery_topics.append(f"{DISCOVERY_PREFIX}/lock/{dev_name}_{ent}/config")
+            discovery_topics.append(_config_topic("lock", f"{dev_name}_{ent}"))
             state_topics.append(f"{TOPIC_PREFIX}/lock/{dev_name}/{ent}/state")
 
     if dps_map.get("6", {}).get("component") == "phase_a":
         for suffix in ("voltage", "current", "power"):
-            discovery_topics.append(f"{DISCOVERY_PREFIX}/sensor/{dev_name}_output_{suffix}/config")
+            discovery_topics.append(_config_topic("sensor", f"{dev_name}_output_{suffix}"))
             state_topics.append(f"{TOPIC_PREFIX}/{dtype}/{dev_name}/phase_a/{suffix}/state")
 
     # Общие топики устройства.
@@ -4090,6 +4349,11 @@ def _remove_discovery_for_device(dev):
     # навсегда и подхватывается при повторном создании устройства.
     state_topics.append(f"{TOPIC_PREFIX}/{dev_name}/battery_alert")
     state_topics.append(f"{TOPIC_PREFIX}/{dev_name}/battery_last_up")
+    # v1.13.16: чистим и `pending` (json_attributes_topic у light/switch) —
+    # иначе retained остаётся после удаления устройства и подхватывается при
+    # повторном создании с тем же именем.
+    state_topics.append(f"{TOPIC_PREFIX}/light/{dev_name}/pending")
+    state_topics.append(f"{TOPIC_PREFIX}/switch/{dev_name}/pending")
 
     for t in discovery_topics:
         mqtt_client.publish(t, payload=None, qos=1, retain=True)
@@ -4234,6 +4498,16 @@ def _handle_import_devices(payload_str):
             # публиковался, WebUI получал таймаут) — считаем такое устройство
             # «без DP» и идём дальше.
             _import_dps_map = {}
+        # v1.13.14 (#15): overwrite без dps_map не должен стирать карту устройства.
+        # WebUI/скрипт могут прислать частичную запись (только enabled/ip) — наследуем
+        # существующую карту, иначе устройство «потемнеет» в HA (и в файле, и в рантайме).
+        if "dps_map" not in dev:
+            for _d in all_devices:
+                if _d.get("name") == name:
+                    _old_dm = _d.get("dps_map")
+                    if isinstance(_old_dm, dict) and _old_dm:
+                        _import_dps_map = dict(_old_dm)
+                    break
         _validate_dps = data.get("validate_dps_map", True)
         if _import_dps_map:
             if _validate_dps:
@@ -4287,7 +4561,9 @@ def _handle_import_devices(payload_str):
                         # ложный конфликт.
                         _old_id = d.get("id")
                         _old_ip = d.get("ip")
-                        all_devices[i] = entry
+                        # v1.13.14 (#15): merge, а не replace — иначе теряются
+                        # метаданные (presets/product_id/…) и dps_map, не присланные клиентом.
+                        all_devices[i] = {**d, **entry}
                         updated += 1
                         if _old_id and _old_id != dev_id:
                             existing_ids.discard(_old_id)
@@ -4515,6 +4791,11 @@ def _reload_all_devices():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             fresh = json.load(f)
+        # v1.13.15: гарантируем наличие dps_map — ручная правка конфига
+        # может оставить его null/отсутствующим, а publish_* читают напрямую.
+        for _d in fresh:
+            if isinstance(_d, dict):
+                _d.setdefault("dps_map", {})
         with DEVICES_LOCK:
             ALL_DEVICES.clear()
             ALL_DEVICES.extend(fresh)
@@ -4750,6 +5031,10 @@ def _config_fix_format_inplace(all_devices):
                     bump("expire_after")
         dm = d.get("dps_map")
         if dm is None:
+            # v1.13.14 (#17/21, N1): явный `dps_map: null` раньше пропускался,
+            # а затем падал в device_entities/publish_state (`None.items()`).
+            d["dps_map"] = {}
+            bump("dps_map")
             continue
         if not isinstance(dm, dict):
             d["dps_map"] = {}
@@ -5160,6 +5445,744 @@ def base_availability(dev_name):
     }
 
 
+# v2.0 (increment 1): single registry of Discovery descriptors.
+# A publisher returns a list of EntitySpec; topic + JSON are built in one
+# place. The payload must stay byte-for-byte, so the config below is built
+# from the very same expressions, in the very same key order, that
+# publish_phase_a used before.
+from dataclasses import dataclass
+
+
+@dataclass
+class EntitySpec:
+    """One published Discovery entity.
+
+    component + unique_id -> config topic (via _config_topic);
+    config                -> ready dict, key order matters (json.dumps);
+    state_topic           -> state topic of the entity;
+    qos/retain/ensure_ascii -> mqtt_client.publish parameters;
+    log_tag               -> log line the publisher used to emit;
+    source                -> which registry branch produced the spec.
+    """
+
+    component: str
+    unique_id: str
+    config: dict
+    state_topic: str
+    qos: int = 0
+    ensure_ascii: bool = True
+    retain: bool = True
+    log_tag: str = ""
+    source: str = ""
+
+
+def device_entities(dev, sources=("phase_a",)):
+    """Registry of entity descriptors of one device.
+
+    sources -> which registry branches to build. Every migrated publisher
+    asks for its own branch: device_entities(device, ("switch",)).
+    The default stays ("phase_a",) on purpose: publish_phase_a is the only
+    publisher that calls device_entities(dev) with no filter, and it must
+    not start publishing switch/lock/select/number/sensor configs -
+    publish_discovery calls publish_switches / publish_locks /
+    publish_selects / publish_numbers / publish_sensors for the very same
+    device right after it. When the remaining publishers migrate, the
+    default becomes every branch.
+
+    Increment 2 added the switch and lock branches, increment 3 the
+    select and number ones, increment 4 the sensor one. The payload must
+    stay byte-for-byte, so every config below is built from the very same
+    expressions, in the very same key order, that the old publisher used:
+    for select "options" stays before "optimistic", for number the
+    optional "unit_of_measurement" stays AFTER **avail, and for
+    sensor/binary_sensor the optional keys (device_class,
+    unit_of_measurement, then state_class or payload_on..state_off) stay
+    AFTER **avail as well.
+
+    The sensor branch is LAST on purpose: it is the only branch whose
+    dev_type default differs from the registry one (dev.get("type",
+    "sensor") instead of "switch", exactly as publish_sensors had it), so
+    it must not be able to change what the branches above built.
+
+    Increment 5 appends the battery branch after the sensor branch: two
+    specs per device (battery_alert and battery_last_seen), no walk over
+    dps_map and no dev_type of its own, so its position is free and every
+    branch above it stays byte-identical.
+
+    Increment 6 adds the light and climate branches in front of the sensor one:
+    each builds exactly one spec per device, neither of them touches the
+    dev_type local the phase_a branch above reads, and the sensor branch keeps
+    its own local for exactly that reason. The log line the old
+    publish_climate wrote while it walked dps_map for preset options now lives
+    inside the climate branch, and the ORDER of the log lines is unchanged: the
+    registry is built before the spec is published.
+
+    Increment 7 adds the cover and fan branches in front of the sensor one: one
+    spec per device each, and neither of them re-binds a local the preamble
+    owns nor walks dps_map by component (both find their DPs by name, exactly as
+    the old publishers did). Both branches read dps_map with ["dps_map"], so a
+    device without that key still fails the way it failed before. The two
+    warnings the old bodies wrote for an entity with nothing to control live
+    inside the branches now, and the ORDER of the log lines is unchanged: the
+    registry is built before the spec is published. A cover has no unconditional
+    state topic, so the spec of that branch carries the position topic and the
+    config key points at the same local.
+    """
+    want = set(sources)
+    specs = []
+
+    # v1.13.7 (баг дублирования имён): `device.name` = friendly (как было), а
+    # `name` сущности — только её роль. Для «целых» устройств шлём name: None,
+    # иначе HA склеивает "device.name" + " " + "name" и выходит «Люстра Спальня
+    # Люстра Спальня». Историю см. dev/docs/changelog/main.md.
+    dev_name = dev["name"]
+    friendly = dev["friendly_name"]
+    dev_type = dev.get("type", "switch")
+    avail = base_availability(dev_name)
+    device_info = {
+        "identifiers": [dev["id"]],
+        "name": friendly,
+        "manufacturer": "Tuya",
+        "model": dev.get("model", "Tuya Device"),
+    }
+
+    if "phase_a" in want:
+        for suffix, name, unit, dclass in [
+            ("voltage", "Output Voltage", "V", "voltage"),
+            ("current", "Output Current", "A", "current"),
+            ("power", "Output Power", "kW", "power"),
+        ]:
+            unique_id = f"{dev_name}_output_{suffix}"
+            state_topic = f"{TOPIC_PREFIX}/{dev_type}/{dev_name}/phase_a/{suffix}/state"
+            config = {
+                "name": name,
+                "unique_id": unique_id,
+                "state_topic": state_topic,
+                "unit_of_measurement": unit,
+                "device_class": dclass,
+                "state_class": "measurement",
+                "expire_after": AVAILABILITY_EXPIRE,
+                "device": device_info,
+                **avail,
+            }
+            specs.append(EntitySpec(
+                component="sensor",
+                unique_id=unique_id,
+                config=config,
+                state_topic=state_topic,
+                log_tag=f"[Discovery] phase_a: {friendly} / {suffix} ({unit})",
+                source="phase_a",
+            ))
+
+    if "switch" in want:
+        # component="switch" -> HA switch: command /set, state /state,
+        # payload/state ON/OFF. Only DPs with component="switch" get here.
+        for dp_str, info in dev["dps_map"].items():
+            if info.get("component") != "switch":
+                continue
+            entity_name = info["name"]
+            unique_id = f"{dev_name}_{entity_name}"
+            state_topic = f"{TOPIC_PREFIX}/switch/{dev_name}/{entity_name}/state"
+            config = {
+                "name": entity_name,
+                "unique_id": unique_id,
+                "command_topic": f"{TOPIC_PREFIX}/switch/{dev_name}/{entity_name}/set",
+                "state_topic": state_topic,
+                "json_attributes_topic": f"{TOPIC_PREFIX}/switch/{dev_name}/pending",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "state_on": "ON",
+                "state_off": "OFF",
+                "optimistic": False,
+                "expire_after": AVAILABILITY_EXPIRE,
+                "device": device_info,
+                **avail,
+            }
+            specs.append(EntitySpec(
+                component="switch",
+                unique_id=unique_id,
+                config=config,
+                state_topic=state_topic,
+                log_tag=f"[Discovery] switch: {friendly} / {entity_name}",
+                source="switch",
+            ))
+
+    if "lock" in want:
+        # v1.10.20: lock - умные замки (HA platform 'lock').
+        # DP с component='lock' (обычно name='lock_state', bool:
+        # true = заперто). Поле `inverted: true` в DP инвертирует смысл
+        # значения (инверсия живёт в set/state, не в discovery-конфиге).
+        for dp_str, info in dev["dps_map"].items():
+            if info.get("component") != "lock":
+                continue
+            # DP без name -> "lock" (как в publish_locks).
+            entity_name = info.get("name", "lock")
+            unique_id = f"{dev_name}_{entity_name}"
+            state_topic = f"{TOPIC_PREFIX}/lock/{dev_name}/{entity_name}/state"
+            config = {
+                "name": entity_name,
+                "unique_id": unique_id,
+                "command_topic": f"{TOPIC_PREFIX}/lock/{dev_name}/{entity_name}/set",
+                "state_topic": state_topic,
+                "payload_lock": "LOCK",
+                "payload_unlock": "UNLOCK",
+                "state_locked": "LOCKED",
+                "state_unlocked": "UNLOCKED",
+                "optimistic": False,
+                "expire_after": AVAILABILITY_EXPIRE,
+                "device": device_info,
+                **avail,
+            }
+            specs.append(EntitySpec(
+                component="lock",
+                unique_id=unique_id,
+                config=config,
+                state_topic=state_topic,
+                log_tag=f"[Discovery] lock: {friendly} / {entity_name}",
+                source="lock",
+            ))
+
+    if "select" in want:
+        # v1.12.8: в options HA уходят МЕТКИ (значения карты `map`), иначе
+        # список показывал бы сырые значения Tuya, а команда меткой не
+        # находила пару. Нетмэпленные значения (например "last") остаются
+        # как есть. Порядок ключей: options -> optimistic.
+        for dp_str, info in dev["dps_map"].items():
+            if info.get("component") != "select":
+                continue
+            entity_name = info["name"]
+            smap = get_select_map(info)
+
+            options = info.get("options", [])
+            if smap:
+                labels = list(smap.values())
+                for o in options:
+                    if o not in smap:
+                        labels.append(o)
+                options = labels
+
+            unique_id = f"{dev_name}_{entity_name}"
+            state_topic = f"{TOPIC_PREFIX}/select/{dev_name}/{entity_name}/state"
+            config = {
+                "name": entity_name,
+                "unique_id": unique_id,
+                "command_topic": f"{TOPIC_PREFIX}/select/{dev_name}/{entity_name}/set",
+                "state_topic": state_topic,
+                "options": options,
+                "optimistic": False,
+                "expire_after": AVAILABILITY_EXPIRE,
+                "device": device_info,
+                **avail,
+            }
+            specs.append(EntitySpec(
+                component="select",
+                unique_id=unique_id,
+                config=config,
+                state_topic=state_topic,
+                log_tag=f"[Discovery] select: {friendly} / {entity_name} ({options})",
+                source="select",
+            ))
+
+    if "number" in want:
+        # HA number: min/max/step + mode "box". unit опционален и
+        # добавляется ПОСЛЕ **avail (как в publish_numbers) — порядок
+        # ключей в json.dumps значим.
+        for dp_str, info in dev["dps_map"].items():
+            if info.get("component") != "number":
+                continue
+            entity_name = info["name"]
+            unique_id = f"{dev_name}_{entity_name}"
+            state_topic = f"{TOPIC_PREFIX}/number/{dev_name}/{entity_name}/state"
+            config = {
+                "name": entity_name,
+                "unique_id": unique_id,
+                "command_topic": f"{TOPIC_PREFIX}/number/{dev_name}/{entity_name}/set",
+                "state_topic": state_topic,
+                "min": info.get("min", 0),
+                "max": info.get("max", 100),
+                "step": info.get("step", 1),
+                "mode": "box",
+                "optimistic": False,
+                "expire_after": AVAILABILITY_EXPIRE,
+                "device": device_info,
+                **avail,
+            }
+            if info.get("unit"):
+                config["unit_of_measurement"] = info["unit"]
+            specs.append(EntitySpec(
+                component="number",
+                unique_id=unique_id,
+                config=config,
+                state_topic=state_topic,
+                log_tag=f"[Discovery] number: {friendly} / {entity_name}",
+                source="number",
+            ))
+
+    if "light" in want:
+        # v2.0 (increment 6): the branch that used to be the whole
+        # publish_light. ONE spec per device and NO walk over dps_map: the
+        # three DPs are found BY NAME (find_dp_by_name), exactly as the old
+        # publisher found them, and a light DP carries no component of its own
+        # - the sensor branch cannot recognise one, but publish_discovery calls
+        # exactly one publisher per device type, so nothing is published twice
+        # (unchanged behaviour, written down so nobody "fixes" it here).
+        #
+        # supported_color_modes keeps the OLD order - color_temp, then rgb, and
+        # "brightness" only when neither was found - because HA shows the modes
+        # in the order it was given them.
+        #
+        # The three kelvin keys are OPTIONAL and stay AFTER **avail, as in the
+        # old config: color_temp_kelvin, min_kelvin, max_kelvin, and only when
+        # the temp_value DP was really found. The key order of json.dumps IS
+        # part of the payload.
+        #
+        # The old publish said `retain=True` and nothing else, so the spec keeps
+        # the EntitySpec defaults (qos 0 / ensure_ascii True / retain True) and
+        # spells none of them out.
+        dp_bright, _ = find_dp_by_name(dev, "bright_value")
+        dp_temp, info_temp = find_dp_by_name(dev, "temp_value")
+        dp_color, _ = find_dp_by_name(dev, "colour_data")
+
+        has_bright = dp_bright is not None
+        has_temp = dp_temp is not None
+        has_color = dp_color is not None
+
+        modes = []
+        if has_temp:
+            modes.append("color_temp")
+        if has_color:
+            modes.append("rgb")
+        if not modes:
+            modes.append("brightness")
+
+        unique_id = f"{dev_name}_light"
+        state_topic = f"{TOPIC_PREFIX}/light/{dev_name}/state"
+        config = {
+            "name": None,
+            "unique_id": unique_id,
+            "command_topic": f"{TOPIC_PREFIX}/light/{dev_name}/set",
+            "state_topic": state_topic,
+            "json_attributes_topic": f"{TOPIC_PREFIX}/light/{dev_name}/pending",
+            "schema": "json",
+            "brightness": has_bright,
+            "brightness_scale": HA_BRIGHT_MAX,
+            "supported_color_modes": modes,
+            "optimistic": False,
+            "expire_after": AVAILABILITY_EXPIRE,
+            "device": device_info,
+            **avail,
+        }
+        if has_temp and info_temp is not None:
+            kmin, kmax = get_kelvin_bounds(info_temp)
+            config["color_temp_kelvin"] = True
+            config["min_kelvin"] = kmin
+            config["max_kelvin"] = kmax
+        specs.append(EntitySpec(
+            component="light",
+            unique_id=unique_id,
+            config=config,
+            state_topic=state_topic,
+            log_tag=f"[Discovery] light: {friendly} ({modes}, scale={HA_BRIGHT_MAX})",
+            source="light",
+        ))
+
+    if "climate" in want:
+        # v2.0 (increment 6): the branch that used to be the whole
+        # publish_climate. ONE spec per device.
+        #
+        # v1.10.10: presets / preset_map may be no-list/dict (hand-edited
+        # devices_config.json), so the two isinstance guards below stay - a
+        # bare `for p in 42` would take the discovery of the device down.
+        #
+        # v1.9.10: with no explicit presets they are derived from the DP with
+        # component="preset" (its options), which is what makes a climate
+        # imported from the Cloud work at once. The log line the old publisher
+        # wrote for that case lives HERE, in the branch: the registry is built
+        # before the spec is published, so the ORDER of the two log lines is
+        # the one of the old function.
+        #
+        # The three preset keys are OPTIONAL and stay AFTER **avail:
+        # preset_modes, preset_mode_command_topic, preset_mode_state_topic.
+        #
+        # The old publish said `retain=True` and nothing else, so the spec keeps
+        # the EntitySpec defaults (qos 0 / ensure_ascii True / retain True) and
+        # spells none of them out.
+        presets = dev.get("presets") or []
+        if not isinstance(presets, list):
+            presets = []
+        preset_map = dev.get("preset_map") or {}
+        if not isinstance(preset_map, dict):
+            preset_map = {}
+
+        if not presets:
+            for _dp, _info in dev.get("dps_map", {}).items():
+                if _info.get("component") == "preset":
+                    _opts = _info.get("options", [])
+                    if _opts:
+                        presets = list(_opts)
+                        log.info(
+                            f"[Discovery] climate {dev_name}: presets из DP "
+                            f"{_dp} (options, {len(_opts)} шт.)"
+                        )
+                        break
+
+        preset_modes_ha = [preset_map.get(p, p) for p in presets]
+
+        min_temp = dev.get("min_temp", DEFAULT_MIN_TEMP)
+        max_temp = dev.get("max_temp", DEFAULT_MAX_TEMP)
+        temp_step = dev.get("temp_step", DEFAULT_TEMP_STEP)
+
+        unique_id = f"{dev_name}_climate"
+        # A climate entity has FOUR state topics (mode / temp / current /
+        # preset); the spec carries the current-temperature one, the topic the
+        # bridge publishes on every reading, and it is the SAME local the
+        # config below points at, so the two cannot drift apart.
+        current_state_topic = f"{TOPIC_PREFIX}/climate/{dev_name}/current/state"
+        config = {
+            "name": None,
+            "unique_id": unique_id,
+            "modes": ["off", "heat"],
+            "mode_command_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/mode/set",
+            "mode_state_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/mode/state",
+            "temperature_command_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/temp/set",
+            "temperature_state_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/temp/state",
+            "current_temperature_topic": current_state_topic,
+            "min_temp": min_temp,
+            "max_temp": max_temp,
+            "temp_step": temp_step,
+            "temperature_unit": "C",
+            "optimistic": False,
+            "expire_after": AVAILABILITY_EXPIRE,
+            "device": device_info,
+            **avail,
+        }
+        if presets:
+            config["preset_modes"] = preset_modes_ha
+            config["preset_mode_command_topic"] = f"{TOPIC_PREFIX}/climate/{dev_name}/preset/set"
+            config["preset_mode_state_topic"] = f"{TOPIC_PREFIX}/climate/{dev_name}/preset/state"
+        specs.append(EntitySpec(
+            component="climate",
+            unique_id=unique_id,
+            config=config,
+            state_topic=current_state_topic,
+            log_tag=f"[Discovery] climate: {friendly} (presets: {preset_modes_ha})",
+            source="climate",
+        ))
+
+    if "cover" in want:
+        # v2.0 (increment 7): the branch that used to be the whole
+        # publish_cover. ONE spec per device, and NO walk over dps_map by
+        # component: the DPs are found BY NAME over dps_map.values(), exactly
+        # as the old publisher found them, and publish_discovery calls exactly
+        # one publisher per device type, so nothing is published twice.
+        #
+        # dps_map is read with ["dps_map"] on purpose: the old body did the
+        # same, so a device without that key still fails the way it failed
+        # before (and the switch/lock/select/number/sensor branches above read
+        # it that way too).
+        #
+        # A cover has NO unconditional state topic: command_topic comes with
+        # the control DP, position_topic with percent_control/percent_state.
+        # The state topic local below is the POSITION one - the topic the
+        # bridge publishes the position on - and the config key points at that
+        # very local, so the spec and the config cannot drift apart.
+        #
+        # device_class comes from the control DP when that DP carries one and
+        # is "curtain" otherwise: the rule of v1.10.20, applied in the same
+        # order (first match wins).
+        #
+        # The four control keys and the four position keys are OPTIONAL and stay
+        # AFTER **avail, in the OLD order. The key order of json.dumps IS part
+        # of the payload.
+        #
+        # The old publish said `retain=True` and nothing else, so the spec keeps
+        # the EntitySpec defaults (qos 0 / ensure_ascii True / retain True) and
+        # spells none of them out.
+        #
+        # The warning the old publisher wrote for a cover with neither control
+        # nor percent_* lives HERE, in the branch: the registry is built before
+        # the spec is published, so it still lands BEFORE the "[Discovery]
+        # cover: ..." line of the publisher.
+        dps_map = dev["dps_map"]
+
+        has_control = any(i.get("name") == "control" for i in dps_map.values())
+        has_pos = any(i.get("name") in ("percent_control", "percent_state")
+                      for i in dps_map.values())
+
+        # device_class comes from the control DP when that DP carries one,
+        # "curtain" otherwise - the rule the old publish_cover applied.
+        device_class = "curtain"
+        for i in dps_map.values():
+            if i.get("name") == "control" and i.get("device_class"):
+                device_class = i["device_class"]
+                break
+
+        unique_id = f"{dev_name}_cover"
+        state_topic = f"{TOPIC_PREFIX}/cover/{dev_name}/position/state"
+        config = {
+            "name": None,
+            "unique_id": unique_id,
+            "device_class": device_class,
+            "optimistic": False,
+            "expire_after": AVAILABILITY_EXPIRE,
+            "device": device_info,
+            **avail,
+        }
+        if has_control:
+            config["command_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/set"
+            config["payload_open"] = "OPEN"
+            config["payload_close"] = "CLOSE"
+            config["payload_stop"] = "STOP"
+        if has_pos:
+            config["position_topic"] = state_topic
+            config["set_position_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/position/set"
+            config["position_open"] = 100
+            config["position_closed"] = 0
+
+        if not (has_control or has_pos):
+            log.warning(f"[Discovery] cover {dev_name}: нет DP control/percent_* — "
+                        f"сущность без управления")
+        specs.append(EntitySpec(
+            component="cover",
+            unique_id=unique_id,
+            config=config,
+            state_topic=state_topic,
+            log_tag=f"[Discovery] cover: {friendly} ({device_class})",
+            source="cover",
+        ))
+
+    if "fan" in want:
+        # v2.0 (increment 7): the branch that used to be the whole
+        # publish_fan. ONE spec per device, NO walk over dps_map by component:
+        # the DPs are found BY NAME over dps_map.values(), exactly as the old
+        # publisher found them, and publish_discovery calls exactly one
+        # publisher per device type, so nothing is published twice.
+        #
+        # dps_map is read with ["dps_map"] on purpose - see the cover branch
+        # above.
+        #
+        # A fan has a state topic only when a switch DP is there, so the config
+        # key "state_topic" is added under `if has_switch:` and the spec carries
+        # the same local.
+        #
+        # The two shapes of fan_speed keep the OLD order and the OLD meaning:
+        # options -> preset_modes (the LABELS of `map` first, the unmapped
+        # values after, as in the select branch since v1.12.14), a number ->
+        # percentage + speed_range_min/max. The direction keys stay AFTER
+        # them, and the key order of json.dumps IS part of the payload.
+        #
+        # The old publish said `retain=True` and nothing else, so the spec keeps
+        # the EntitySpec defaults (qos 0 / ensure_ascii True / retain True) and
+        # spells none of them out.
+        #
+        # The warning the old publisher wrote for a fan with no switch, no
+        # fan_speed and no fan_direction lives HERE, in the branch: the registry
+        # is built before the spec is published, so it still lands BEFORE the
+        # "[Discovery] fan: ..." line of the publisher.
+        dps_map = dev["dps_map"]
+
+        has_switch = any(i.get("name") == "switch" for i in dps_map.values())
+        speed = None
+        for i in dps_map.values():
+            if i.get("name") == "fan_speed":
+                speed = i
+                break
+        has_dir = any(i.get("name") == "fan_direction" for i in dps_map.values())
+
+        unique_id = f"{dev_name}_fan"
+        state_topic = f"{TOPIC_PREFIX}/fan/{dev_name}/state"
+        config = {
+            "name": None,
+            "unique_id": unique_id,
+            "optimistic": False,
+            "expire_after": AVAILABILITY_EXPIRE,
+            "device": device_info,
+            **avail,
+        }
+        if has_switch:
+            config["command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/set"
+            config["state_topic"] = state_topic
+            config["payload_on"] = "ON"
+            config["payload_off"] = "OFF"
+            config["state_on"] = "ON"
+            config["state_off"] = "OFF"
+
+        if speed is not None:
+            if speed.get("options"):
+                # v1.12.14: as in select - the LABELS of the map go into
+                # preset_modes (Tuya -> HA), otherwise HA showed a state label
+                # that is not in the preset list.
+                _pmap = get_select_map(speed)
+                _modes = list(_pmap.values()) if _pmap else []
+                for _o in speed["options"]:
+                    if _o not in _pmap:
+                        _modes.append(_o)
+                config["preset_modes"] = _modes
+                config["preset_mode_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/set"
+                config["preset_mode_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/state"
+            else:
+                config["percentage_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/speed/set"
+                config["percentage_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/speed/state"
+                config["speed_range_min"] = speed.get("min", 1)
+                config["speed_range_max"] = speed.get("max", 100)
+
+        if has_dir:
+            config["direction_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/direction/set"
+            config["direction_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/direction/state"
+
+        if not (has_switch or speed or has_dir):
+            log.warning(f"[Discovery] fan {dev_name}: нет DP switch/fan_speed/fan_direction")
+        specs.append(EntitySpec(
+            component="fan",
+            unique_id=unique_id,
+            config=config,
+            state_topic=state_topic,
+            log_tag=f"[Discovery] fan: {friendly}",
+            source="fan",
+        ))
+
+    if "sensor" in want:
+        # v2.0 (increment 4): the branch that used to be the whole
+        # publish_sensors. ONE legacy function owned TWO components, so
+        # this branch keeps the skip list instead of a filter: what is
+        # left is component "sensor" (the default of
+        # info.get("component", "sensor"), so a DP with no component at
+        # all is a sensor) and "binary_sensor".
+        #
+        # The branch is LAST on purpose: publish_sensors defaulted
+        # dev_type to "sensor" while the registry local above defaults to
+        # "switch" (increment 1, from publish_phase_a). Both defaults are
+        # visible in a state topic, so the sensor DPs get their own local
+        # instead of overwriting dev_type for the branches above.
+        for dp_str, info in dev["dps_map"].items():
+            component = info.get("component", "sensor")
+            # v1.10.20: cover/fan/lock публикуются своими функциями
+            # (publish_cover/publish_fan/publish_locks) — здесь их быть
+            # не должно.
+            if component in ("switch", "light", "preset", "select", "phase_a",
+                             "number", "cover", "fan", "lock"):
+                continue
+            entity_name = info.get("name", f"dp_{dp_str}")
+            unique_id = f"{dev_name}_{entity_name}"
+            sensor_type = dev.get("type", "sensor")
+            state_topic = f"{TOPIC_PREFIX}/{sensor_type}/{dev_name}/dps/{dp_str}/state"
+
+            # v1.9.4: per-device expire_after для батарейных.
+            # Значения из конфига, дефолт — BATTERY_EXPIRE_AFTER.
+            if dev.get("battery_powered"):
+                _expire = dev.get("expire_after", BATTERY_EXPIRE_AFTER)
+            else:
+                _expire = AVAILABILITY_EXPIRE
+            config = {
+                "name": entity_name,
+                "unique_id": unique_id,
+                "state_topic": state_topic,
+                "expire_after": _expire,
+                "device": device_info,
+                **avail,
+            }
+            if info.get("device_class"):
+                config["device_class"] = info["device_class"]
+            if info.get("unit"):
+                config["unit_of_measurement"] = info["unit"]
+            if component == "sensor":
+                config["state_class"] = info.get("state_class", "measurement")
+            elif component == "binary_sensor":
+                config["payload_on"] = "ON"
+                config["payload_off"] = "OFF"
+                config["state_on"] = "ON"
+                config["state_off"] = "OFF"
+                # v1.9.13: для motion (и любого binary_sensor) НЕ трогаем
+                # expire_after — HA переводил сенсор в unavailable через
+                # минуту после события, и автоматизации «OFF → выключить
+                # свет» ложно срабатывали. Значение приходит из
+                # device.expire_after (3600/90000 для батарейных) или из
+                # AVAILABILITY_EXPIRE.
+            specs.append(EntitySpec(
+                component=component,
+                unique_id=unique_id,
+                config=config,
+                state_topic=state_topic,
+                log_tag=f"[Discovery] {component}: {friendly} / {entity_name}",
+                source="sensor",
+            ))
+
+    if "battery" in want:
+        # v2.0 (increment 5): the branch that used to be the whole
+        # publish_battery_alert_discovery. TWO specs per device and NO walk
+        # over dps_map at all - the old function published unconditionally,
+        # and publish_discovery is what checks device["battery_powered"].
+        #   sensor/<dev>_battery_alert      - ok / no_data
+        #   sensor/<dev>_battery_last_seen  - timestamp of the last UP
+        # object_id lives INSIDE both configs (a stable entity_id built from
+        # dev_name, never from friendly_name) and the ORDER of the two
+        # appends below is the order the old function published in.
+        #
+        # This is the only branch that overrides the EntitySpec defaults:
+        # qos=1 and ensure_ascii=False (the old publish said both out loud);
+        # retain stays the default True, which is why it is not passed.
+        #
+        # v1.9.7: the alert expire_after must stay ABOVE
+        # BATTERY_ALERT_AFTER_SEC, otherwise HA goes unavailable through
+        # device["expire_after"] while the bridge republishes the alert only
+        # on a state change. So it is NOT the per-device expire of the
+        # sensor branch either.
+        _alert_expire = BATTERY_ALERT_AFTER_SEC + 3600
+        alert_id = f"{dev_name}_battery_alert"
+        state_topic = f"{TOPIC_PREFIX}/{dev_name}/battery_alert"
+        alert_config = {
+            "name": "battery",
+            "unique_id": alert_id,
+            "object_id": alert_id,
+            "state_topic": state_topic,
+            "icon": "mdi:battery-alert-variant-outline",
+            "expire_after": _alert_expire,
+            "device": device_info,
+            **avail,
+        }
+        specs.append(EntitySpec(
+            component="sensor",
+            unique_id=alert_id,
+            config=alert_config,
+            state_topic=state_topic,
+            qos=1,
+            ensure_ascii=False,
+            log_tag=f"[Discovery] battery: {friendly}",
+            source="battery",
+        ))
+
+        # 2. battery_last_seen - timestamp. The state topic is
+        # .../battery_last_up (NOT .../battery_up - that is the topic
+        # publish_battery_last_up writes, so battery_up would leave HA
+        # listening to a topic nobody publishes), and there is NO
+        # expire_after here: the old config had none. state_topic is reused
+        # on purpose - the spec above already took its own value.
+        lastup_id = f"{dev_name}_battery_last_seen"
+        state_topic = f"{TOPIC_PREFIX}/{dev_name}/battery_last_up"
+        lastup_config = {
+            "name": "last seen",
+            "unique_id": lastup_id,
+            "object_id": lastup_id,
+            "state_topic": state_topic,
+            "device_class": "timestamp",
+            "icon": "mdi:clock-check-outline",
+            "device": device_info,
+            **avail,
+        }
+        specs.append(EntitySpec(
+            component="sensor",
+            unique_id=lastup_id,
+            config=lastup_config,
+            state_topic=state_topic,
+            qos=1,
+            ensure_ascii=False,
+            log_tag=f"[Discovery] battery_last_seen: {friendly}",
+            source="battery",
+        ))
+    return specs
+
+
+
 def publish_discovery(device):
     # v1.10.14: нормализуем friendly_name — иначе KeyError при ручной
     # правке devices_config.json без friendly_name (все подфункции
@@ -5170,6 +6193,10 @@ def publish_discovery(device):
                                    or "?")
     if not device.get("name"):
         device["name"] = device.get("id") or "unknown"
+    # v1.13.15: dps_map обязателен для publish_* (device_entities/publish_state
+    # читают его напрямую) — при ручной правке конфига может отсутствовать/null.
+    if not isinstance(device.get("dps_map"), dict):
+        device["dps_map"] = {}
     dev_type = device.get("type", "sensor")
     dev_name = device["name"]
     friendly = device["friendly_name"]
@@ -5213,512 +6240,189 @@ def publish_discovery(device):
 
 
 def publish_phase_a(device, device_info):
-    dev_name = device["name"]
-    friendly = device["friendly_name"]
-    dev_type = device.get("type", "switch")
-    avail = base_availability(dev_name)
+    # v2.0 (increment 1): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte) but the parameter stays: publish_discovery owns the
+    # call signature and it is outside this patch. Topic and JSON are now
+    # built in one place: _config_topic + json.dumps.
+    for spec in device_entities(device):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
-    for suffix, name, unit, dclass in [
-        ("voltage", "Output Voltage", "V", "voltage"),
-        ("current", "Output Current", "A", "current"),
-        ("power", "Output Power", "kW", "power"),
-    ]:
-        unique_id = f"{dev_name}_output_{suffix}"
-        topic = f"{DISCOVERY_PREFIX}/sensor/{unique_id}/config"
-        config = {
-            "name": f"{friendly} {name}",
-            "unique_id": unique_id,
-            "state_topic": f"{TOPIC_PREFIX}/{dev_type}/{dev_name}/phase_a/{suffix}/state",
-            "unit_of_measurement": unit,
-            "device_class": dclass,
-            "state_class": "measurement",
-            "expire_after": AVAILABILITY_EXPIRE,
-            "device": device_info,
-            **avail,
-        }
-        mqtt_client.publish(topic, json.dumps(config), retain=True)
-        log.info(f"[Discovery] phase_a: {friendly} / {suffix} ({unit})")
 
 
 def publish_light(device, device_info):
-    dev_name = device["name"]
-    avail = base_availability(dev_name)
-
-    dp_bright, _ = find_dp_by_name(device, "bright_value")
-    dp_temp, info_temp = find_dp_by_name(device, "temp_value")
-    dp_color, _ = find_dp_by_name(device, "colour_data")
-
-    has_bright = dp_bright is not None
-    has_temp = dp_temp is not None
-    has_color = dp_color is not None
-
-    modes = []
-    if has_temp:
-        modes.append("color_temp")
-    if has_color:
-        modes.append("rgb")
-    if not modes:
-        modes.append("brightness")
-
-    unique_id = f"{dev_name}_light"
-    config = {
-        "name": device["friendly_name"],
-        "unique_id": unique_id,
-        "command_topic": f"{TOPIC_PREFIX}/light/{dev_name}/set",
-        "state_topic": f"{TOPIC_PREFIX}/light/{dev_name}/state",
-        "schema": "json",
-        "brightness": has_bright,
-        "brightness_scale": HA_BRIGHT_MAX,
-        "supported_color_modes": modes,
-        "optimistic": False,
-        "expire_after": AVAILABILITY_EXPIRE,
-        "device": device_info,
-        **avail,
-    }
-    if has_temp and info_temp is not None:
-        kmin, kmax = get_kelvin_bounds(info_temp)
-        config["color_temp_kelvin"] = True
-        config["min_kelvin"] = kmin
-        config["max_kelvin"] = kmax
-    topic = f"{DISCOVERY_PREFIX}/light/{unique_id}/config"
-    mqtt_client.publish(topic, json.dumps(config), retain=True)
-    log.info(f"[Discovery] light: {device['friendly_name']} ({modes}, scale={HA_BRIGHT_MAX})")
+    # v2.0 (increment 6): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte, see the device_info contract in check 3) but the
+    # parameter stays: publish_discovery owns the call signature and it is
+    # outside this patch. Topic and JSON are now built in one place:
+    # _config_topic + json.dumps.
+    # v1.13.10: чистый retained-признак pending при (ре)публикации Discovery
+    _publish_pending(device["name"], False)
+    for spec in device_entities(device, ("light",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_switches(device, device_info):
-    dev_name = device["name"]
-    avail = base_availability(dev_name)
-
-    for dp_str, info in device["dps_map"].items():
-        if info.get("component") != "switch":
-            continue
-        entity_name = info["name"]
-        unique_id = f"{dev_name}_{entity_name}"
-        config = {
-            "name": f"{device['friendly_name']} {entity_name}",
-            "unique_id": unique_id,
-            "command_topic": f"{TOPIC_PREFIX}/switch/{dev_name}/{entity_name}/set",
-            "state_topic": f"{TOPIC_PREFIX}/switch/{dev_name}/{entity_name}/state",
-            "payload_on": "ON",
-            "payload_off": "OFF",
-            "state_on": "ON",
-            "state_off": "OFF",
-            "optimistic": False,
-            "expire_after": AVAILABILITY_EXPIRE,
-            "device": device_info,
-            **avail,
-        }
-        topic = f"{DISCOVERY_PREFIX}/switch/{unique_id}/config"
-        mqtt_client.publish(topic, json.dumps(config), retain=True)
-        log.info(f"[Discovery] switch: {device['friendly_name']} / {entity_name}")
+    # v2.0 (increment 2): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte) but the parameter stays: publish_discovery owns the
+    # call signature and it is outside this patch. Topic and JSON are now
+    # built in one place: _config_topic + json.dumps.
+    # v1.13.10: чистый retained-признак pending при (ре)публикации Discovery
+    _publish_pending(device["name"], False)
+    for spec in device_entities(device, ("switch",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_selects(device, device_info):
-    dev_name = device["name"]
-    avail = base_availability(dev_name)
-
-    for dp_str, info in device["dps_map"].items():
-        if info.get("component") != "select":
-            continue
-        entity_name = info["name"]
-        smap = get_select_map(info)
-
-        options = info.get("options", [])
-        if smap:
-            # v1.12.8: в options HA уходят МЕТКИ (значения карты), иначе список
-            # показывал бы сырые значения Tuya, а команда меткой не находила пару.
-            # Нетмэпленные значения (например "last") остаются как есть.
-            labels = list(smap.values())
-            for o in options:
-                if o not in smap:
-                    labels.append(o)
-            options = labels
-
-        unique_id = f"{dev_name}_{entity_name}"
-        config = {
-            "name": f"{device['friendly_name']} {entity_name}",
-            "unique_id": unique_id,
-            "command_topic": f"{TOPIC_PREFIX}/select/{dev_name}/{entity_name}/set",
-            "state_topic": f"{TOPIC_PREFIX}/select/{dev_name}/{entity_name}/state",
-            "options": options,
-            "optimistic": False,
-            "expire_after": AVAILABILITY_EXPIRE,
-            "device": device_info,
-            **avail,
-        }
-        topic = f"{DISCOVERY_PREFIX}/select/{unique_id}/config"
-        mqtt_client.publish(topic, json.dumps(config), retain=True)
-        log.info(f"[Discovery] select: {device['friendly_name']} / {entity_name} ({options})")
+    # v2.0 (increment 3): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte) but the parameter stays: publish_discovery owns the
+    # call signature and it is outside this patch. Topic and JSON are now
+    # built in one place: _config_topic + json.dumps.
+    for spec in device_entities(device, ("select",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_numbers(device, device_info):
-    dev_name = device["name"]
-    avail = base_availability(dev_name)
-
-    for dp_str, info in device["dps_map"].items():
-        if info.get("component") != "number":
-            continue
-        entity_name = info["name"]
-        unique_id = f"{dev_name}_{entity_name}"
-        config = {
-            "name": f"{device['friendly_name']} {entity_name}",
-            "unique_id": unique_id,
-            "command_topic": f"{TOPIC_PREFIX}/number/{dev_name}/{entity_name}/set",
-            "state_topic": f"{TOPIC_PREFIX}/number/{dev_name}/{entity_name}/state",
-            "min": info.get("min", 0),
-            "max": info.get("max", 100),
-            "step": info.get("step", 1),
-            "mode": "box",
-            "optimistic": False,
-            "expire_after": AVAILABILITY_EXPIRE,
-            "device": device_info,
-            **avail,
-        }
-        if info.get("unit"):
-            config["unit_of_measurement"] = info["unit"]
-        topic = f"{DISCOVERY_PREFIX}/number/{unique_id}/config"
-        mqtt_client.publish(topic, json.dumps(config), retain=True)
-        log.info(f"[Discovery] number: {device['friendly_name']} / {entity_name}")
+    # v2.0 (increment 3): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte) but the parameter stays: publish_discovery owns the
+    # call signature and it is outside this patch. Topic and JSON are now
+    # built in one place: _config_topic + json.dumps.
+    for spec in device_entities(device, ("number",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_cover(device, device_info):
-    """v1.10.20: cover — шторы / рольставни / ворота (HA platform 'cover').
-
-    DP берутся из dps_map по именам (COVER_DP_NAMES):
-      control         — open / stop / close (команда)
-      percent_control — целевое положение 0..100 (команда)
-      percent_state   — текущее положение 0..100 (состояние)
-
-    Нужен хотя бы один из control / percent_control, иначе управление
-    из HA будет недоступно (только состояние).
-    """
-    dev_name = device["name"]
-    avail = base_availability(dev_name)
-    dps_map = device["dps_map"]
-
-    has_control = any(i.get("name") == "control" for i in dps_map.values())
-    has_pos = any(i.get("name") in ("percent_control", "percent_state")
-                  for i in dps_map.values())
-
-    # device_class — из DP (необязательно), по умолчанию curtain
-    device_class = "curtain"
-    for i in dps_map.values():
-        if i.get("name") == "control" and i.get("device_class"):
-            device_class = i["device_class"]
-            break
-
-    config = {
-        "name": device["friendly_name"],
-        "unique_id": f"{dev_name}_cover",
-        "device_class": device_class,
-        "optimistic": False,
-        "expire_after": AVAILABILITY_EXPIRE,
-        "device": device_info,
-        **avail,
-    }
-    if has_control:
-        config["command_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/set"
-        config["payload_open"] = "OPEN"
-        config["payload_close"] = "CLOSE"
-        config["payload_stop"] = "STOP"
-    if has_pos:
-        config["position_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/position/state"
-        config["set_position_topic"] = f"{TOPIC_PREFIX}/cover/{dev_name}/position/set"
-        config["position_open"] = 100
-        config["position_closed"] = 0
-
-    if not (has_control or has_pos):
-        log.warning(f"[Discovery] cover {dev_name}: нет DP control/percent_* — "
-                    f"сущность без управления")
-
-    topic = f"{DISCOVERY_PREFIX}/cover/{dev_name}_cover/config"
-    mqtt_client.publish(topic, json.dumps(config), retain=True)
-    log.info(f"[Discovery] cover: {device['friendly_name']} ({device_class})")
+    # v2.0 (increment 7): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte, see the device_info contract in check 4) but the
+    # parameter stays: publish_discovery owns the call signature and it is
+    # outside this patch. Topic and JSON are now built in one place:
+    # _config_topic + json.dumps.
+    #
+    # The cover branch warns about a cover with neither control nor percent_*
+    # from inside the branch, so that line still lands BEFORE the
+    # "[Discovery] cover: ..." one below.
+    for spec in device_entities(device, ("cover",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_fan(device, device_info):
-    """v1.10.20: fan — вентиляторы (HA platform 'fan').
-
-    DP берутся из dps_map по именам (FAN_DP_NAMES):
-      switch        — вкл/выкл (command/state ON|OFF)
-      fan_speed     — enum (options) → preset_modes, число → percentage
-      fan_direction — forward / reverse
-    """
-    dev_name = device["name"]
-    avail = base_availability(dev_name)
-    dps_map = device["dps_map"]
-
-    has_switch = any(i.get("name") == "switch" for i in dps_map.values())
-    speed = None
-    for i in dps_map.values():
-        if i.get("name") == "fan_speed":
-            speed = i
-            break
-    has_dir = any(i.get("name") == "fan_direction" for i in dps_map.values())
-
-    config = {
-        "name": device["friendly_name"],
-        "unique_id": f"{dev_name}_fan",
-        "optimistic": False,
-        "expire_after": AVAILABILITY_EXPIRE,
-        "device": device_info,
-        **avail,
-    }
-    if has_switch:
-        config["command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/set"
-        config["state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/state"
-        config["payload_on"] = "ON"
-        config["payload_off"] = "OFF"
-        config["state_on"] = "ON"
-        config["state_off"] = "OFF"
-
-    if speed is not None:
-        if speed.get("options"):
-            # v1.12.14: как у select — в preset_modes уходят МЕТКИ карты (Tuya→HA),
-            # иначе HA показывал состояние-метку, которой нет в списке пресетов.
-            _pmap = get_select_map(speed)
-            _modes = list(_pmap.values()) if _pmap else []
-            for _o in speed["options"]:
-                if _o not in _pmap:
-                    _modes.append(_o)
-            config["preset_modes"] = _modes
-            config["preset_mode_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/set"
-            config["preset_mode_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/preset/state"
-        else:
-            config["percentage_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/speed/set"
-            config["percentage_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/speed/state"
-            config["speed_range_min"] = speed.get("min", 1)
-            config["speed_range_max"] = speed.get("max", 100)
-
-    if has_dir:
-        config["direction_command_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/direction/set"
-        config["direction_state_topic"] = f"{TOPIC_PREFIX}/fan/{dev_name}/direction/state"
-
-    if not (has_switch or speed or has_dir):
-        log.warning(f"[Discovery] fan {dev_name}: нет DP switch/fan_speed/fan_direction")
-
-    topic = f"{DISCOVERY_PREFIX}/fan/{dev_name}_fan/config"
-    mqtt_client.publish(topic, json.dumps(config), retain=True)
-    log.info(f"[Discovery] fan: {device['friendly_name']}")
+    # v2.0 (increment 7): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte, see the device_info contract in check 4) but the
+    # parameter stays: publish_discovery owns the call signature and it is
+    # outside this patch. Topic and JSON are now built in one place:
+    # _config_topic + json.dumps.
+    #
+    # The fan branch warns about a fan with no switch, no fan_speed and no
+    # fan_direction from inside the branch, so that line still lands BEFORE the
+    # "[Discovery] fan: ..." one below.
+    for spec in device_entities(device, ("fan",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_locks(device, device_info):
-    """v1.10.20: lock — умные замки (HA platform 'lock').
-
-    DP с component='lock' (обычно name='lock_state', bool: true = заперто).
-    Поле `inverted: true` в DP инвертирует смысл значения.
-    """
-    dev_name = device["name"]
-    avail = base_availability(dev_name)
-
-    for dp_str, info in device["dps_map"].items():
-        if info.get("component") != "lock":
-            continue
-        entity_name = info.get("name", "lock")
-        unique_id = f"{dev_name}_{entity_name}"
-        config = {
-            "name": f"{device['friendly_name']} {entity_name}",
-            "unique_id": unique_id,
-            "command_topic": f"{TOPIC_PREFIX}/lock/{dev_name}/{entity_name}/set",
-            "state_topic": f"{TOPIC_PREFIX}/lock/{dev_name}/{entity_name}/state",
-            "payload_lock": "LOCK",
-            "payload_unlock": "UNLOCK",
-            "state_locked": "LOCKED",
-            "state_unlocked": "UNLOCKED",
-            "optimistic": False,
-            "expire_after": AVAILABILITY_EXPIRE,
-            "device": device_info,
-            **avail,
-        }
-        topic = f"{DISCOVERY_PREFIX}/lock/{unique_id}/config"
-        mqtt_client.publish(topic, json.dumps(config), retain=True)
-        log.info(f"[Discovery] lock: {device['friendly_name']} / {entity_name}")
+    """v1.10.20: lock — умные замки (HA platform 'lock')."""
+    # v2.0 (increment 2): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte) but the parameter stays: publish_discovery owns the
+    # call signature and it is outside this patch. Topic and JSON are now
+    # built in one place: _config_topic + json.dumps.
+    for spec in device_entities(device, ("lock",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_climate(device, device_info):
-    dev_name = device["name"]
-    unique_id = f"{dev_name}_climate"
-    avail = base_availability(dev_name)
-
-    # v1.10.10: presets/preset_map могут быть не-list/dict (ручной
-    # edit devices_config.json). Строгие проверки — иначе for p in 42.
-    presets = device.get("presets") or []
-    if not isinstance(presets, list):
-        presets = []
-    preset_map = device.get("preset_map") or {}
-    if not isinstance(preset_map, dict):
-        preset_map = {}
-
-    # v1.9.10: если presets не заданы явно — выводим из DP с
-    # component="preset" (options). Это делает climate-импорт из Cloud
-    # автоматически рабочим: options DP становятся preset_modes в HA.
-    if not presets:
-        for _dp, _info in device.get("dps_map", {}).items():
-            if _info.get("component") == "preset":
-                _opts = _info.get("options", [])
-                if _opts:
-                    presets = list(_opts)
-                    log.info(
-                        f"[Discovery] climate {dev_name}: presets из DP "
-                        f"{_dp} (options, {len(_opts)} шт.)"
-                    )
-                    break
-
-    preset_modes_ha = [preset_map.get(p, p) for p in presets]
-
-    min_temp = device.get("min_temp", DEFAULT_MIN_TEMP)
-    max_temp = device.get("max_temp", DEFAULT_MAX_TEMP)
-    temp_step = device.get("temp_step", DEFAULT_TEMP_STEP)
-
-    config = {
-        "name": device["friendly_name"],
-        "unique_id": unique_id,
-        "modes": ["off", "heat"],
-        "mode_command_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/mode/set",
-        "mode_state_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/mode/state",
-        "temperature_command_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/temp/set",
-        "temperature_state_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/temp/state",
-        "current_temperature_topic": f"{TOPIC_PREFIX}/climate/{dev_name}/current/state",
-        "min_temp": min_temp,
-        "max_temp": max_temp,
-        "temp_step": temp_step,
-        "temperature_unit": "C",
-        "optimistic": False,
-        "expire_after": AVAILABILITY_EXPIRE,
-        "device": device_info,
-        **avail,
-    }
-    if presets:
-        config["preset_modes"] = preset_modes_ha
-        config["preset_mode_command_topic"] = f"{TOPIC_PREFIX}/climate/{dev_name}/preset/set"
-        config["preset_mode_state_topic"] = f"{TOPIC_PREFIX}/climate/{dev_name}/preset/state"
-    topic = f"{DISCOVERY_PREFIX}/climate/{unique_id}/config"
-    mqtt_client.publish(topic, json.dumps(config), retain=True)
-    log.info(f"[Discovery] climate: {device['friendly_name']} (presets: {preset_modes_ha})")
+    # v2.0 (increment 6): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte, see the device_info contract in check 3) but the
+    # parameter stays: publish_discovery owns the call signature and it is
+    # outside this patch. Topic and JSON are now built in one place:
+    # _config_topic + json.dumps.
+    #
+    # The climate branch logs the derived presets from inside the branch, so
+    # that line still lands BEFORE the "[Discovery] climate: ..." one below.
+    for spec in device_entities(device, ("climate",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 def publish_sensors(device, device_info):
-    dev_name = device["name"]
-    dev_type = device.get("type", "sensor")
-    avail = base_availability(dev_name)
-
-    for dp_str, info in device["dps_map"].items():
-        component = info.get("component", "sensor")
-        # v1.10.20: cover/fan/lock публикуются своими функциями
-        # (publish_cover/publish_fan/publish_locks) — здесь их быть не должно.
-        if component in ("switch", "light", "preset", "select", "phase_a",
-                         "number", "cover", "fan", "lock"):
-            continue
-        entity_name = info.get("name", f"dp_{dp_str}")
-        unique_id = f"{dev_name}_{entity_name}"
-        state_topic = f"{TOPIC_PREFIX}/{dev_type}/{dev_name}/dps/{dp_str}/state"
-
-        # v1.9.4: per-device expire_after для батарейных.
-        # Значения из конфига, дефолт — BATTERY_EXPIRE_AFTER.
-        if device.get("battery_powered"):
-            _expire = device.get("expire_after", BATTERY_EXPIRE_AFTER)
-        else:
-            _expire = AVAILABILITY_EXPIRE
-        config = {
-            "name": f"{device['friendly_name']} {entity_name}",
-            "unique_id": unique_id,
-            "state_topic": state_topic,
-            "expire_after": _expire,
-            "device": device_info,
-            **avail,
-        }
-        if info.get("device_class"):
-            config["device_class"] = info["device_class"]
-        if info.get("unit"):
-            config["unit_of_measurement"] = info["unit"]
-        if component == "sensor":
-            config["state_class"] = info.get("state_class", "measurement")
-        elif component == "binary_sensor":
-            config["payload_on"] = "ON"
-            config["payload_off"] = "OFF"
-            config["state_on"] = "ON"
-            config["state_off"] = "OFF"
-            # v1.9.13: для motion (и любого binary_sensor) НЕ трогаем
-            # expire_after. Работает из device.expire_after: 3600/90000
-            # для батарейных, 120 для обычных.
-            #
-            # Раньше для motion стояло expire_after=60 → HA переводил
-            # сенсор в `unavailable` через минуту после последнего
-            # события. Автоматизации «OFF → выключить свет» ложно
-            # срабатывали через 60 сек после движения.
-            #
-            # Теперь: motion держит последнее значение (ON/OFF) пока
-            # bridge живёт. `OFF` приходит только от устройства
-            # (pir=none → "none" → OFF). `unavailable` — только если
-            # устройство реально молчит > expire_after (для
-            # батарейных = 25ч от battery_alert).
-
-        topic = f"{DISCOVERY_PREFIX}/{component}/{unique_id}/config"
-        mqtt_client.publish(topic, json.dumps(config), retain=True)
-        log.info(f"[Discovery] {component}: {device['friendly_name']} / {entity_name}")
+    # v2.0 (increment 4): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte, see the device_info contract in check 3) but the
+    # parameter stays: publish_discovery owns the call signature and it is
+    # outside this patch. Topic and JSON are now built in one place:
+    # _config_topic + json.dumps.
+    #
+    # Both components of the old function are in the tuple: the branch is
+    # selected by "sensor" and builds a spec per DP, so a binary_sensor DP
+    # keeps publishing under homeassistant/binary_sensor/.
+    for spec in device_entities(device, ("sensor", "binary_sensor")):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 # ==================== BATTERY DISCOVERY (v1.9.5) ====================
 def publish_battery_alert_discovery(device, device_info):
-    """
-    v1.9.5: Discovery для battery_alert и battery_last_seen.
-
-    HA создаёт две сущности:
-      sensor.<name>_battery_alert      — ok / no_data
-      sensor.<name>_battery_last_seen  — timestamp последнего UP
-
-    object_id задаёт стабильный entity_id (из dev_name, не friendly_name).
-    """
-    dev_name = device["name"]
-    friendly = device["friendly_name"]
-    avail = base_availability(dev_name)
-    # v1.9.7: expire_after для battery_alert должен быть БОЛЬШЕ
-    # BATTERY_ALERT_AFTER_SEC, иначе HA уходит в unavailable
-    # через device.expire_after (3600 для двери), а bridge
-    # перепубликовывает alert только при смене состояния.
-    # Берём BATTERY_ALERT_AFTER_SEC + 3600 (запас 1 час).
-    _alert_expire = BATTERY_ALERT_AFTER_SEC + 3600
-
-    # v1.9.11: alert_id = <dev>_battery_alert. Раньше было <dev>_battery —
-    # конфликтовало с DP с name="battery" (оба писали в один
-    # homeassistant/sensor/<dev>_battery/config). Теперь battery_alert
-    # всегда отдельная сущность, никогда не пересекается с DP.
-    alert_id = f"{dev_name}_battery_alert"
-    alert_config = {
-        "name": f"{friendly} battery",
-        "unique_id": alert_id,
-        "object_id": alert_id,
-        "state_topic": f"{TOPIC_PREFIX}/{dev_name}/battery_alert",
-        "icon": "mdi:battery-alert-variant-outline",
-        "expire_after": _alert_expire,
-        "device": device_info,
-        **avail,
-    }
-    mqtt_client.publish(
-        f"{DISCOVERY_PREFIX}/sensor/{alert_id}/config",
-        json.dumps(alert_config, ensure_ascii=False),
-        qos=1, retain=True,
-    )
-    log.info(f"[Discovery] battery: {friendly}")
-    
-    # 2. battery_last_seen — timestamp
-    lastup_id = f"{dev_name}_battery_last_seen"
-    lastup_config = {
-        "name": f"{friendly} last seen",
-        "unique_id": lastup_id,
-        "object_id": lastup_id,
-        "state_topic": f"{TOPIC_PREFIX}/{dev_name}/battery_last_up",
-        "device_class": "timestamp",
-        "icon": "mdi:clock-check-outline",
-        "device": device_info,
-        **avail,
-    }
-    mqtt_client.publish(
-        f"{DISCOVERY_PREFIX}/sensor/{lastup_id}/config",
-        json.dumps(lastup_config, ensure_ascii=False),
-        qos=1, retain=True,
-    )
-    log.info(f"[Discovery] battery_last_seen: {friendly}")
+    # v2.0 (increment 5): publication goes through device_entities(device).
+    # device_info is no longer used (the registry builds an identical one,
+    # byte-for-byte, see the device_info contract in check 3) but the
+    # parameter stays: publish_discovery owns the call signature and it is
+    # outside this patch. Topic and JSON are now built in one place:
+    # _config_topic + json.dumps.
+    #
+    # The branch builds TWO specs, alert then last_seen, and the ORDER of
+    # the publications is the order of the specs - proved by the first
+    # index of each spec marker in the branch, not by where this loop ends.
+    for spec in device_entities(device, ("battery",)):
+        mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                            json.dumps(spec.config,
+                                       ensure_ascii=spec.ensure_ascii),
+                            qos=spec.qos, retain=spec.retain)
+        log.info(spec.log_tag)
 
 
 # ==================== STATE PUBLISHING ====================
@@ -6123,7 +6827,7 @@ def _log_repeat(name, code_label, code_hint, where="", state_dict=None, lock=Non
 def _log_914_once(name, where=""):
     _log_repeat(
         name,
-        code_label="Tuya error 914",
+        code_label=f"Tuya error 914 ({tuya_err_text(914)})",
         code_hint="проверь local_key/version в конфиге",
         where=where,
         state_dict=_LAST_914_STATE,
@@ -6134,7 +6838,7 @@ def _log_914_once(name, where=""):
 def _log_905_once(name, where=""):
     _log_repeat(
         name,
-        code_label="Network Error 905",
+        code_label=f"Network Error 905 ({tuya_err_text(905)})",
         code_hint="устройство недоступно",
         where=where,
         state_dict=_LAST_905_STATE,
@@ -6202,6 +6906,8 @@ def run_polling_device(dev):
     has_phase_a = dev.get("dps_map", {}).get("6", {}).get("component") == "phase_a"
     last_online = None
     consecutive_904 = 0
+    # v1.14.0 (п.10): циклы «UDP жив, TCP молчит» — потолок против «вечного online».
+    udp_no_tcp_cycles = 0
     first_iteration = True
 
     while not STOP_EVENT.is_set():
@@ -6403,18 +7109,58 @@ def run_polling_device(dev):
 
         # ==== OFFLINE_TIMEOUT ====
         if time.time() - last_real_data > OFFLINE_TIMEOUT:
-            if last_online is not False:
-                # v1.12.10: в тихих часах offline ожидаем — в DEBUG, без WARNING.
-                _msg = (f"[Worker] {name}: нет данных "
-                        f"{int(time.time() - last_real_data)}с, offline")
-                if _is_quiet_now(name):
-                    log.debug(_msg + " (тихие часы)")
-                else:
-                    log.warning(_msg)
-                publish_availability(dev, False)
-                last_online = False
-            last_real_data = time.time()
-            drop_device_conn(name)
+            # v1.14.0 (п.10): если прибор вещает по UDP — он жив, а TCP мог отвалиться
+            # молча. Тогда не гасим availability и не рвём сокет, но продление
+            # ограничено потолком циклов (защита от «вечного online»).
+            udp_alive_now = False
+            if UDP_ENABLED:
+                try:
+                    udp_alive_now = udp_detect.is_alive(name)
+                except Exception:
+                    udp_alive_now = False
+
+            if udp_alive_now and udp_no_tcp_cycles < UDP_NO_TCP_MAX_CYCLES:
+                udp_no_tcp_cycles += 1
+                last_real_data = time.time()
+                log.debug(f"[Worker] {name}: UDP жив (идёт вещание), offline отложен "
+                          f"[{udp_no_tcp_cycles}/{UDP_NO_TCP_MAX_CYCLES}]")
+            else:
+                if last_online is not False:
+                    # v1.12.10: в тихих часах offline ожидаем — в DEBUG, без WARNING.
+                    _msg = (f"[Worker] {name}: нет данных "
+                            f"{int(time.time() - last_real_data)}с, offline")
+                    if _is_quiet_now(name):
+                        log.debug(_msg + " (тихие часы)")
+                    else:
+                        log.warning(_msg)
+                    publish_availability(dev, False)
+                    last_online = False
+                    consecutive_904 = 0   # v1.13.15: единообразно с 904-ветками
+                last_real_data = time.time()
+                udp_no_tcp_cycles = 0
+                drop_device_conn(name)
+                # v1.14.0: при включённом UDP — форс-реконнект TCP (общий cooldown),
+                # чтобы воркер пересоздал соединение штатным путём.
+                if UDP_ENABLED:
+                    try:
+                        if udp_detect.can_force_reconnect():
+                            request_worker_restart(name)
+                            log.info(f"[Worker] {name}: UDP-детектор → форс-реконнект TCP")
+                    except Exception:
+                        pass
+
+        # v1.14.0 (B): UDP-статус устройства → MQTT (retain) при смене,
+        # чтобы WebUI показал «UDP: жив/молчит».
+        if UDP_ENABLED:
+            try:
+                _now_udp = udp_detect.is_alive(name)
+                if _udp_alive_cache.get(name) != _now_udp:
+                    _udp_alive_cache[name] = _now_udp
+                    mqtt_client.publish(f"{TOPIC_PREFIX}/{name}/udp_alive",
+                                        "true" if _now_udp else "false",
+                                        qos=1, retain=True)
+            except Exception:
+                pass
 
         # receive() уже ждал 100мс, пауза снижает нагрузку на CPU/сеть
         if data is None:
@@ -6487,6 +7233,10 @@ def run_battery_listener(dev):
             f"работать. Проверь cap_add: [NET_RAW] в docker-compose."
         )
     log.info(f"[Battery] {name}: старт (ping {BATTERY_PING_INTERVAL}s)")
+    # v1.13.5: дверное (магнитное) устройство? — в dps_map есть DP с name == "door".
+    # У таких первый запрос после пробуждения — status() (см. окно ниже).
+    _is_door = any((info or {}).get("name") == "door"
+                   for info in (dev.get("dps_map") or {}).values())
 
     # DP для updatedps — все из dps_map
     dp_list = [int(dp) for dp in dev.get("dps_map", {}).keys() if str(dp).isdigit()]
@@ -6583,6 +7333,7 @@ def run_battery_listener(dev):
             last_err = None
             _answered = False
             _win_t0 = time.time()
+            _empty_tries = 0  # v1.13.6: подряд идущие пустые попытки (окно закроем после 3)
 
             try:
                 # v1.12.39: окно ограничено ВРЕМЕНЕМ, а не числом попыток.
@@ -6628,13 +7379,56 @@ def run_battery_listener(dev):
                         d.set_socketTimeout(BATTERY_UPDATEDPS_TIMEOUT)
                         dps = None
 
+                        # v1.13.5: ДВЕРНЫЕ (магнитные) — свежий DP отдаёт первый же запрос
+                        # после пробуждения. Пока устройство не уснуло, повторные
+                        # updatedps обычно возвращают пусто/старое. Поэтому на ПЕРВОЙ
+                        # попытке окна: 1) берём отчёт, если устройство прислало его само;
+                        # 2) иначе просим status(); 3) updatedps — только если DP ещё нет.
+                        if _is_door:  # v1.13.5: не только первая попытка — опрашиваем весь период бодрствования
+                            _pend = None
+                            try:
+                                _sock = getattr(d, "socket", None)
+                                if _sock is not None:
+                                    import select as _select
+                                    if _select.select([_sock], [], [], 0)[0]:
+                                        _pend = d.receive()
+                            except Exception as e:  # noqa: BLE001
+                                if DEBUG_BATTERY_TRACE:
+                                    log.info(f"[Battery] {name}: trace: pending err: {e}")
+                            if DEBUG_BATTERY_TRACE:
+                                log.info(
+                                    f"[Battery] {name}: trace: pending="
+                                    f"{json.dumps(_pend, ensure_ascii=False) if isinstance(_pend, dict) else _pend}"
+                                )
+                            if isinstance(_pend, dict):
+                                dps = _pend.get("dps") or None
+                            if not dps:
+                                _ts = time.time()
+                                try:
+                                    _sf = _status_socket(d, timeout=BATTERY_UPDATEDPS_TIMEOUT)
+                                except Exception as e:  # noqa: BLE001
+                                    _sf = None
+                                    if DEBUG_BATTERY_TRACE:
+                                        log.info(f"[Battery] {name}: trace: status-first err: {e}")
+                                if DEBUG_BATTERY_TRACE:
+                                    log.info(
+                                        f"[Battery] {name}: trace: status-first -> "
+                                        f"{json.dumps(_sf, ensure_ascii=False) if isinstance(_sf, dict) else _sf} "
+                                        f"({time.time() - _ts:.2f}s)"
+                                    )
+                                if (isinstance(_sf, dict) and "dps" in _sf
+                                        and "Error" not in _sf):
+                                    dps = _sf.get("dps") or None
+                                if isinstance(dps, dict) and not dps:
+                                    dps = None
+
                         # v1.12.39: сначала updatedps (0x12) — просим устройство
                         # отдать DP. Если ответа нет или он пустой, в ТОЙ ЖЕ
                         # попытке пробуем status() (0x0a) как fallback: на части
                         # батарейных PIR updatedps отдаёт None, а status даёт DP.
                         _t0 = time.time()
                         try:
-                            result = d.updatedps(dp_list)
+                            result = None if dps else d.updatedps(dp_list)
                         except Exception as e:
                             log.debug(f"[Battery] {name}: updatedps #{i + 1} err: {e}")
                             result = None
@@ -6678,6 +7472,22 @@ def run_battery_listener(dev):
                         if isinstance(dps, dict) and not dps:
                             dps = None
 
+                        if DEBUG_BATTERY_TRACE and _is_door:
+                            _dt = time.time() - _win_t0
+                            log.info(f"[Battery] {name}: trace: попытка {i}: "
+                                     f"dps={json.dumps(dps, ensure_ascii=False) if dps else None} "
+                                     f"({_dt:.2f}с окна)")
+
+                        # v1.13.5: отсеиваем невалидное — публикуем только DP, которые
+                        # описаны в dps_map устройства (чужие/мусорные ключи не публикуем;
+                        # если после фильтра пусто — ответ считаем невалидным).
+                        if isinstance(dps, dict):
+                            _known = dev.get("dps_map") or {}
+                            _kept = {k: v for k, v in dps.items() if k in _known}
+                            if dps and not _kept and DEBUG_BATTERY_TRACE:
+                                log.info(f"[Battery] {name}: trace: отсеяно невалидное {dps}")
+                            dps = _kept or None
+
                         if dps is not None:
                             got_dps = True
                             with _LAST_BATT_LOCK:
@@ -6710,14 +7520,27 @@ def run_battery_listener(dev):
                     finally:
                         _lock.release()
 
+                    # v1.13.5: НЕ закрываем окно после первого успеха. Пока устройство
+                    # бодрствует (отвечает на ping) — продолжаем спрашивать и публиковать
+                    # каждое валидное значение: так видны все переключения внутри одного
+                    # пробуждения (дверь пощёлкали — увидим каждое изменение).
                     if got_dps:
-                        # v1.12.39: как только данные получены — окно можно
-                        # закрывать. Раньше после status() окно закрывалось, а
-                        # после updatedps — нет, и лишние попытки могли
-                        # перезаписать состояние частичным ответом.
-                        break
-                    # v1.12.33: первые попытки — быстрее (успеть в короткое окно PIR).
-                    _wait = BATTERY_UPDATEDPS_FAST if i < 2 else BATTERY_UPDATEDPS_INTERVAL
+                        # v1.13.5: дверные — спрашиваем почти подряд (раунд-трип status ~1.0 с
+                        # ⇒ гарантированно ~1 замер в секунду); прочие — с паузой.
+                        _wait = (BATTERY_POLL_UP_INTERVAL_DOOR if _is_door
+                                 else BATTERY_POLL_UP_INTERVAL_OTHER)
+                        _empty_tries = 0
+                    else:
+                        # v1.12.33: первые попытки — быстрее (успеть в короткое окно PIR).
+                        _wait = BATTERY_UPDATEDPS_FAST if i < 2 else BATTERY_UPDATEDPS_INTERVAL
+                        # v1.13.6: три пустые попытки ПОДРЯД — устройство фактически спит
+                        # (на ping ещё отвечает, но DP не отдаёт): закрываем окно, чтобы
+                        # не тянуть его до BATTERY_WINDOW_SEC (в логах видели окна до 120 с).
+                        _empty_tries += 1
+                        if _empty_tries >= 3:
+                            log.info(f"[Battery] {name}: 3 пустые попытки подряд — "
+                                     f"закрываю окно ({time.time() - _win_t0:.0f}с)")
+                            break
                     if STOP_EVENT.wait(_wait):
                         break
 
@@ -6764,6 +7587,10 @@ def run_battery_listener(dev):
                               f"(updatedps + status, "
                               f"{time.time() - _win_t0:.1f}с)")
 
+                if DEBUG_BATTERY_TRACE:
+                    log.info(f"[Battery] {name}: trace: итог окна: got_dps={got_dps} "
+                             f"answered={_answered} last_err={last_err} попыток={i + 1} "
+                             f"за {time.time() - _win_t0:.1f}с")
                 # Закрываем соединение — устройство засыпает
                 drop_device_conn(name)
 
@@ -6992,6 +7819,21 @@ def main():
     if SWITCH_DEBOUNCER.window > 0:
         threading.Thread(target=debounce_worker, daemon=True,
                          name="switch-debounce").start()
+
+    # v1.14.0 (п.10): пассивный UDP-детектор — независимый признак «прибор жив».
+    if UDP_ENABLED:
+        _gwid_map = {d["id"]: d["name"] for d in devs_start
+                     if d.get("id") and not d.get("battery_powered", False)}
+        udp_detect.register_devices(_gwid_map)
+        threading.Thread(target=udp_detect.run,
+                         args=(STOP_EVENT, UDP_PORT, UDP_ALIVE_WINDOW,
+                               UDP_RECONNECT_COOLDOWN),
+                         daemon=True, name="udp-detect").start()
+        log.info(f"[Bridge] UDP-детектор включён: порт {UDP_PORT}, "
+                 f"устройств в карте {len(_gwid_map)}, "
+                 f"потолок offline-продления {UDP_NO_TCP_MAX_CYCLES} циклов")
+    else:
+        log.info("[Bridge] UDP-детектор выключен (UDP_ENABLED=0)")
 
     log.info(f"[Bridge] Запущено воркеров: {started} (из {len(devs_start)})")
 

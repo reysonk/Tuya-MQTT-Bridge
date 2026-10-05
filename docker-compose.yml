@@ -38,6 +38,13 @@ services:
       # 600 = включить защиту от спама кликов.
       - SWITCH_DEBOUNCE_MS=${SWITCH_DEBOUNCE_MS:-0}
       - SWITCH_DEBOUNCE_MAX_MS=${SWITCH_DEBOUNCE_MAX_MS:-1200}
+      # v1.14.0: пассивный UDP-детектор вещаний Tuya.
+      # 0 = выключен (мгновенный откат без пересборки образа).
+      - UDP_ENABLED=${UDP_ENABLED:-1}
+      - UDP_PORT=${UDP_PORT:-6667}
+      - UDP_ALIVE_WINDOW=${UDP_ALIVE_WINDOW:-30}
+      - UDP_NO_TCP_MAX_CYCLES=${UDP_NO_TCP_MAX_CYCLES:-3}
+      - UDP_RECONNECT_COOLDOWN=${UDP_RECONNECT_COOLDOWN:-120}
     healthcheck:
       test: ["CMD-SHELL", "grep -q 'main.py' /proc/1/cmdline && test -f /app/state/state_cache.json"]
       interval: 30s
