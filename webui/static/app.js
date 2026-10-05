@@ -5925,7 +5925,7 @@ async function importSelected() {
 
   // v1.27.6: пресет IP — по локальной подсети из конфига (fallback MQTT).
   const prefix = _guessSubnetPrefix();
-  const placeholder = prefix ? `${prefix}.100` : "192.168.0.100";
+  const placeholder = prefix ? `${prefix}.100` : "192.168.1.100";
   const preValue = prefix ? `${prefix}.` : "";
   const netHint = prefix ? `Сеть: ${prefix}.x` : "";
 
@@ -7853,7 +7853,8 @@ const HELP_TEXT = {
       <h3>Команды (Home Assistant → bridge)</h3>
       <ul>
         <li><code>tuya/light/&lt;dev&gt;/set</code> — JSON:
-            <code>{"state":"ON","brightness":180,"color_temp_kelvin":4000}</code>;</li>
+            <code>{"state":"ON","brightness":180,"color_temp":4000}</code>
+            (мост принимает и устаревший ключ <code>color_temp_kelvin</code>);</li>
         <li><code>tuya/switch/&lt;dev&gt;/&lt;entity&gt;/set</code> — <code>ON</code> или <code>OFF</code>;</li>
         <li><code>tuya/climate/&lt;dev&gt;/mode/set</code> — <code>off</code> или <code>heat</code>;</li>
         <li><code>tuya/climate/&lt;dev&gt;/temp/set</code> — уставка, число °C;</li>
@@ -7880,7 +7881,9 @@ const HELP_TEXT = {
       <h3>Состояние (bridge → Home Assistant)</h3>
       <ul>
         <li><code>tuya/light/&lt;dev&gt;/state</code> — JSON:
-            <code>{state, brightness, color_mode, color, color_temp_kelvin}</code>;</li>
+            <code>{state, brightness, color_mode, color, color_temp}</code>
+            (<code>color_temp</code> — в Кельвинах, discovery ставит
+            <code>color_temp_kelvin: true</code>);</li>
         <li><code>tuya/switch/&lt;dev&gt;/&lt;entity&gt;/state</code> — <code>ON</code> или <code>OFF</code>;</li>
         <li><code>tuya/climate/&lt;dev&gt;/mode/state</code> — <code>off</code> или <code>heat</code>;</li>
         <li><code>tuya/climate/&lt;dev&gt;/temp/state</code> — уставка;</li>

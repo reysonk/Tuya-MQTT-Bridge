@@ -52,17 +52,17 @@ def _env_int(name, default):
         return default
 
 
-MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.0.3"
+MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.1.10"
 MQTT_PORT = _env_int("MQTT_PORT", 1883)
 MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 WEBUI_PORT = _env_int("WEBUI_PORT", 5386)
 WEBUI_HOST = os.getenv("WEBUI_HOST") or "0.0.0.0"
-WEBUI_VERSION = "1.34.4"
+WEBUI_VERSION = "1.34.5"
 # v1.32.33: публичный номер релиза (совпадает с тегом релиза на GitHub).
 # Подвал показывает «Release X», а WebUI сверяет по нему наличие новой версии.
-RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.3"
+RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.3.1"
 
 # v1.32.34: проверка «есть ли релиз новее» на GitHub (публичный репозиторий, без токена;
 # GITHUB_TOKEN поддержан на случай, если репозиторий останется приватным).
@@ -845,7 +845,7 @@ def _check_tz_for_quiet():
         # явно UTC/GMT и НЕ задан TZ через env.
         env_tz = os.environ.get("TZ", "")
         if off_h == 0 and off_m == 0 and not env_tz and tzname.upper() in ("UTC", "GMT"):
-            log.warning("[Quiet] TZ=UTC — проверь docker-compose (TZ=Asia/Novosibirsk)")
+            log.warning("[Quiet] TZ=UTC — проверь docker-compose (TZ в docker-compose)")
     except Exception as e:
         log.warning(f"[Quiet] TZ check: {e}")
 

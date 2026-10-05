@@ -50,7 +50,7 @@ def _env_int(name, default):
         return default
 
 
-MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.0.3"
+MQTT_BROKER = os.getenv("MQTT_BROKER") or "192.168.1.10"
 MQTT_PORT = _env_int("MQTT_PORT", 1883)
 MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
@@ -187,7 +187,7 @@ _LEGACY_ORPHAN_FALLBACK = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.14.1"
+DISCOVERY_VERSION = "1.14.2"
 RETAINED_DUP_WINDOW = 10
 
 # v1.12.32: пул команд — per-device (DEVICE_EXECS, команды и повторы отдельно),
@@ -6493,7 +6493,12 @@ def publish_state(device, dps):
         elif has_temp:
             state["color_mode"] = "color_temp"
             if color_temp_val is not None:
-                state["color_temp_kelvin"] = color_temp_val
+                # HA (MQTT light, schema=json) читает температуру из ключа
+                # "color_temp": флаг discovery color_temp_kelvin лишь говорит,
+                # что ЗНАЧЕНИЕ в Кельвинах. С ключом "color_temp_kelvin" HA
+                # ловит KeyError и сыпет "Invalid or incomplete color value
+                # '<весь словарь>' received for entity light.<name>".
+                state["color_temp"] = color_temp_val
         else:
             state["color_mode"] = "brightness"
 
