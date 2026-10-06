@@ -11013,7 +11013,7 @@ const _DC_ALLOWED = [
 const _SC_ALLOWED = ["measurement","total","total_increasing"];
 const _LIGHT_DP_NAMES_FRONT = [
   "switch_led","bright_value","temp_value",
-  "colour_data","colour_data_v2","work_mode",
+  "colour_data","colour_data_v2","work_mode","scene",
 ];
 
 // v1.27.1: эвристика device_class/unit по code (когда Cloud не дал).

@@ -187,7 +187,7 @@ _LEGACY_ORPHAN_FALLBACK = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.14.2"
+DISCOVERY_VERSION = "1.14.7"
 RETAINED_DUP_WINDOW = 10
 
 # v1.12.32: пул команд — per-device (DEVICE_EXECS, команды и повторы отдельно),
@@ -347,9 +347,11 @@ STATE_CLASSES_ALLOWED = {
 # Из publish_light: switch_led, bright_value, temp_value, colour_data.
 # colour_data_v2 и work_mode — задел, не используются в publish_light,
 # но допустимы в конфиге.
+# v1.14.5: scene — select-сцены (DP 51 и т.п.); публикуются generic-веткой
+# select (см. publish_discovery/publish_state).
 LIGHT_DP_NAMES = {
     "switch_led", "bright_value", "temp_value",
-    "colour_data", "colour_data_v2", "work_mode",
+    "colour_data", "colour_data_v2", "work_mode", "scene",
 }
 
 # Обязательные DP для type=climate (жёстко не требуем, но предупреждаем).
@@ -1790,6 +1792,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
         client.publish(f"{TOPIC_PREFIX}/bridge/status", "online", qos=1, retain=True)
         client.publish(f"{TOPIC_PREFIX}/bridge/version", DISCOVERY_VERSION, qos=1, retain=True)
         client.subscribe(f"{TOPIC_PREFIX}/light/+/set")
+        client.subscribe(f"{TOPIC_PREFIX}/light/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/switch/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/climate/+/+/set")
         client.subscribe(f"{TOPIC_PREFIX}/select/+/+/set")
@@ -2172,7 +2175,10 @@ def process_command(dev, component, parts, cmd):
         try:
             tuya = get_device_conn(dev)
             if component == "light":
-                handle_light_command(tuya, dev, cmd)
+                if len(parts) >= 5 and parts[3] == "work_mode":
+                    handle_light_work_mode_command(tuya, dev, cmd)
+                else:
+                    handle_light_command(tuya, dev, cmd)
             elif component == "switch":
                 handle_switch_command(tuya, dev, parts, cmd)
             elif component == "climate":
@@ -2255,7 +2261,7 @@ CMD_PENDING_LOCK = threading.Lock()
 _NO_RETRY_NAMES = {"bright_value", "temp_value", "colour_data", "temp_set"}
 
 
-def _publish_pending(dev_name, pending):
+def _publish_pending(dev_name, pending, dev=None):
     """v1.13.10: признак «команда ещё не подтверждена» отдельным retained-топиком.
 
     HA при наличии state_topic пессимистична и нашу предпубликацию считает
@@ -2264,14 +2270,35 @@ def _publish_pending(dev_name, pending):
     способ проверять ФАКТ, без таймеров и guard-ов:
       {{ not is_state_attr('switch.vykliuchatel_..._switch_2', 'pending', true) }}
     Публикуем в оба вида топика (light/switch) — подписан только один.
+
+    v1.14.3: если передано устройство и в нём есть DP work_mode — кладём его
+    значение в тот же JSON (топик подключён к сущности light как
+    json_attributes_topic). Семантика pending не меняется.
     """
-    payload = json.dumps({"pending": bool(pending)}, ensure_ascii=True)
+    payload = {"pending": bool(pending)}
+    if dev is not None:
+        dp_work, info_work = find_dp_by_name(dev, "work_mode")
+        if dp_work is not None:
+            with STATE_LOCK:
+                cached = STATE_CACHE.get(dev_name, {})
+            val = cached.get(dp_work)
+            if val is not None:
+                payload["work_mode"] = val
+                if info_work is not None and info_work.get("options"):
+                    payload["work_mode_text"] = str(val)
+    payload = json.dumps(payload, ensure_ascii=True)
     for comp in ("light", "switch"):
         try:
             mqtt_client.publish(f"{TOPIC_PREFIX}/{comp}/{dev_name}/pending",
                                 payload, qos=0, retain=True)
         except Exception as e:
             log.debug(f"[Pending] {dev_name}: {e}")
+
+
+def _pending_any(dev_name):
+    """v1.14.3: есть ли хотя бы один неподтверждённый DP у устройства."""
+    with CMD_PENDING_LOCK:
+        return bool(CMD_PENDING.get(dev_name))
 
 
 def _pending_mark(dev, updates):
@@ -2290,7 +2317,7 @@ def _pending_mark(dev, updates):
             d[str(dp)] = {"v": v, "ts": now, "tries": 0}
             marked = True
     if marked:
-        _publish_pending(name, True)   # v1.13.10: HA видит «не подтверждено»
+        _publish_pending(name, True, dev)   # v1.13.10: HA видит «не подтверждено»
 
 
 def _pending_clear(dev_name, dp):
@@ -2304,7 +2331,12 @@ def _pending_clear(dev_name, dp):
             CMD_PENDING.pop(dev_name, None)
             empty = True
     if empty:
-        _publish_pending(dev_name, False)   # v1.13.10: подтверждено — снимаем признак
+        # v1.13.10: подтверждено — снимаем признак
+        # v1.14.3: dev нужен для атрибута work_mode; публикуем ВСЕГДА, даже если
+        # устройство уже не найдено (иначе retained pending:true зависнет навсегда)
+        with DEVICES_LOCK:
+            dev = DEVICE_INDEX.get(dev_name)
+        _publish_pending(dev_name, False, dev)
 
 
 def _pending_active(dev_name, dp):
@@ -2973,6 +3005,24 @@ def handle_light_command(tuya, dev, cmd):
                 tuya.set_value(dp, v)
             except Exception as ee:
                 log.warning(f"[Light] set_value({dp}) failed: {ee}")
+
+
+def handle_light_work_mode_command(tuya, dev, cmd):
+    """v1.14.4: HA MQTT select для DP work_mode ленты."""
+    dp_str, info = find_dp_by_name(dev, "work_mode")
+    if dp_str is None:
+        return
+    dp = dp_int(dp_str)
+    if dp is None:
+        return
+
+    val = str(cmd).strip('"')
+    options = info.get("options") if info and info.get("options") else ["white", "colour", "scene", "music"]
+    if val not in options:
+        log.debug(f"[Light] {dev['name']}: игнорирую work_mode='{val}' (допустимы {options})")
+        return
+
+    debounced_set(tuya, dev, dp, val, window_ms=0, component="select")
 
 
 def switch_dp_val(dev, topic_parts, cmd):
@@ -4292,6 +4342,7 @@ def _remove_discovery_for_device(dev):
 
     if dtype == "light":
         discovery_topics.append(_config_topic("light", f"{dev_name}_light"))
+        discovery_topics.append(_config_topic("select", f"{dev_name}_work_mode"))
         state_topics.append(f"{TOPIC_PREFIX}/light/{dev_name}/state")
     elif dtype == "climate":
         discovery_topics.append(_config_topic("climate", f"{dev_name}_climate"))
@@ -5786,6 +5837,36 @@ def device_entities(dev, sources=("phase_a",)):
             source="light",
         ))
 
+    if "light" in want:
+        # v1.14.4: для лент с DP work_mode публикуем отдельный MQTT select,
+        # чтобы HA мог переключать режим (white/colour/scene/music).
+        dp_work, info_work = find_dp_by_name(dev, "work_mode")
+        if dp_work is not None:
+            options = info_work.get("options") if info_work and info_work.get("options") else ["white", "colour", "scene", "music"]
+            unique_id = f"{dev_name}_work_mode"
+            state_topic = f"{TOPIC_PREFIX}/light/{dev_name}/pending"
+            config = {
+                "name": "work_mode",
+                "unique_id": unique_id,
+                "command_topic": f"{TOPIC_PREFIX}/light/{dev_name}/work_mode/set",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.work_mode }}",
+                "command_template": "{{ value }}",
+                "options": options,
+                "optimistic": False,
+                "expire_after": AVAILABILITY_EXPIRE,
+                "device": device_info,
+                **avail,
+            }
+            specs.append(EntitySpec(
+                component="select",
+                unique_id=unique_id,
+                config=config,
+                state_topic=state_topic,
+                log_tag=f"[Discovery] select: {friendly} / work_mode ({options})",
+                source="light",
+            ))
+
     if "climate" in want:
         # v2.0 (increment 6): the branch that used to be the whole
         # publish_climate. ONE spec per device.
@@ -6224,6 +6305,11 @@ def publish_discovery(device):
 
     if dev_type == "light":
         publish_light(device, device_info)
+        # v1.14.5: свет публикует и прочие select-DP (например «Сцена»).
+        # work_mode у света — отдельная ветка (light/work_mode/set + pending),
+        # его generic-двойник пропускаем, чтобы не перебить.
+        publish_selects(device, device_info,
+                        skip_unique_ids={f"{device['name']}_work_mode"})
     elif dev_type == "switch":
         publish_switches(device, device_info)
         publish_selects(device, device_info)
@@ -6231,6 +6317,9 @@ def publish_discovery(device):
         publish_sensors(device, device_info)
     elif dev_type == "climate":
         publish_climate(device, device_info)
+        # v1.14.6 (#767): климат дополнительно публикует прочие sensor/binary_sensor DP
+        # (fault и пр.) — иначе аварийный DP не доходит до HA.
+        publish_sensors(device, device_info)
     elif dev_type == "cover":
         publish_cover(device, device_info)
     elif dev_type == "fan":
@@ -6262,7 +6351,7 @@ def publish_light(device, device_info):
     # outside this patch. Topic and JSON are now built in one place:
     # _config_topic + json.dumps.
     # v1.13.10: чистый retained-признак pending при (ре)публикации Discovery
-    _publish_pending(device["name"], False)
+    _publish_pending(device["name"], False, device)
     for spec in device_entities(device, ("light",)):
         mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
                             json.dumps(spec.config,
@@ -6278,7 +6367,7 @@ def publish_switches(device, device_info):
     # call signature and it is outside this patch. Topic and JSON are now
     # built in one place: _config_topic + json.dumps.
     # v1.13.10: чистый retained-признак pending при (ре)публикации Discovery
-    _publish_pending(device["name"], False)
+    _publish_pending(device["name"], False, device)
     for spec in device_entities(device, ("switch",)):
         mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
                             json.dumps(spec.config,
@@ -6287,13 +6376,17 @@ def publish_switches(device, device_info):
         log.info(spec.log_tag)
 
 
-def publish_selects(device, device_info):
+def publish_selects(device, device_info, skip_unique_ids=()):
     # v2.0 (increment 3): publication goes through device_entities(device).
     # device_info is no longer used (the registry builds an identical one,
     # byte-for-byte) but the parameter stays: publish_discovery owns the
     # call signature and it is outside this patch. Topic and JSON are now
     # built in one place: _config_topic + json.dumps.
+    # v1.14.5: skip_unique_ids — не перебивать сущности, которые публикует
+    # отдельная ветка (у света так идёт work_mode).
     for spec in device_entities(device, ("select",)):
+        if spec.unique_id in skip_unique_ids:
+            continue
         mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
                             json.dumps(spec.config,
                                        ensure_ascii=spec.ensure_ascii),
@@ -6437,6 +6530,20 @@ def publish_state(device, dps):
     with STATE_LOCK:
         cached = dict(STATE_CACHE.get(dev_name, {}))
 
+    # v1.14.7 (#779): у части устройств (WiFi Breaker, ver 3.4) прошивка НЕ шлёт
+    # по LAN нулевой bitmap-аварии (fault) — DP отсутствует в отчёте вообще, и
+    # сущность HA висит unavailable. Публикуем дефолт «нет аварии» для
+    # ОТСУТСТВУЮЩИХ fault/problem-DP. Реальное значение (когда устройство
+    # пришлёт DP) перекроет дефолт в ветках ниже.
+    for dp_str, info in dps_map.items():
+        if dp_str in cached:
+            continue
+        if info.get("component") not in ("sensor", "binary_sensor"):
+            continue
+        if info.get("name") not in ("fault", "problem"):
+            continue
+        _publish_sensor_value(dev_type, dev_name, dp_str, info, 0)
+
     # v1.10.20: lock — DP-компонент, публикуется независимо от типа устройства.
     for dp_str, info in dps_map.items():
         if info.get("component") == "lock" and dp_str in cached:
@@ -6478,6 +6585,8 @@ def publish_state(device, dps):
                 json.dumps({"state": "OFF"}),
                 retain=True,
             )
+            if find_dp_by_name(device, "work_mode")[0] is not None:
+                _publish_pending(dev_name, _pending_any(dev_name), device)
             return
 
         if has_bright and brightness_val is None:
@@ -6507,6 +6616,25 @@ def publish_state(device, dps):
             json.dumps(state),
             retain=True,
         )
+        if find_dp_by_name(device, "work_mode")[0] is not None:
+            _publish_pending(dev_name, _pending_any(dev_name), device)
+        # v1.14.5: состояния generic-select у света (work_mode идёт отдельной
+        # веткой через pending, его не дублируем).
+        for dp_str, info in dps_map.items():
+            if info.get("component") != "select":
+                continue
+            if info.get("name") == "work_mode":
+                continue
+            if dp_str not in cached:
+                continue
+            sval = str(cached[dp_str])
+            smap = get_select_map(info)
+            if smap:
+                sval = smap.get(sval, sval)
+            mqtt_client.publish(
+                f"{TOPIC_PREFIX}/select/{dev_name}/{info.get('name')}/state",
+                sval, retain=True,
+            )
         return
 
     if dev_type == "switch":
@@ -6602,6 +6730,11 @@ def publish_state(device, dps):
             preset_map = device.get("preset_map", {})
             preset_ha = preset_map.get(preset, preset)
             mqtt_client.publish(f"{TOPIC_PREFIX}/climate/{dev_name}/preset/state", preset_ha, retain=True)
+        # v1.14.6 (#767): публикуем состояния sensor/binary_sensor DP климата
+        # (fault и пр.) — как это делает ветка switch.
+        for dp_str, info in dps_map.items():
+            if dp_str in cached and info.get("component") in ("sensor", "binary_sensor"):
+                _publish_sensor_value(dev_type, dev_name, dp_str, info, cached[dp_str])
         return
 
     if dev_type == "cover":

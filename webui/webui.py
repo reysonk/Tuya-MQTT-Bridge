@@ -59,10 +59,10 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 WEBUI_PORT = _env_int("WEBUI_PORT", 5386)
 WEBUI_HOST = os.getenv("WEBUI_HOST") or "0.0.0.0"
-WEBUI_VERSION = "1.34.5"
+WEBUI_VERSION = "1.34.6"
 # v1.32.33: публичный номер релиза (совпадает с тегом релиза на GitHub).
 # Подвал показывает «Release X», а WebUI сверяет по нему наличие новой версии.
-RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.3.1"
+RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.3.2"
 
 # v1.32.34: проверка «есть ли релиз новее» на GitHub (публичный репозиторий, без токена;
 # GITHUB_TOKEN поддержан на случай, если репозиторий останется приватным).
@@ -3894,10 +3894,14 @@ def collect_health():
 def render_html():
     analytics_js = "true" if ANALYTICS_ENABLED else "false"
     status_js = "true" if STATUS_HISTORY_ENABLED else "false"
+    with STATE_LOCK:
+        _bridge_ver = STATE.get("version") or "?"
     return (load_index_template()
             .replace("__ANALYTICS_ENABLED__", analytics_js)
             .replace("__STATUS_HISTORY_ENABLED__", status_js)
             .replace("__WEBUI_VERSION__", WEBUI_VERSION)
+            # v1.34.6: в подвал — внутренняя версия моста (Dev), рядом с публичным релизом.
+            .replace("__BRIDGE_VERSION__", _bridge_ver)
             # v1.32.33: публичный номер релиза — для подвала и сверки с GitHub.
             .replace("__RELEASE_TAG__", RELEASE_TAG)
             # v1.27.6: подсеть MQTT — fallback для пресета IP-префикса.
