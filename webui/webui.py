@@ -59,10 +59,15 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 WEBUI_PORT = _env_int("WEBUI_PORT", 5386)
 WEBUI_HOST = os.getenv("WEBUI_HOST") or "0.0.0.0"
-WEBUI_VERSION = "1.34.6"
+WEBUI_VERSION = "1.34.7"
 # v1.32.33: публичный номер релиза (совпадает с тегом релиза на GitHub).
 # Подвал показывает «Release X», а WebUI сверяет по нему наличие новой версии.
-RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.3.2"
+# v1.34.7: X1 — ВАЖНО: публичные теги релизов — САМА нумерация (v1.4),
+# а не внутренняя версия WebUI: на GitHub latest = v1.4 (внутри Bridge
+# 1.14.24 / WebUI 1.34.7). Дефолт = текущий публичный тег: сравнение
+# (1,3,x) > (1,34,7) всегда False — значок нового релиза молчал бы.
+# Переопределение через env RELEASE_TAG сохраняется.
+RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.4"
 
 # v1.32.34: проверка «есть ли релиз новее» на GitHub (публичный репозиторий, без токена;
 # GITHUB_TOKEN поддержан на случай, если репозиторий останется приватным).
@@ -2118,7 +2123,8 @@ def _scan_extended(subnet_prefix):
         return entry
 
     results = []
-    with ThreadPoolExecutor(max_workers=32) as pool:
+    # v1.34.7: W5 — именованные потоки для диагностики (трейсбеки/ps).
+    with ThreadPoolExecutor(max_workers=32, thread_name_prefix="scan-ext") as pool:
         for r in pool.map(scan_one, ips):
             if r:
                 results.append(r)
@@ -2585,14 +2591,26 @@ def _fetch_mappings_for_devices(cloud, device_ids, retries=1):
 
 
 CLOUD_FETCH_TIMEOUT = 60   # v1.22.6: глобальный таймаут Cloud-запросов
+# v1.34.7: W1 — слоты одновременных облачных запросов. Поток после таймаута
+# нельзя убить: он продолжает работать и держать соединение; семафор не даёт
+# таким «зомби» накопиться без ограничения. Слот освобождает сам поток
+# (finally в _runner); при старте потока слот освобождает вызывающий.
+CLOUD_FETCH_SLOTS = threading.Semaphore(3)
 
 
 def _cloud_fetch_with_timeout(access_id, access_secret, region,
                               fetch_mappings=True, timeout=CLOUD_FETCH_TIMEOUT):
     """v1.22.6: обёртка tuya_cloud_fetch в отдельный поток с join(timeout).
     Защищает воркер ThreadingHTTPServer от вечного зависания, если
-    Tuya Cloud недоступен или tinytuya.requests висит без таймаута."""
+    Tuya Cloud недоступен или tinytuya.requests висит без таймаута.
+    v1.34.7: W1 — поток после таймаута переживает вызывающего (нельзя
+    убить), поэтому: (1) слот CLOUD_FETCH_SLOTS ограничивает их число,
+    (2) момент фактического завершения такого потока логируется."""
+    if not CLOUD_FETCH_SLOTS.acquire(timeout=0.5):
+        log.warning("[Cloud] fetch: все слоты заняты — отклоняем запрос (W1)")
+        return {"ok": False, "error": "busy: cloud fetch уже выполняется"}
     result_box = {"result": None}
+    timed_out = threading.Event()
 
     def _runner():
         try:
@@ -2600,12 +2618,22 @@ def _cloud_fetch_with_timeout(access_id, access_secret, region,
                                                      fetch_mappings=fetch_mappings)
         except Exception as e:
             result_box["result"] = {"ok": False, "error": f"cloud fetch exception: {e}"}
+        finally:
+            CLOUD_FETCH_SLOTS.release()
+            if timed_out.is_set():
+                log.info("[Cloud] fetch-поток завершён ПОСЛЕ таймаута — слот освобождён")
 
     t = threading.Thread(target=_runner, daemon=True, name="cloud-fetch")
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        CLOUD_FETCH_SLOTS.release()   # v1.34.7: слот не должен утечь
+        raise
     t.join(timeout=timeout)
     if t.is_alive():
-        log.warning(f"[Cloud] fetch timeout {timeout}s — возвращаем ошибку")
+        timed_out.set()
+        log.warning(f"[Cloud] fetch timeout {timeout}s — возвращаем ошибку, "
+                    f"поток доработает в фоне (слот освободит сам)")
         return {"ok": False, "error": f"timeout {timeout}s (Tuya Cloud недоступен)"}
     return result_box["result"] or {"ok": False, "error": "empty result"}
 
@@ -2791,6 +2819,12 @@ def load_cloud_cache():
             _CLOUD_CACHE_MEM["data"] = data
             return data
         except Exception as e:
+            # v1.34.7: W6 — типовые причины: OSError (файл заменён/удалён
+            # внешним редактором между getmtime и open) и json.JSONDecodeError
+            # (запись в процессе). Сбрасываем кэш, чтобы не отдавать
+            # устаревшие данные при повторных опросах.
+            _CLOUD_CACHE_MEM["mtime"] = None
+            _CLOUD_CACHE_MEM["data"] = None
             log.warning(f"[CloudCache] load: {e}")
             return None
 
@@ -3692,7 +3726,12 @@ def audit_log(op, device=None, changes=None, ok=True, error=None, extra=None):
             entry.update(extra)
         line = json.dumps(entry, ensure_ascii=False)
         with _config_audit_lock:
-            rotation_failed = False
+            # v1.34.7: W3 — запись ПЕРЕД ротацией: раньше упавший os.replace
+            # в ротации приводил к пропуску записи (потеря события аудита).
+            # Теперь пишем всегда; ошибка ротации логируется и повторится
+            # со следующей записью — запись не блокируется.
+            with open(CONFIG_AUDIT_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
             try:
                 if (os.path.exists(CONFIG_AUDIT_FILE)
                         and os.path.getsize(CONFIG_AUDIT_FILE) > AUDIT_MAX_BYTES):
@@ -3715,13 +3754,12 @@ def audit_log(op, device=None, changes=None, ok=True, error=None, extra=None):
                             os.replace(src, dst)
                     os.replace(CONFIG_AUDIT_FILE, f"{CONFIG_AUDIT_FILE}.1")
             except Exception as e:
-                # v1.22.6: если ротация упала — НЕ пишем в исходный файл,
-                # иначе он растёт без ограничений. Логируем и выходим.
-                rotation_failed = True
-                log.error(f"[Audit] rotate FAILED — запись пропущена: {e}")
-            if not rotation_failed:
-                with open(CONFIG_AUDIT_FILE, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                # v1.22.6: раньше при упавшей ротации запись пропускалась,
+                # чтобы файл не рёс без ограничений.
+                # v1.34.7: ОТМЕНЕНО (W3): запись уже сделана ДО ротации —
+                # теперь только логируем, ротация повторится со следующей
+                # записью (данные не теряем).
+                log.error(f"[Audit] rotate FAILED — запись сохранена, ротация пропущена: {e}")
     except Exception as e:
         log.warning(f"[Audit] write: {e}")
 
@@ -4161,6 +4199,20 @@ class WebUIHandler(BaseHTTPRequestHandler):
             # v1.32.2: тяжёлые enrich/quiet считаем ВНЕ STATE_LOCK. Раньше лок
             # держался на весь цикл (файлы, вложенные локи) — MQTT-поток ждал
             # и статусы устройств «залипали».
+            # v1.34.7: W4 — снапшоты quiet/latency_reason снимаем ОДИН раз
+            # на устройство в лёгком пред-цикле: раньше в горячий цикл enrich
+            # (файлы/кэши) были вложены 4 захвата QUIET_LOCK на устройство
+            # (_ping_hidden_reason→is_quiet_now, is_quiet_now, quiet_until_ts,
+            # quiet_windows_of). Теперь цикл enrich читает только снапшот.
+            _quiet_snap = {}
+            for _name in _all_names:
+                _lat = _ping_hidden_reason(_name)
+                _quiet_snap[_name] = {
+                    "latency_reason": _lat,
+                    "quiet": is_quiet_now(_name),
+                    "quiet_until": quiet_until_ts(_name),
+                    "quiet_windows": quiet_windows_of(_name),
+                }
             for name in sorted(_all_names):
                 info = _devs_snap.get(name, {})
                 m = meta_snap.get(name, {})
@@ -4179,7 +4231,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 )
                 # v1.28.19: вычисляем причину один раз (был 3x вызов
                 # get_device_meta + is_quiet_now на каждое устройство).
-                _lat_reason = _ping_hidden_reason(name)
+                # v1.34.7: W4 — берём из снапшота пред-цикла (см. выше).
+                _qs = _quiet_snap.get(name, {})
+                _lat_reason = _qs.get("latency_reason")
                 status["devices"].append({
                     "name": name, "friendly_name": m.get("friendly_name", name),
                     "type": m.get("type", "unknown"), "model": m.get("model", ""),
@@ -4215,9 +4269,11 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     # v1.32.2: поле "history" убрано — его никто не читал
                     # (историю подтягивает сам UI из своего кэша).
                     "cache": info.get("cache", {}),
-                    "quiet": is_quiet_now(name),
-                    "quiet_until": quiet_until_ts(name),
-                    "quiet_windows": quiet_windows_of(name),
+                    # v1.34.7: W4 — из снапшота (один захват QUIET_LOCK
+                    # на устройство в пред-цикле, а не три в цикле enrich).
+                    "quiet": _qs.get("quiet", False),
+                    "quiet_until": _qs.get("quiet_until", 0),
+                    "quiet_windows": _qs.get("quiet_windows", []),
                 })
             # v1.22.1: безопасный sort по friendly_name (str + fallback)
             status["devices"].sort(
@@ -5199,8 +5255,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
         try:
             if since == 0:
                 with _log_buffer_lock: backlog = list(_log_buffer)[-SSE_BACKLOG:]
-                for item in backlog:
-                    if item["seq"] > since: self._sse_write(item)
+                # v1.34.7: W2 — обрыв клиента при отдаче бэклога не должен
+                # ронять обработчик с трейсбеком: ловим и завершаем сессию
+                # (finally отпишет очередь SSE).
+                try:
+                    for item in backlog:
+                        if item["seq"] > since: self._sse_write(item)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
             last_ping = time.time(); last_act = time.time()
             while not STOP_EVENT.is_set():
                 if time.time() - last_ping > 10:

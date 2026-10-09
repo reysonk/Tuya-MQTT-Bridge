@@ -30,6 +30,13 @@ seen = {"ok": False}
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
+    # v1.14.8: H1 — при ошибке коннекта (rc != 0) не подписываемся:
+    # paho сам повторит соединение, а subscribe при провале коннекта
+    # бессмыслен и засоряет лог. rc — int (paho 1.x) или ReasonCode (2.x).
+    _rc = getattr(rc, "value", rc)
+    if _rc != 0:
+        print(f"healthcheck: connect rc={_rc} — подписи нет")
+        return
     client.subscribe(TOPIC, qos=0)
 
 

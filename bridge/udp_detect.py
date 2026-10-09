@@ -203,7 +203,7 @@ def run(stop_event, port=6667, alive_window=30, reconnect_cooldown=120):
             prev = known_ip.get(gwid)
             if prev != src_ip:
                 known_ip[gwid] = src_ip
-                log.info("[UDP] %s (gwId %s) вещает с %s", name, gwid, src_ip)
+                log.debug("[UDP] %s (gwId %s) вещает с %s", name, gwid, src_ip)
     finally:
         try:
             sock.close()

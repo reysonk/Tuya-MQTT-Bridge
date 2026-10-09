@@ -1,5 +1,5 @@
 # Tuya WiFi → MQTT Bridge → Home Assistant
-> Bridge **1.14.2** / WebUI **1.34.5
+> Bridge **1.14.24** / WebUI **1.34.7
 
 Локальный мост **Tuya WiFi → MQTT** для Home Assistant.
 Работает **без Tuya Cloud**: устройства опрашиваются напрямую по локальной сети

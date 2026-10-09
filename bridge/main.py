@@ -187,7 +187,7 @@ _LEGACY_ORPHAN_FALLBACK = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.14.7"
+DISCOVERY_VERSION = "1.14.24"
 RETAINED_DUP_WINDOW = 10
 
 # v1.12.32: пул команд — per-device (DEVICE_EXECS, команды и повторы отдельно),
@@ -256,12 +256,23 @@ LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 2
 
 DEBOUNCE_BY_TYPE = {
-    "bright_value": 150,
+    # v1.14.20 (08.10.2026 20:36): ползунок яркости шлёт значение на каждое движение (~10-20 событий/с).
+    # 150 мс не успевали склеивать серию, поэтому в очередь устройства пачка команд, а не одна;
+    # плюс к этому однопоточная очередь (DEVICE_EXECS max_workers=1, см. get_device_exec) —
+    # отсюда «2-е задумалось, 3-е тоже». 300 мс склеивает серию в одно значение; последнее
+    # (актуальное) всегда побеждает, поэтому ход ползунка не «залипает».
+    "bright_value": 300,
     "temp_value":   150,
     "colour_data":  150,
     "temp_set":     300,
     "number":       500,
 }
+
+# v1.14.20 (08.10.2026 20:36): сколько раз отложенная команда может переждать занятый cmd-лок,
+# прежде чем быть признана потерянной. При частых тыках по ползунку лок держит предыдущая
+# команда (ответ облака Tuya). v1.14.22: каждая попытка = окно дебаунса (300 мс) + таймаут
+# лока (1 с) — суммарно до ~7.8 с, что покрывает медленный ack (p90 2-3 с) с запасом.
+DEBOUNCE_RETRY_MAX = 6
 
 CACHE_SNAPSHOT_ENABLED = True
 
@@ -498,6 +509,12 @@ WORKER_START_LOCK = threading.Lock()
 STATE_CACHE = {d["name"]: {} for d in DEVICES}
 BATTERY_LAST_UP = {}   # v1.10.0: {name: unix_ts} — persist battery last UP
 STATE_LOCK = threading.Lock()
+# v1.14.24: DP, чьё значение в STATE_CACHE — НАША оптимистичная догадка (команда отправлена,
+# но прибор ещё не прислал этот DP). Пока DP здесь, команда с совпадающим значением НЕ считается
+# no-op: кэш мог разойтись с прибором (мост OFF, люстра физически ON), и такую команду надо
+# доставить и проверить, иначе выключить из HA невозможно (карточка #1039). Метка снимается,
+# когда прибор реально присылает этот DP (см. _state_confirm).
+STATE_UNCONFIRMED = {}
 
 STOP_EVENT = threading.Event()
 START_TIME = time.time()
@@ -564,6 +581,34 @@ log.info(f"[Config] CONFIG_FILE = {os.path.abspath(CONFIG_FILE)}")
 # Теперь bridge сам их удаляет.
 
 
+def _published_entity_wants(dev):
+    """v1.14.11: какие наборы компонентов публикует publish_discovery для этого типа.
+
+    Источник истины — сама publish_discovery (см. её диспетчер). Раньше
+    ожидаемый набор в `_discovery_topics_for_device` строился отдельной
+    ручной таблицей, и она расходилась с реальностью: light публикует
+    select-сцены, climate — sensor/binary_sensor (v1.14.6), а ожидаемые
+    списки это не учитывали → стартовая orphan-чистка сносила живые
+    сущности (сцены ленты, sensor'ы тёплых полов у climate).
+    """
+    dtype = dev.get("type", "sensor")
+    wants = [("lock",)]              # v1.10.20: lock — для любого типа
+    if dtype == "light":
+        wants += [("light",), ("select",)]
+    elif dtype == "switch":
+        wants += [("switch",), ("select",), ("number",),
+                  ("sensor",), ("binary_sensor",)]
+    elif dtype == "climate":
+        wants += [("climate",), ("sensor",), ("binary_sensor",)]
+    elif dtype == "cover":
+        wants += [("cover",)]
+    elif dtype == "fan":
+        wants += [("fan",)]
+    else:
+        wants += [("sensor",), ("binary_sensor",)]
+    return wants
+
+
 def _discovery_topics_for_device(dev):
     """Полный список Discovery-топиков, которые публикует publish_discovery(dev).
 
@@ -585,48 +630,26 @@ def _discovery_topics_for_device(dev):
         for suffix in ("voltage", "current", "power"):
             topics.add(_config_topic("sensor", f"{dev_name}_output_{suffix}"))
 
-    # light / climate / cover / fan — свои unique_id
-    if dtype == "light":
-        topics.add(_config_topic("light", f"{dev_name}_light"))
-    elif dtype == "climate":
-        topics.add(_config_topic("climate", f"{dev_name}_climate"))
-    # v1.10.20
-    elif dtype == "cover":
-        topics.add(_config_topic("cover", f"{dev_name}_cover"))
-    elif dtype == "fan":
-        topics.add(_config_topic("fan", f"{dev_name}_fan"))
-
-    # DP-уровневые сущности.
-    # v1.12.37: набор компонентов зависит от type — publish_discovery
-    # вызывает DP-публикаторы не для всех типов:
-    #   switch     -> switch/select/number/sensor/binary_sensor;
-    #   sensor и др. (else) -> publish_sensors, только sensor/binary_sensor;
-    #   light/climate/cover/fan -> только своя одиночная сущность, DP не
-    #                              публикуются отдельными топиками.
-    # Раньше DP-цикл шёл для всех типов, и «ожидаемые» включали, например,
-    # sensor/<climate>_temp_current/config, которых мост не публикует —
-    # отсюда расхождение «ожидалось» vs фактически retained (C2).
-    if dtype == "switch":
-        dp_components = ("switch", "select", "number",
-                         "sensor", "binary_sensor")
-    elif dtype in ("light", "climate", "cover", "fan"):
-        dp_components = ()
-    else:
-        dp_components = ("sensor", "binary_sensor")
-    for dp_str, info in dev.get("dps_map", {}).items():
-        comp = info.get("component")
-        ent = info.get("name", f"dp_{dp_str}")
-        if comp == "lock":             # v1.10.20: lock — для любого типа
-            topics.add(_config_topic("lock", f"{dev_name}_{ent}"))
-        elif comp in dp_components:
-            if comp == "switch":
-                topics.add(_config_topic("switch", f"{dev_name}_{ent}"))
-            elif comp == "select":
-                topics.add(_config_topic("select", f"{dev_name}_{ent}"))
-            elif comp == "number":
-                topics.add(_config_topic("number", f"{dev_name}_{ent}"))
-            else:                       # sensor / binary_sensor
-                topics.add(_config_topic(comp, f"{dev_name}_{ent}"))
+    # DP-уровневые сущности — v1.14.11: строим ИЗ ТЕХ ЖЕ спецификаций, что
+    # публикует publish_discovery (device_entities по наборам из
+    # _published_entity_wants). Единый источник истины исключает расхождение
+    # «ожидалось» vs «published», из-за которого orphan-чистка (строгий набор
+    # B8, v1.14.8) удаляла реальные сущности: select-сцены ленты
+    # (work_mode DP21 / scene DP51), sensor/binary_sensor у climate (тёплые полы).
+    for _want in _published_entity_wants(dev):
+        try:
+            for _spec in device_entities(dev, _want):
+                topics.add(_config_topic(_spec.component, _spec.unique_id))
+        except Exception as e:  # noqa: BLE001
+            # v1.14.11: спецификация не построилась — не рискуем удалением
+            # живых сущностей, добираем DP-компоненты грубым (надмножеством).
+            log.warning(f"[Discovery] expected topics {dev_name}/{_want}: {e}")
+            for dp_str, info in dev.get("dps_map", {}).items():
+                comp = info.get("component")
+                if comp in ("switch", "select", "number", "sensor",
+                            "binary_sensor", "lock"):
+                    topics.add(_config_topic(
+                        comp, f"{dev_name}_{info.get('name', f'dp_{dp_str}')}"))
 
     return topics
 
@@ -780,6 +803,24 @@ def _filter_orphan_by_suffix(topics, all_dev_names):
             if ent:
                 dynamic_suffixes.add(f"_{ent}")
 
+    # v1.14.8: B8 — ожидаемый набор unique_id для ТЕКУЩИХ устройств
+    # (источник — _discovery_topics_for_device, тот же, что у sync-реестра).
+    # Нужен, чтобы привязка «startswith(dev_name + "_")» не считала нашим
+    # чужой unique_id, начинающийся с имени нашего устройства-префикса.
+    _cur_by_name = {}
+    _expected_uids = {}
+    for dev in devs:
+        _n = dev.get("name")
+        if not _n:
+            continue
+        _cur_by_name[_n] = dev
+        _uids = set()
+        for _t in _discovery_topics_for_device(dev):
+            _p = _t.split("/")
+            if len(_p) >= 4:
+                _uids.add(_p[2])          # uid = parts[2] топика config
+        _expected_uids[_n] = _uids
+
     all_suffixes = tuple(_LEGACY_ORPHAN_FALLBACK) + tuple(sorted(dynamic_suffixes))
 
     # v1.10.14: история имён — current ∪ persisted.
@@ -796,11 +837,24 @@ def _filter_orphan_by_suffix(topics, all_dev_names):
             continue
         unique_id = parts[2]
         # 1. Проверка «не привязан к известному имени bridge».
+        # v1.14.8: B8 — раньше давала привязку ЛЮБОЕ совпадение
+        # startswith(dev_name + "_"): чужой unique_id, начинающийся с имени
+        # нашего устройства-префикса, считался нашим и не чистился. Для
+        # ТЕКУЩИХ устройств теперь сверяем полный unique_id с ожидаемым
+        # набором (_discovery_topics_for_device); для исторических имён
+        # (объект устройства уже отсутствует) — прежний префикс-матч.
         bound = False
         for dev_name in known_names_sorted:
-            if unique_id == dev_name or unique_id.startswith(dev_name + "_"):
+            if unique_id == dev_name:
                 bound = True
                 break
+            if unique_id.startswith(dev_name + "_"):
+                if dev_name not in _cur_by_name:
+                    bound = True          # историческое имя — прежний матч
+                    break
+                if unique_id in _expected_uids.get(dev_name, ()):
+                    bound = True
+                    break
         if bound:
             continue
         # 2. v1.10.14: обязательная привязка к известному имени.
@@ -1400,14 +1454,17 @@ def _validate_dps_map(dev_type, dps_map):
             mx = info.get("max")
             if mn is None or mx is None:
                 return False, f"dp {dp_str}: number requires min and max", warnings
-            if not isinstance(mn, (int, float)) or isinstance(mn, bool):
+            # v1.14.8: единый порядок проверок — сначала isinstance(v, bool)
+            # (bool является подклассом int, поэтому проверка bool идёт первой),
+            # затем isinstance(v, (int, float)) — как в остальных ветках.
+            if isinstance(mn, bool) or not isinstance(mn, (int, float)):
                 return False, f"dp {dp_str}: min must be number", warnings
-            if not isinstance(mx, (int, float)) or isinstance(mx, bool):
+            if isinstance(mx, bool) or not isinstance(mx, (int, float)):
                 return False, f"dp {dp_str}: max must be number", warnings
             if mn >= mx:
                 return False, f"dp {dp_str}: min ({mn}) must be < max ({mx})", warnings
             step = info.get("step", 1)
-            if not isinstance(step, (int, float)) or isinstance(step, bool):
+            if isinstance(step, bool) or not isinstance(step, (int, float)):
                 return False, f"dp {dp_str}: step must be number", warnings
             if step <= 0:
                 return False, f"dp {dp_str}: step must be > 0", warnings
@@ -2167,7 +2224,12 @@ def debounce_worker():
 def process_command(dev, component, parts, cmd):
     name = dev["name"]
     lock = get_device_cmd_lock(name)
-    with lock:
+    if not lock.acquire(timeout=1.0):
+        # v1.14.10: 0.2 → 1.0 — лок почти всегда занят deviceworker'ом,
+        # команда терялась при коротком таймауте (задержка юзера #848).
+        log.warning(f"[ProcessCommand] {name}: unable to acquire device command lock")
+        return
+    try:
         with DEVICES_LOCK:
             if name not in DEVICE_INDEX:
                 return
@@ -2197,7 +2259,8 @@ def process_command(dev, component, parts, cmd):
         except Exception as e:
             log.warning(f"[Tuya] Ошибка команды {name}: {e}")
             drop_device_conn(name)
-            return
+    finally:
+        lock.release()
 
     request_status(name)
 
@@ -2216,6 +2279,30 @@ def _cache_update(dev_name, updates):
     if changed:
         mark_state_dirty()
     return changed
+
+
+def _state_mark_unconfirmed(dev_name, dps):
+    """v1.14.24: пометить DP как «значение — наша команда, прибор ещё не подтвердил»."""
+    if not dps:
+        return
+    with STATE_LOCK:
+        s = STATE_UNCONFIRMED.setdefault(str(dev_name), set())
+        for dp in dps:
+            s.add(str(dp))
+
+
+def _state_confirm(dev_name, dps):
+    """v1.14.24: прибор реально прислал эти DP — снять метку «не подтверждено»."""
+    if not dps:
+        return
+    with STATE_LOCK:
+        s = STATE_UNCONFIRMED.get(str(dev_name))
+        if not s:
+            return
+        for dp in dps:
+            s.discard(str(dp))
+        if not s:
+            STATE_UNCONFIRMED.pop(str(dev_name), None)
 
 
 # ==================== ЗАЩИТА ОТ «ЭХА» КОМАНД (v1.12.6) ====================
@@ -2246,22 +2333,36 @@ CMD_ACK_LOG_SIG = [""]         # лог только при смене набо�
 # Наблюдали: люстра применила OFF только через 46 с (устройство «зависло»), при
 # этом HA и switch_2 уже показали off (оптимистичная публикация). Переотправляем
 # команду, пока не придёт отчёт с ожидаемым значением или не кончатся попытки.
-CMD_RETRY_AFTER_SEC = 2.5      # через сколько секунд без подтверждения переотправлять
+CMD_RETRY_AFTER_SEC = 5.0      # v1.14.23 (09.10.2026 04:22, #1035): 2.5 → 5.0 — реже дёргаем
+                               # молчащий прибор (меньше шторма команд); далее экспоненциально ×2/×3.
 # v1.13.9: жёсткий потолок удержания «старого» отчёта, даже если команда так и не подтверждена.
 # Нужен, чтобы прибор, который вообще не отвечает, не блокировал правду бесконечно:
 # pending снимается исчерпанием повторов, но у окна должна быть верхняя граница.
 CMD_GUARD_PENDING_MAX_SEC = 8.0
 CMD_RETRY_MAX = 3              # максимум переотправок на команду
 CMD_RETRY_SWEEP_SEC = 0.5      # период проверки
-CMD_PENDING = {}               # {dev_name: {dp_str: {"v": val, "ts": t, "tries": n}}}
+CMD_PENDING = {}               # {dev_name: {dp_str: {"v": val, "ts": t, "tries": n, "gen": g}}}
 CMD_PENDING_LOCK = threading.Lock()
+# v1.14.23 (09.10.2026 04:22, #1035): LATEST-WINS. Поколение (gen) желаемого значения на пару
+# (прибор, DP). Новая команда по DP поднимает gen; отложенный send сверяет свой gen с
+# текущим и, если его перезаписали, НЕ отправляет устаревшее значение (иначе ретрай старого
+# ON мог прилететь ПОСЛЕ финального OFF и снова зажечь люстру — наблюдали 09.10 ночью).
+CMD_GEN = {}                   # {dev_name: {dp_str: int}}
+CMD_GEN_LOCK = threading.Lock()
+_CMD_GEN_SEQ = [0]
+# v1.14.16: cmd_echo — признак «этой публикацией мы подтверждаем НАШУ команду». Больше НЕ
+# глобальный одноразовый флаг: передаётся явным аргументом `echo=` в publish_state от источника
+# (оптимистичная публикация команды / отчёт, совпавший с командой по значению в _cmd_guard_filter).
+# Так посторонняя публикация (дребезг, статус-опрос) не «крадёт» чужой флаг.
 # v1.12.30: переотправляем только «ключевые» DP (вкл/выкл, режим), а не настройки
 # яркости/цвета/температуры — иначе на каждую подстройку Adaptive Lighting летят
 # лишние повторы и лог шумит.
+# v1.14.22: для этих DP НЕ публикуется и признак pending (см. _pending_mark) —
+# HA-автоматизации, завязанные на `pending`, для ползунков яркости/цвета не сработают.
 _NO_RETRY_NAMES = {"bright_value", "temp_value", "colour_data", "temp_set"}
 
 
-def _publish_pending(dev_name, pending, dev=None):
+def _publish_pending(dev_name, pending, dev=None, echo=False):
     """v1.13.10: признак «команда ещё не подтверждена» отдельным retained-топиком.
 
     HA при наличии state_topic пессимистична и нашу предпубликацию считает
@@ -2275,9 +2376,12 @@ def _publish_pending(dev_name, pending, dev=None):
     значение в тот же JSON (топик подключён к сущности light как
     json_attributes_topic). Семантика pending не меняется.
     """
-    payload = {"pending": bool(pending)}
+    payload = {"pending": bool(pending), "cmd_echo": bool(echo)}
     if dev is not None:
-        dp_work, info_work = find_dp_by_name(dev, "work_mode")
+        # v1.14.22: снапшот под DEVICES_LOCK — конкурентный edit_config
+        # мог менять dps_map в той же dict'е (RuntimeError: changed size).
+        with DEVICES_LOCK:
+            dp_work, info_work = find_dp_by_name(dev, "work_mode")
         if dp_work is not None:
             with STATE_LOCK:
                 cached = STATE_CACHE.get(dev_name, {})
@@ -2308,14 +2412,29 @@ def _pending_mark(dev, updates):
     marked = False
     with CMD_PENDING_LOCK:
         d = CMD_PENDING.setdefault(name, {})
-        for dp, v in updates.items():
-            info = dps_map.get(str(dp))
-            if not info:                       # неизвестный/стримовый DP — не повторяем
-                continue
-            if info.get("name") in _NO_RETRY_NAMES:
-                continue
-            d[str(dp)] = {"v": v, "ts": now, "tries": 0}
-            marked = True
+        with CMD_GEN_LOCK:
+            gd = CMD_GEN.setdefault(name, {})
+            for dp, v in updates.items():
+                info = dps_map.get(str(dp))
+                if not info:                   # неизвестный/стримовый DP — не повторяем
+                    continue
+                if info.get("name") in _NO_RETRY_NAMES:
+                    continue
+                prev = d.get(str(dp))
+                # v1.14.23: дубль той же команды в окне повторов — НЕ сбрасываем прогресс
+                # ретрая (иначе каждый повторный ON от HA давал вечный «повтор #1» + шторм).
+                if (prev is not None and _val_eq(prev.get("v"), v)
+                        and (now - prev.get("ts", 0)) < CMD_RETRY_AFTER_SEC * 3):
+                    continue
+                _CMD_GEN_SEQ[0] += 1
+                gd[str(dp)] = _CMD_GEN_SEQ[0]
+                d[str(dp)] = {"v": v, "ts": now, "tries": 0, "gen": gd[str(dp)]}
+                marked = True
+        if not d:
+            CMD_PENDING.pop(name, None)
+            with CMD_GEN_LOCK:
+                if not CMD_GEN.get(name):
+                    CMD_GEN.pop(name, None)
     if marked:
         _publish_pending(name, True, dev)   # v1.13.10: HA видит «не подтверждено»
 
@@ -2449,7 +2568,6 @@ def _publish_cmd_ack_stats(force=False):
     with CMD_ACK_LAST_PUB_LOCK:
         if not force and (now - CMD_ACK_LAST_PUB[0]) < 30:
             return
-        CMD_ACK_LAST_PUB[0] = now
     with CMD_ACK_LOCK:
         data = {k: list(v) for k, v in CMD_ACK.items()}
     devs = {}
@@ -2491,6 +2609,10 @@ def _publish_cmd_ack_stats(force=False):
                             qos=1, retain=True)
     except Exception as e:
         log.debug(f"[CmdAck] publish: {e}")
+        # v1.14.22: таймстамп НЕ обновляем — иначе при ошибке теряли бы окно 30 с
+        return
+    with CMD_ACK_LAST_PUB_LOCK:
+        CMD_ACK_LAST_PUB[0] = now
 
 
 def _cmd_guard_filter(dev_name, dps):
@@ -2507,14 +2629,16 @@ def _cmd_guard_filter(dev_name, dps):
     молчащий прибор не может держать «старое» бесконечно.
     """
     if not dps:
-        return dps
+        return dps, False
     now = time.time()
     guard = cmd_guard_sec(dev_name)
     acks = []
+    clears = []   # v1.14.8: отложенная очистка pending (после замера ack)
+    matched = False   # v1.14.16: был ли отчёт подтверждением НАШЕЙ команды (для cmd_echo)
     with CMD_GUARD_LOCK:
         g = CMD_GUARD.get(dev_name)
         if not g:
-            return dps
+            return dps, False
         out = {}
         for dp, v in dps.items():
             rec = g.get(str(dp))
@@ -2523,8 +2647,12 @@ def _cmd_guard_filter(dev_name, dps):
                 if _val_eq(v, rec["v"]):
                     # значение совпало → это реальный отклик прибора
                     acks.append(age * 1000.0)
-                    _pending_clear(dev_name, dp)    # v1.12.29: подтверждено
+                    clears.append(dp)    # v1.12.29: подтверждено (clear — ниже)
                     g.pop(str(dp), None)
+                    # v1.14.16: отчёт совпал с нашей командой ПО ЗНАЧЕНИЮ → это эхо НАШЕЙ
+                    # команды. Признак отдаём через return, а не глобальным флагом — иначе его
+                    # подхватывала следующая (посторонняя) публикация состояния (дребезг/опрос).
+                    matched = True
                 elif age < guard or (_pending_active(dev_name, dp)
                                      and age < CMD_GUARD_PENDING_MAX_SEC):
                     # v1.13.8: старое значение — не публикуем ни в окне эха,
@@ -2533,14 +2661,19 @@ def _cmd_guard_filter(dev_name, dps):
                     continue
                 else:
                     # повторы исчерпаны, прибор так и не подтвердил — дальше правда прибора
-                    _pending_clear(dev_name, dp)
+                    clears.append(dp)    # v1.14.8: clear — ниже
                     g.pop(str(dp), None)
             out[dp] = v
         if not g:
             CMD_GUARD.pop(dev_name, None)
-    for ms in acks:
-        _cmd_ack_record(dev_name, ms)
-    return out
+        # v1.14.8: B5 — СНАЧАЛА ack, ЗАТЕМ закрытие окна pending — и ВСЁ
+        # внутри CMD_GUARD_LOCK: вне лока новая команда успевала зарегистрировать
+        # pending между снятием лока и _pending_clear, и чистка гасила ЕЁ окно.
+        for ms in acks:
+            _cmd_ack_record(dev_name, ms)
+        for dp in clears:
+            _pending_clear(dev_name, dp)
+    return out, matched
 
 
 def optimistic_update_many(dev, updates: dict):
@@ -2555,8 +2688,14 @@ def optimistic_update_many(dev, updates: dict):
     name = dev["name"]
     with STATE_LOCK:
         prev = dict(STATE_CACHE.get(name, {}))
-    _is_noop = all(str(dp) in prev and _val_eq(v, prev[str(dp)])
-                   for dp, v in updates.items())
+        unconf = set(STATE_UNCONFIRMED.get(name, ()))
+    # v1.14.24: no-op — ТОЛЬКО если значение совпало с кэшем И этот DP подтверждён прибором.
+    # Если кэш не подтверждён (наша оптимистичная догадка) — команду слать и проверять надо:
+    # иначе рассинхрон не исправить (карточка #1039).
+    _dirty = [str(dp) for dp, v in updates.items()
+              if not (str(dp) in prev and _val_eq(v, prev[str(dp)])
+                      and str(dp) not in unconf)]
+    _is_noop = not _dirty
     _cache_update(name, updates)
     # v1.12.3: публикуем состояние в MQTT СРАЗУ после команды, а не ждём
     # следующего status(). После команды Tuya часто отдаёт 914/905 на status()
@@ -2567,8 +2706,11 @@ def optimistic_update_many(dev, updates: dict):
     if not _is_noop:
         _cmd_guard_mark(name, updates)
         _pending_mark(dev, updates)   # v1.12.29: ждём подтверждения прибора
+        # v1.14.24: пока прибор не прислал эти DP — это НАША догадка, а не факт.
+        _state_mark_unconfirmed(name, _dirty)
     try:
-        publish_state(dev, {str(k): v for k, v in updates.items()})
+        # v1.14.16: оптимистичная публикация — это НАШЕ состояние (echo=True) для HA-гардов.
+        publish_state(dev, {str(k): v for k, v in updates.items()}, echo=True)
     except Exception as e:
         log.warning(f"[Set] {dev['name']}: публикация состояния: {e}")
 
@@ -2601,15 +2743,34 @@ def _send_gate():
         GLOBAL_SEND_LAST[0] = now
 
 
-def _retry_send(dev_name, dp, v, attempt):
-    """v1.12.29/31: переотправить команду прибору (не дожидаясь лока)."""
+def _retry_send(dev_name, dp, v, attempt, rec=None):
+    """v1.12.29/31: переотправить команду прибору (не дожидаясь лока).
+
+    v1.14.10: счётчик попыток ведёт cmd_retry_worker при планировании — здесь
+    tries НЕ трогаем: лок почти всегда занят (deviceworker держит ~0.1 с из
+    цикла), return до апдейта оставлял tries=0 и лог заливал «повтор #1» (#848).
+    Захват лока 0.2 → 0.5 с: попытка уже засчитана, просто даём шанс реально
+    отправить; лок занят → пропускаем, следующий проход по backoff.
+    """
+    # v1.14.23: latest-wins — не отправляем повтор, если значение по DP уже перезаписано
+    # свежей командой (иначе устаревший ON прилетит после финального OFF).
+    if rec is not None:
+        with CMD_PENDING_LOCK:
+            cur = (CMD_PENDING.get(dev_name) or {}).get(str(dp))
+            gen_now = (CMD_GEN.get(dev_name) or {}).get(str(dp))
+        if cur is not rec or (rec.get("gen") is not None and rec.get("gen") != gen_now):
+            log.info(f"[Retry] {dev_name} dp={dp}: пропуск — команда перезаписана "
+                     f"(gen {rec.get('gen')}→{gen_now})")
+            return False
     with DEVICES_LOCK:
         dev = DEVICE_INDEX.get(dev_name)
     if not dev:
         return False
     lock = get_device_cmd_lock(dev_name)
-    if not lock.acquire(timeout=0.2):
-        return False          # прибор занят командой — попробуем на след. проходе
+    if not lock.acquire(timeout=0.5):
+        # v1.14.10: попытка засчитана воркером; лок занят — без отправки.
+        log.debug(f"[Retry] {dev_name} dp={dp}: лок занят, попытка #{attempt} не отправлена")
+        return False          # попробуем на след. проходе
     try:
         with DEVICES_LOCK:
             if dev_name not in DEVICE_INDEX:
@@ -2636,6 +2797,7 @@ def cmd_retry_worker():
             break
         now = time.time()
         due = []
+        lost = []   # v1.14.14: устройства с исчерпанными повторами — снять флаг pending в HA
         with CMD_PENDING_LOCK:
             for dev_name, dps in list(CMD_PENDING.items()):
                 for dp, rec in list(dps.items()):
@@ -2648,22 +2810,45 @@ def cmd_retry_worker():
                     _backoff = max(CMD_RETRY_AFTER_SEC * (rec["tries"] + 1),
                                    2.0 * cmd_avg6_sec(dev_name))
                     if rec["tries"] < CMD_RETRY_MAX and age >= _backoff:
+                        # v1.14.10: счётчик попыток — ЗДЕСЬ, при планировании.
+                        # v1.14.8/9 считали только в _retry_send после захвата
+                        # лока, но лок почти всегда занят (deviceworker держит
+                        # ~0.1 с из цикла ~0.13 с) → return до апдейта →
+                        # tries вечно 0 → шторм «повтор #1» каждые 2*avg6 (#848).
+                        # Планируемая попытка уже ограничена CMD_RETRY_MAX →
+                        # шторм гарантированно закрывается при любой причине.
                         rec["tries"] += 1
                         rec["ts"] = now
-                        due.append((dev_name, dp, rec["v"], rec["tries"]))
+                        due.append((dev_name, dp, rec["v"], rec, rec["tries"]))
                     elif rec["tries"] >= CMD_RETRY_MAX and age >= CMD_RETRY_AFTER_SEC * 6:
                         dps.pop(dp, None)          # сдались — дальше правда прибора
                 if not dps:
                     CMD_PENDING.pop(dev_name, None)
-        for dev_name, dp, v, tries in due:
+                    lost.append(dev_name)
+        # v1.14.14 (карточка #878): «сдались» — обязательно снимаем признак pending.
+        # Раньше здесь только чистили CMD_PENDING, а retained-топик pending:true оставался
+        # висеть до следующей публикации состояния → HA считала команду неподтверждённой
+        # (гарды «not pending» ложно резали живые нажатия).
+        for dev_name in lost:
+            with DEVICES_LOCK:
+                _dev = DEVICE_INDEX.get(dev_name)
+            _publish_pending(dev_name, False, _dev)
+        for dev_name, dp, v, rec, attempt in due:
             # v1.12.30: первый повтор — INFO, дальше DEBUG (меньше шума в логе).
-            msg = f"[Retry] {dev_name} dp={dp}: прибор не подтвердил, повтор #{tries}"
-            if tries == 1:
+            msg = f"[Retry] {dev_name} dp={dp}: прибор не подтвердил, повтор #{attempt}"
+            if attempt == 1:
                 log.info(msg)
             else:
                 log.debug(msg)
             try:
-                get_device_retry_exec(dev_name).submit(_retry_send, dev_name, dp, v, tries)
+                # v1.14.13: ретрай идёт на ТОТ ЖЕ per-device executor, что и команды
+                # (get_device_exec, max_workers=1). Раньше ретраи жили в отдельном
+                # executor'е и конкурировали с process_command за device_cmd_lock:
+                # пока ретрай держал лок (rate-gate + set_value), входящая команда
+                # не получала лок за 1.0с и ДРОПАЛАСЬ (лог «unable to acquire device
+                # command lock» → залипание люстры, карточка #878). Один писатель
+                # на устройство — лок больше не контендится, команды не теряются.
+                get_device_exec(dev_name).submit(_retry_send, dev_name, dp, v, attempt, rec)
             except Exception as e:
                 log.debug(f"[Retry] submit: {e}")
 
@@ -2708,16 +2893,59 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
             entry["timer"].cancel()
 
         def fire():
-            # v1.10.3: pop ПЕРЕД выполнением — только если мы всё ещё
-            # "текущий" таймер. Иначе новый debounced_set перезаписал бы
-            # DEBOUNCE[key], а старый fire снёс бы запись нового.
+            # v1.14.8: таймаут на захват device_cmd_lock — предотвращаем зависание
+            # при udevice-таймаутах (socket 0.3 с) или бесконечном ожидании в process_command.
             with DEBOUNCE_LOCK:
                 current = DEBOUNCE.get(key)
                 if current is None or current["timer"] is not _t_ref.get("timer"):
                     return
-                DEBOUNCE.pop(key, None)
+            # delay pop until after lock release below; another debounced_set may
+            # have recreated the entry, and we must not remove it out from under it.
             lock = get_device_cmd_lock(dev_name)
-            with lock:
+            if not lock.acquire(timeout=1.0):
+                # v1.14.10: 0.2 → 1.0 — см. process_command: при коротком
+                # таймауте отложенная команда терялась (задержка юзера #848).
+                # v1.14.20 (08.10.2026 20:36, ползунок яркости — «устройство тупит, 2-е и 3-е
+                # срабатывание с лагом»): команда больше НЕ теряется молча — ПЕРЕВЗВОДИМ таймер
+                # дебаунса ещё на раз, чтобы попробовать снова, когда лок освободится. Лок держит
+                # предыдущая команда (облако Tuya); раньше её ожидание просто роняло нашу.
+                # Переввод ограничен DEBOUNCE_RETRY_MAX попытками, чтобы не крутить вечно.
+                with DEBOUNCE_LOCK:
+                    cur = DEBOUNCE.get(key)
+                    # v1.14.21 (08.10.2026 20:44, ползунок яркости: «яркость откатывается на
+                    # предыдущее значение»): гонка старого таймера с новым. T1 поймал
+                    # таймаут лока, потом юзер двинул ползунок → debounced_set() отменил T1
+                    # (отмена no-op: T1 уже висит в acquire) и создал T2 с новым значением.
+                    # Старый T1 перевзводил таймер и ПЕРЕПРИСВАИВАЛ оба указателя
+                    # (DEBOUNCE[key]["timer"] и _t_ref["timer"]) на себя — «самозахват».
+                    # Из-за этого T2.abort() на гарде выше, V2 терялся, а уходил устаревший V1.
+                    # Поэтому ПЕРЕД перевзводом проверяем, что запись в DEBOUNCE всё ещё
+                    # указывает на НАС: если её перебил новый debounced_set — не трогаем
+                    # ничего, актуальное значение уедет его собственным таймером.
+                    # v1.14.22: разделили две причины отказа — «нас перебил новый
+                    # debounced_set» (тихий return) и «лимит повторов исчерпан»
+                    # (WARNING). Раньше обе склеивались в один return без лога,
+                    # из-за чего строка «команда потеряна» была недостижима.
+                    if cur is None or cur.get("timer") is not _t_ref.get("timer"):
+                        # Нас перебил новый debounced_set — актуальное значение
+                        # уедет его собственным таймером.
+                        return
+                    if cur.get("tries", 0) >= DEBOUNCE_RETRY_MAX:
+                        log.warning(f"[Debounce fire] {dev_name}: лимит повторов "
+                                    f"({DEBOUNCE_RETRY_MAX}) исчерпан, команда потеряна")
+                        return
+                    cur["tries"] = cur.get("tries", 0) + 1
+                    retry_t = threading.Timer(window, fire)
+                    retry_t.daemon = True
+                    cur["timer"] = retry_t
+                    # гард выше сверяется с _t_ref — без этой строки ретрай вышел бы
+                    # втупик на первом же проходе (таймер уже не тот)
+                    _t_ref["timer"] = retry_t
+                    retry_t.start()
+                    log.warning(f"[Debounce fire] {dev_name}: lock busy, команда отложена "
+                                f"(попытка {cur['tries']}/{DEBOUNCE_RETRY_MAX})")
+                    return
+            try:
                 with DEVICES_LOCK:
                     if dev_name not in DEVICE_INDEX:
                         return
@@ -2730,6 +2958,8 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
                 except Exception as e:
                     log.warning(f"[Debounce] {dev_name} dp={dp}: {e}")
                     drop_device_conn(dev_name)
+            finally:
+                lock.release()
             request_status(dev_name)
 
         _t_ref = {}
@@ -2993,6 +3223,8 @@ def handle_light_command(tuya, dev, cmd):
     # v1.12.26: публикуем состояние ДО блокирующей команды (как в debounced_set).
     # Иначе на multi-DP (state + brightness + color_temp) HA ждал реального отчёта
     # устройства — наблюдали 24 с на включение люстры с яркостью/цветом.
+    # ВНИМАНИЕ: сюда приходят уже ПОД device-команд-локом (process_command держит его до
+    # конца), поэтому свой лок здесь брать нельзя — будет дедлок. Лок берёт только process_command.
     optimistic_update_many(dev, cache)
     try:
         _send_gate()
@@ -3001,6 +3233,9 @@ def handle_light_command(tuya, dev, cmd):
         log.warning(f"[Light] set_multiple_values failed: {e}; fallback")
         for dp, v in payload.items():
             try:
+                # v1.14.20 (08.10.2026 20:36): rate-limit и на fallback-ветке — иначе при пачке
+                # multi-DP команды летят в облакоTuya без интервала и копятся там (лаг).
+                wait_device_rate_limit(dev["name"], "light")
                 _send_gate()
                 tuya.set_value(dp, v)
             except Exception as ee:
@@ -3578,6 +3813,28 @@ def _ensure_worker_running(dev, reason=""):
     return True
 
 
+def _ensure_worker_running_later(name, reason, timeout=30.0):
+    """v1.14.8: дождаться остановки воркера в фоне и поднять его.
+
+    Страховка B3 (_handle_edit_config): request_worker_stop() отправлен, но
+    воркер не подтвердил выход за отведённое время. Флаг он обрабатывает
+    асинхронно — воркер может завершиться ПОЗЖЕ, когда никто не смотрит:
+    без отложенного старта опрос устройства встанет до рестарта контейнера.
+    Образец — _restart_workers_later().
+    """
+    deadline = time.time() + timeout
+    while _worker_alive(name) and time.time() < deadline and not STOP_EVENT.is_set():
+        time.sleep(0.5)
+    if _worker_alive(name):
+        log.warning(f"[EditConfig] {name}: {reason} — воркер не остановился за "
+                    f"{timeout:.0f}с, отложенный старт отменён")
+        return
+    with DEVICES_LOCK:
+        d = DEVICE_INDEX.get(name)
+    if d and _ensure_worker_running(d, reason):
+        log.info(f"[EditConfig] {name}: {reason} — воркер поднят отложенно")
+
+
 def _handle_edit_config(payload_str):
     # v1.8.3: сначала извлекаем request_id, потом проверяем флаги —
     # чтобы ответ ушёл с правильным request_id даже в ошибочных ветках.
@@ -3764,7 +4021,9 @@ def _handle_edit_config(payload_str):
             _publish_edit_result(dev_name, False, f"invalid dps_map: {err_dps}",
                                  request_id=request_id)
             return
-        warnings = warn_dps
+        # v1.14.22: extend, а не replace — иначе при одновременной смене type+dps_map
+        # терялись warning'и от валидации старой карты (type_changed без dps_map выше).
+        warnings.extend(warn_dps)
         # Нормализация ключей в строки (на случай, если пришли числа)
         filtered["dps_map"] = {str(k): v for k, v in filtered["dps_map"].items()}
 
@@ -3776,6 +4035,7 @@ def _handle_edit_config(payload_str):
     # при успехе — в конце (см. _ensure_worker_running), при провале — здесь.
     tcp_change = any(k in filtered for k in ("ip", "local_key", "version"))
     _worker_stopped_for_validate = False
+    _worker_stop_requested = False   # v1.14.8: был ли request_worker_stop() (страховка B3)
     if validate and tcp_change:
         new_ip = filtered.get("ip", dev["ip"])
         new_key = filtered.get("local_key", dev["local_key"])
@@ -3788,8 +4048,11 @@ def _handle_edit_config(payload_str):
             # v1.12.16: сначала просим НАСТОЯЩИЙ останов — иначе воркер делал лишь
             # реконнект, `_wait_worker_exit` всегда истекал и TCP-валидация ip/key/version
             # фактически не выполнялась (в лог уходило «пропущена»).
+            # v1.14.22: request_worker_restart убран — воркер проверяет stop-флаг
+            # ПЕРВЫМ (см. run_polling_device), и лишний restart оставался висеть
+            # в RESTART_FLAGS → при отложенном старте новый воркер делал пустой реконнект.
             request_worker_stop(dev_name)
-            request_worker_restart(dev_name)
+            _worker_stop_requested = True   # v1.14.8: см. страховку в конце функции
             _worker_stopped_for_validate = _wait_worker_exit(dev_name, timeout=3.0)
             if not _worker_stopped_for_validate:
                 log.warning(f"[EditConfig] {dev_name}: воркер не завершился за 3с — "
@@ -3888,6 +4151,14 @@ def _handle_edit_config(payload_str):
     # о restart (см. ниже). Если enabled false->true — воркер уже стартанул.
     with DEVICES_LOCK:
         _DEVICE_INDEX_BEFORE_ENABLE = set(DEVICE_INDEX.keys())
+        # v1.14.8: TOCTOU — сравнение вычисляем ТОМ ЖЕ захвате лока, что и снимок:
+        # раньше решение о restart считалось ниже (после вставок/попов в
+        # DEVICE_INDEX), и индекс мог измениться за это время.
+        _enabled_turned_on = (
+            "enabled" in filtered
+            and filtered["enabled"] is True
+            and dev_name not in _DEVICE_INDEX_BEFORE_ENABLE
+        )
     if "enabled" in filtered:
         _new_enabled = filtered["enabled"]   # v1.10.3: валидировано как bool
         with DEVICES_LOCK:
@@ -4147,11 +4418,7 @@ def _handle_edit_config(payload_str):
     # v1.10.3: restart подавляем ТОЛЬКО при реальном enabled false->true.
     # Иначе (enabled уже был True) рестарт нужен — ip/key/dps_map могли
     # измениться.
-    _enabled_turned_on = (
-        "enabled" in filtered
-        and filtered["enabled"] is True
-        and dev_name not in _DEVICE_INDEX_BEFORE_ENABLE
-    )
+    # v1.14.8: _enabled_turned_on уже вычислен при снимке DEVICE_INDEX (см. выше).
     if not _enabled_turned_on and not _skip_final_restart:
         request_worker_restart(dev_name)
 
@@ -4164,6 +4431,13 @@ def _handle_edit_config(payload_str):
     # (после остановки restart-флаг выше уже некому обработать).
     if _worker_stopped_for_validate:
         _ensure_worker_running(dev, "после edit_config (validate)")
+    # v1.14.8: страховка B3 — stop запрошен, но воркер не подтвердил выход за 3с.
+    # Флаг он обработает асинхронно и может выйти ПОЗЖЕ, когда никто не смотрит:
+    # без отложенного старта опрос устройства встанет до рестарта контейнера.
+    elif _worker_stop_requested:
+        threading.Thread(target=_ensure_worker_running_later,
+                         args=(dev_name, "после отложенной валидации"),
+                         daemon=True, name=f"editcfg-validate-{dev_name}").start()
 
     if _expire_delete:
         filtered = dict(filtered)
@@ -4686,17 +4960,22 @@ def _handle_import_devices(payload_str):
             continue
         with DEVICES_LOCK:
             _existing = DEVICE_INDEX.get(name)
+            if _existing is not None:
+                # v1.14.8: чтение прежних значений и мутация записи — ОДИН
+                # захват DEVICES_LOCK: раньше _existing.get(...) читался вне
+                # лока, а update(matched) конкурентный воркер мог увидеть
+                # частично обновлённый dict. Ссылка берётся из DEVICE_INDEX
+                # тем же локом — запись мутируется только здесь.
+                _old_battery = bool(_existing.get("battery_powered", False))
+                _existing.update(matched)
         if _existing is not None:
             # --- Устройство уже активно: overwrite ---
             # v1.10.15: overwrite мог сменить enabled/battery_powered —
             # обрабатываем переходы воркеров. Раньше при enabled:false
             # устройство продолжало опрашиваться, а при смене
             # battery_powered — оставалось с неверным типом воркера.
-            _old_battery = bool(_existing.get("battery_powered", False))
             _new_battery = bool(matched.get("battery_powered", False))
             _new_enabled = bool(matched.get("enabled", True))
-            with DEVICES_LOCK:
-                _existing.update(matched)
             if not _new_enabled:
                 with DEVICES_LOCK:
                     DEVICE_INDEX.pop(name, None)
@@ -6519,10 +6798,14 @@ def publish_battery_alert_discovery(device, device_info):
 
 
 # ==================== STATE PUBLISHING ====================
-def publish_state(device, dps):
+def publish_state(device, dps, echo=False):
     dev_type = device.get("type", "sensor")
     dev_name = device["name"]
-    dps_map = device["dps_map"]
+    # v1.14.8: снапшот dps_map под DEVICES_LOCK (RLock) — иначе конкурентная
+    # правка маппинга (импорт/редактирование) могла отдать в Discovery/состояние
+    # частично обновлённый dict или прервать итерацию («changed size»).
+    with DEVICES_LOCK:
+        dps_map = dict(device.get("dps_map") or {})
 
     if dps:
         _cache_update(dev_name, {str(k): v for k, v in dps.items()})
@@ -6549,14 +6832,23 @@ def publish_state(device, dps):
         if info.get("component") == "lock" and dp_str in cached:
             _publish_lock_state(dev_name, info, cached[dp_str])
 
+    # v1.14.16: cmd_echo — ГЛАВНЫЙ признак «это эхо НАШЕЙ команды» передаётся ЯВНО от источника
+    # (оптимистичная публикация команды или отчёт, совпавший с командой по значению). Публикуем
+    # pending ДО состояния — HA получит флаг в одном событии со сменой состояния.
+    if dev_type in ("light", "switch"):
+        _publish_pending(dev_name, _pending_any(dev_name), device, echo=echo)
+
     if dev_type == "light":
         state = {"state": "OFF"}
         color_temp_val = None
         color_val = None
         brightness_val = None
-        has_color = find_dp_by_name(device, "colour_data")[0] is not None
-        has_temp = find_dp_by_name(device, "temp_value")[0] is not None
-        has_bright = find_dp_by_name(device, "bright_value")[0] is not None
+        # v1.14.8: B1 (доп.) — флаги света тоже со снимка: find_dp_by_name
+        # итерирует живой dps_map устройства (DEVICES_LOCK RLock — вложенность безопасна).
+        with DEVICES_LOCK:
+            has_color = find_dp_by_name(device, "colour_data")[0] is not None
+            has_temp = find_dp_by_name(device, "temp_value")[0] is not None
+            has_bright = find_dp_by_name(device, "bright_value")[0] is not None
 
         for dp_str, info in dps_map.items():
             if dp_str not in cached:
@@ -6585,8 +6877,7 @@ def publish_state(device, dps):
                 json.dumps({"state": "OFF"}),
                 retain=True,
             )
-            if find_dp_by_name(device, "work_mode")[0] is not None:
-                _publish_pending(dev_name, _pending_any(dev_name), device)
+            # v1.14.22: _publish_pending уже вызван выше с echo=echo — убрано.
             return
 
         if has_bright and brightness_val is None:
@@ -6616,8 +6907,8 @@ def publish_state(device, dps):
             json.dumps(state),
             retain=True,
         )
-        if find_dp_by_name(device, "work_mode")[0] is not None:
-            _publish_pending(dev_name, _pending_any(dev_name), device)
+        # v1.14.22: _publish_pending уже вызван выше с echo=echo — повторная
+        # публикация здесь перетирала cmd_echo на false. Убрано.
         # v1.14.5: состояния generic-select у света (work_mode идёт отдельной
         # веткой через pending, его не дублируем).
         for dp_str, info in dps_map.items():
@@ -7148,7 +7439,9 @@ def run_polling_device(dev):
                     if DEBUG_RAW_DP:
                         log.debug(f"[Worker] {name}: receive dps={dps}")
                     try:
-                        publish_state(dev, _cmd_guard_filter(name, dps))
+                        _filt, _echo = _cmd_guard_filter(name, dps)
+                        _state_confirm(name, _filt.keys())
+                        publish_state(dev, _filt, echo=_echo)
                     except Exception as e:
                         log.warning(f"[Worker] {name}: publish_state: {e}")
                     last_real_data = time.time()
@@ -7214,7 +7507,9 @@ def run_polling_device(dev):
                         if DEBUG_RAW_DP:
                             log.debug(f"[Worker] {name}: status dps={dps}")
                         try:
-                            publish_state(dev, _cmd_guard_filter(name, dps))
+                            _filt, _echo = _cmd_guard_filter(name, dps)
+                            _state_confirm(name, _filt.keys())
+                            publish_state(dev, _filt, echo=_echo)
                         except Exception as e:
                             log.warning(f"[Worker] {name}: publish_state (status): {e}")
                         last_real_data = time.time()
@@ -7236,6 +7531,7 @@ def run_polling_device(dev):
                                 if extra and isinstance(extra, dict) and "Error" not in extra:
                                     dps = extra.get("dps", extra)
                                     if dps and isinstance(dps, dict) and "6" in dps:
+                                        _state_confirm(name, dps.keys())
                                         publish_state(dev, dps)
                             except Exception as e:
                                 log.debug(f"[Worker] {name} phase_a extra: {e}")
@@ -7257,17 +7553,22 @@ def run_polling_device(dev):
                 except Exception:
                     udp_alive_now = False
 
-            if udp_alive_now and udp_no_tcp_cycles < UDP_NO_TCP_MAX_CYCLES:
+            # v1.14.10 (B): в тихие часы прибор молчит по TCP НАМЕРЕННО — не дёргаем
+            # соединение и не шумим. UDP-жив в тишину трактуем как «offline отложен»
+            # сверх потолка циклов; при мёртвом UDP реконнект не форсим.
+            _quiet = _is_quiet_now(name)
+            if udp_alive_now and (udp_no_tcp_cycles < UDP_NO_TCP_MAX_CYCLES or _quiet):
                 udp_no_tcp_cycles += 1
                 last_real_data = time.time()
                 log.debug(f"[Worker] {name}: UDP жив (идёт вещание), offline отложен "
-                          f"[{udp_no_tcp_cycles}/{UDP_NO_TCP_MAX_CYCLES}]")
+                          f"[{udp_no_tcp_cycles}/{UDP_NO_TCP_MAX_CYCLES}]"
+                          + (" (тихие часы)" if _quiet else ""))
             else:
                 if last_online is not False:
                     # v1.12.10: в тихих часах offline ожидаем — в DEBUG, без WARNING.
                     _msg = (f"[Worker] {name}: нет данных "
                             f"{int(time.time() - last_real_data)}с, offline")
-                    if _is_quiet_now(name):
+                    if _quiet:
                         log.debug(_msg + " (тихие часы)")
                     else:
                         log.warning(_msg)
@@ -7279,7 +7580,8 @@ def run_polling_device(dev):
                 drop_device_conn(name)
                 # v1.14.0: при включённом UDP — форс-реконнект TCP (общий cooldown),
                 # чтобы воркер пересоздал соединение штатным путём.
-                if UDP_ENABLED:
+                # v1.14.10 (B): в тихие часы не форсим — прибор молчит намеренно.
+                if UDP_ENABLED and not _quiet:
                     try:
                         if udp_detect.can_force_reconnect():
                             request_worker_restart(name)
@@ -7305,6 +7607,9 @@ def run_polling_device(dev):
             if STOP_EVENT.wait(WORKER_IDLE_SLEEP):
                 break
 
+    # v1.14.22: закрываем persistent-сокет при выходе — как в run_battery_listener.
+    # Раньше сокет оставался в DEVICE_CONN до следующего внешнего drop_/рестарта.
+    drop_device_conn(name)
     log.info(f"[Worker] {name}: остановлен")
 
 
@@ -7434,7 +7739,7 @@ def run_battery_listener(dev):
 
         if state != last_state:
             extra = f" ({ms} мс)" if up else ""
-            log.info(f"[Battery] {name}: {state}{extra}")
+            log.debug(f"[Battery] {name}: {state}{extra}")
 
         # === Переход DOWN → UP ===
         if up and last_state != "UP":
@@ -7631,7 +7936,7 @@ def run_battery_listener(dev):
                             with _LAST_BATT_LOCK:
                                 _LAST_BATT_STATE.pop(name, None)
                             if dps != last_dps:
-                                log.info(
+                                log.debug(
                                     f"[Battery] {name}: данные → "
                                     f"{json.dumps(dps, ensure_ascii=False)}"
                                 )
@@ -7675,9 +7980,14 @@ def run_battery_listener(dev):
                         # (на ping ещё отвечает, но DP не отдаёт): закрываем окно, чтобы
                         # не тянуть его до BATTERY_WINDOW_SEC (в логах видели окна до 120 с).
                         _empty_tries += 1
+                        # v1.14.8: закрытие окна после 3 пустых попыток подряд —
+                        # НАМЕРЕННОЕ поведение по дизайну (не баг): прибор
+                        # отвечает на ping, но не отдаёт DP — окно не тянем до
+                        # BATTERY_WINDOW_SEC. Счётчик сбрасывается при
+                        # получении данных (_empty_tries = 0 выше).
                         if _empty_tries >= 3:
-                            log.info(f"[Battery] {name}: 3 пустые попытки подряд — "
-                                     f"закрываю окно ({time.time() - _win_t0:.0f}с)")
+                            log.debug(f"[Battery] {name}: 3 пустые попытки подряд — "
+                                      f"закрываю окно ({time.time() - _win_t0:.0f}с)")
                             break
                     if STOP_EVENT.wait(_wait):
                         break
@@ -7688,9 +7998,9 @@ def run_battery_listener(dev):
                     # v1.12.39: видно, с какой попытки удалось собрать данные
                     # и сколько это заняло — помогает ловить «узкие» окна.
                     if i > 0:
-                        log.info(f"[Battery] {name}: данные получены с "
-                                 f"{i + 1}-й попытки "
-                                 f"({time.time() - _win_t0:.1f}с)")
+                        log.debug(f"[Battery] {name}: данные получены с "
+                                  f"{i + 1}-й попытки "
+                                  f"({time.time() - _win_t0:.1f}с)")
                     else:
                         log.debug(f"[Battery] {name}: данные получены "
                                   f"с 1-й попытки")

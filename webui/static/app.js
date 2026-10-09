@@ -6,12 +6,16 @@ const BRIDGE_STARTUP_GRACE_SEC = 60;
 const BRIDGE_STATE = { bridge_ping_mode: null, bridge_started_at: 0, cmd_ack: null };
 // v1.33.28: не падать на не-JSON ответе (502/HTML от прокси, обрыв) — вместо
 // SyntaxError в консоли отдаём {}, и код уходит в свою ветку «нет данных».
+// v1.34.7: F2 — это верно ТОЛЬКО для не-успешных ответов. Успешный (ok)
+// ответ с битым JSON — баг API/клиента: ошибку пробрасываем дальше (throw),
+// иначе молча отданное {} маскирует поломку.
 (function () {
   if (typeof Response === "undefined" || !Response.prototype || !Response.prototype.json) return;
   const _json = Response.prototype.json;
   Response.prototype.json = function () {
     return _json.call(this).catch((e) => {
       try { console.warn("[api] не-JSON ответ:", this.url, this.status, e && e.message); } catch (_) {}
+      if (this.ok) throw e;   // v1.34.7: F2 — ok + битый JSON → дальше
       return {};
     });
   };
@@ -1526,7 +1530,16 @@ function selectNodeContents(el) {
   } catch (e) { console.warn("selection err", e); }
   return false;
 }
-function tryExecCopy(txt) {
+// v1.34.7: F5 — основной путь navigator.clipboard (HTTPS/localhost),
+// execCommand — фолбэк (HTTP/небезопасный контекст, старые браузеры).
+// Функция async — вызывающий ждёт результат.
+async function tryExecCopy(txt) {
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(txt);
+      return true;
+    }
+  } catch (e) { /* нет разрешения/небезопасный контекст — фолбэк ниже */ }
   try {
     const ta = document.createElement("textarea");
     ta.value = txt;
@@ -1539,10 +1552,10 @@ function tryExecCopy(txt) {
     return ok;
   } catch (e) { return false; }
 }
-function handleCopyAttempt(targetEl) {
+async function handleCopyAttempt(targetEl) {
   const txt = targetEl?.dataset?.copy || targetEl?.textContent || "";
   if (!txt) return;
-  const ok = tryExecCopy(txt);
+  const ok = await tryExecCopy(txt);
   selectNodeContents(targetEl);
   const hint = targetEl.parentElement?.querySelector(".copy-hint") ||
                targetEl.closest(".copy-row")?.querySelector(".copy-hint");
@@ -2054,8 +2067,12 @@ function renderDeviceTable(devs) {
     if (typeof av === "string") return av.localeCompare(bv) * SORT_DIR;
     return (av - bv) * SORT_DIR;
   });
+  // v1.34.7: F4 — Map устройство→индекс один раз: indexOf в map-цикле
+  // был O(n²) на каждую перерисовку (n = LAST_DEVICES). ?? -1 сохраняет
+  // прежнее поведение indexOf для отсутствующего устройства.
+  const idxMap = new Map(LAST_DEVICES.map((d, i) => [d, i]));
   tbody.innerHTML = sorted.map((d) => {
-    const realIdx = LAST_DEVICES.indexOf(d);
+    const realIdx = idxMap.get(d) ?? -1;
     const on = d.status === "online";
     const ip = d.ip ? `<div class="device-ip">${escapeHtml(d.ip)}</div>` : "";
     // v1.28.2: для battery/disabled/quiet — иконка вместо timeout
@@ -2128,8 +2145,10 @@ function _renderDisabledSection(disabled) {
     }
     return av.localeCompare(bv) * _sortDir;
   });
+  // v1.34.7: F4 — та же оптимизация Map→индекс вместо indexOf в цикле.
+  const idxMap = new Map(LAST_DEVICES.map((d, i) => [d, i]));
   body.innerHTML = sorted.map(d => {
-    const realIdx = LAST_DEVICES.indexOf(d);
+    const realIdx = idxMap.get(d) ?? -1;
     const ip = d.ip ? `<div class="device-ip">${escapeHtml(d.ip)}</div>` : "";
     return `<tr class="device-row device-row-disabled" onclick="showDevice(${realIdx})">
       <td><div style="font-weight:500;display:flex;align-items:center;gap:4px;min-width:0;"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(d.friendly_name || d.name)}</span><span class="badge enabled-off" style="font-size:10px;flex:0 0 auto;">⛔</span></div>${ip}</td>
@@ -2537,23 +2556,31 @@ function _onCacheToggle(deviceName, isOpen) {
 
 // v1.28.82: сохраняем/восстанавливаем скролл ЛЮБЫХ таблиц при перерисовке
 // (иначе после renderUpdate таблицы «откидывались» влево/вверх).
+// v1.34.7: F1 — селектор "*" (валидный; пустой селектор "" бросает
+// SyntaxError — пустых селекторов в файле быть не должно). Обёртка в
+// try: ошибка DOM/селектора не должна ронять перерисовку — откатываемся
+// к «скролл не сохранён/не восстановлен».
 function _captureScrolls(root) {
-  const nodes = Array.from(root.querySelectorAll("*"));
-  const out = [];
-  nodes.forEach((el, i) => {
-    if (el.scrollLeft || el.scrollTop) out.push({ i, l: el.scrollLeft, t: el.scrollTop });
-  });
-  return out;
+  try {
+    const nodes = Array.from(root.querySelectorAll("*"));
+    const out = [];
+    nodes.forEach((el, i) => {
+      if (el.scrollLeft || el.scrollTop) out.push({ i, l: el.scrollLeft, t: el.scrollTop });
+    });
+    return out;
+  } catch (e) { return []; }
 }
 function _restoreScrolls(root, saved) {
   if (!saved || !saved.length) return;
-  const nodes = Array.from(root.querySelectorAll("*"));
-  for (const s of saved) {
-    const el = nodes[s.i];
-    if (!el) continue;
-    if (s.l) el.scrollLeft = s.l;
-    if (s.t) el.scrollTop = s.t;
-  }
+  try {
+    const nodes = Array.from(root.querySelectorAll("*"));
+    for (const s of saved) {
+      const el = nodes[s.i];
+      if (!el) continue;
+      if (s.l) el.scrollLeft = s.l;
+      if (s.t) el.scrollTop = s.t;
+    }
+  } catch (e) { /* v1.34.7: нечего восстанавливать — не роняем вызывающего */ }
 }
 
 // v1.28.84: любое раскрытие <details> — небольшой скролл, чтобы блок был виден.
@@ -7073,7 +7100,9 @@ async function probeDeviceItem(item, idx) {
       clearTimeout(timeoutId);
     }
 
-    if (data.ok) {
+    // v1.34.7: F3 — r.json()/fetch могли не дать тела (data === undefined),
+    // data.ok на undefined/null бросал TypeError и терял сообщение ошибки.
+    if (data && data.ok) {
       // v1.29.2: probe перебирает ВСЕ версии и возвращает список ответивших.
       // Если ответили несколько — пользователь выбирает нужную в карточке.
       const _vers = Array.isArray(data.versions)
@@ -7132,12 +7161,14 @@ async function probeDeviceItem(item, idx) {
       if (isMobile()) renderImportPreview();
       else previewRefreshProbeUi(idx);
     } else {
-      const failHtml = `<span style="color:var(--red);">❌ ${escapeHtml(data.error || "ошибка")}</span>`;
+      // v1.34.7: F3 — data может быть undefined/null (обрыв/битый JSON):
+      // без проверки здесь падал TypeError вместо показа ошибки.
+      const failHtml = `<span style="color:var(--red);">❌ ${escapeHtml((data && data.error) || "ошибка")}</span>`;
       item.probe_status_html = failHtml;
       item.probe_ok = false;   // v1.32.4: неудачный probe больше не считается успехом
       item.probe_raw_html = _renderProbeRaw({
-        "версии (ответили)": data.versions || [],
-        "ошибка": data.error || "ответ без данных",
+        "версии (ответили)": (data && data.versions) || [],
+        "ошибка": (data && data.error) || "ответ без данных",
       });
       setStatus(failHtml);
       if (isMobile()) renderImportPreview();
@@ -9755,6 +9786,9 @@ function applyMobileLogsLayout() {
 applyMobileLogsLayout();
 // v1.24.2: убран resize-listener — applyMobileLogsLayout имеет
 // флаг _MOBILE_LOGS_LAYOUT_APPLIED, повторные вызовы ничего не делают.
+// v1.34.7: F7 — флаг НЕ сбрасывается при смене представления намеренно:
+// каждая вкладка — отдельная HTML-страница (свой экземпляр JS), а внутри
+// страницы раскладка логов не пересоздаётся.
 
 
 // ==================== v1.27.0: DPS EDIT ====================
@@ -11725,6 +11759,9 @@ async function closeDpsFill(evt, force) {
   // force=undefined и evt — обычное закрытие (Escape/overlay/крестик).
   // v1.28.25: force==="esc" — Escape. Закрываем БЕЗ подтверждения.
   // Иначе цикл: Esc → uiConfirm → Cancel → dps-fill открыт → Esc → uiConfirm ...
+  // v1.34.7: F6 — осознанно: при Esc несохранённые данные теряются без
+  // предупреждения (иначе возвращаемся к циклу выше). Черновик не
+  // сохраняем — минимальное документированное поведение.
   if (evt && evt.target && evt.target.id !== "dps-fill-overlay") return;
   const _no_confirm = (force === "esc");
   if (!_no_confirm && !force && _dpsFillDirty) {
