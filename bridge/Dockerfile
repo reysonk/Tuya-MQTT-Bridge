@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY cmd_tracker.py .
 COPY udp_detect.py .
 COPY healthcheck.py .
 

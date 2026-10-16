@@ -59,7 +59,7 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 WEBUI_PORT = _env_int("WEBUI_PORT", 5386)
 WEBUI_HOST = os.getenv("WEBUI_HOST") or "0.0.0.0"
-WEBUI_VERSION = "1.34.7"
+WEBUI_VERSION = "1.34.42"
 # v1.32.33: публичный номер релиза (совпадает с тегом релиза на GitHub).
 # Подвал показывает «Release X», а WebUI сверяет по нему наличие новой версии.
 # v1.34.7: X1 — ВАЖНО: публичные теги релизов — САМА нумерация (v1.4),
@@ -67,7 +67,7 @@ WEBUI_VERSION = "1.34.7"
 # 1.14.24 / WebUI 1.34.7). Дефолт = текущий публичный тег: сравнение
 # (1,3,x) > (1,34,7) всегда False — значок нового релиза молчал бы.
 # Переопределение через env RELEASE_TAG сохраняется.
-RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.4"
+RELEASE_TAG = os.getenv("RELEASE_TAG") or "1.5"
 
 # v1.32.34: проверка «есть ли релиз новее» на GitHub (публичный репозиторий, без токена;
 # GITHUB_TOKEN поддержан на случай, если репозиторий останется приватным).
@@ -130,6 +130,9 @@ TINYTUYA_DEVICES_FILE = "webui_state/tinytuya_devices.json"
 TUYA_CLOUD_CACHE_FILE = "webui_state/tuya_cloud_cache.json"
 CONFIG_AUDIT_FILE = "webui_state/config_audit.log"
 QUIET_HOURS_FILE = "webui_state/quiet_hours.json"
+# v1.34.19: отметки «это батарейное» для устройств не из конфига (по cloud id).
+# Модалка пересборки показывает их галочками, чтобы спящие не опрашивались.
+BATTERY_MARKS_FILE = "webui_state/battery_marks.json"
 QUIET_GRACE_SEC = 120
 AUDIT_MAX_BYTES = 5 * 1024 * 1024  # 5 МБ (v1.22.0)
 AUDIT_BACKUPS = 3
@@ -246,25 +249,30 @@ def _load_cloud_mappings():
             if not isinstance(d, dict):
                 continue
             mapping = d.get("mapping") or {}
-            if not isinstance(mapping, dict) or not mapping:
-                continue
             did = d.get("id") or ""
             dname = d.get("name") or ""
             _pid = d.get("product_id") or ""
+            # v1.34.18: product_id индексируем для ВСЕХ устройств, в т.ч. с
+            # пустым mapping (напр. Human Presence Sensor). Иначе
+            # _get_cloud_product_id() не находит pid → пересборка локальной
+            # базы падала «mapping пуст … product_id='001HPS01_5.8G'».
+            if _pid:
+                if did:
+                    pid_by_id[did] = _pid
+                if dname:
+                    pid_by_name[dname] = _pid
+            if not isinstance(mapping, dict) or not mapping:
+                continue
             # v1.28.34: code из Cloud functions (вариант C).
             wr = _writable_codes_from_props(d.get("_raw_properties"))
             if did:
                 by_id[did] = mapping
                 if wr is not None:
                     wr_by_id[did] = wr
-                if _pid:
-                    pid_by_id[did] = _pid
             if dname:
                 by_name[dname] = mapping
                 if wr is not None:
                     wr_by_name[dname] = wr
-                if _pid:
-                    pid_by_name[dname] = _pid
         with TUYA_CLOUD_MAPPING_LOCK:
             TUYA_CLOUD_MAPPING_BY_ID = by_id
             TUYA_CLOUD_MAPPING_BY_NAME = by_name
@@ -315,6 +323,64 @@ def _get_cloud_writable(tuya_id, friendly_name):
         if friendly_name and friendly_name in TUYA_CLOUD_WRITABLE_BY_NAME:
             return TUYA_CLOUD_WRITABLE_BY_NAME[friendly_name]
     return None
+
+
+def _import_fill_empty_dps_map(d):
+    """v1.34.30 (#1166): добрать dps_map для импорта, если прислали пустой.
+
+    Превью шлёт dps_map из клиентского getDeviceMapping — если облачный
+    mapping пуст (fetch маппингов не удался) и tuya-local ничего не подобрал,
+    filtered_dps выходит пустым, а мост молча запишет пустую карту
+    (наследование #15 срабатывает только при ОТСУТСТВИИ ключа dps_map).
+    Итог: у прибора нет MQTT-сущностей (см. #1165: select unknown).
+    Добор серверный: облачный кэш (mapping/product_id) → общий конвейер
+    _enrich_cloud_device (cloud + tuya-local + локальная база). Уже
+    непустую карту не трогаем; при полном отсутствии данных возвращаем
+    устройство как есть — решает мост/пользователь.
+    """
+    if not isinstance(d, dict):
+        return d
+    _dm = d.get("dps_map")
+    if isinstance(_dm, dict) and _dm:
+        return d
+    try:
+        d2 = dict(d)
+        _key = d2.get("friendly_name") or d2.get("name")
+        if not (isinstance(d2.get("mapping"), dict) and d2["mapping"]):
+            _cm = _get_cloud_mapping(d2.get("id"), _key)
+            if isinstance(_cm, dict) and _cm:
+                d2["mapping"] = _cm
+        if not d2.get("product_id"):
+            _pid = _get_cloud_product_id(d2.get("id"), _key)
+            if _pid:
+                d2["product_id"] = _pid
+        if not (isinstance(d2.get("mapping"), dict) and d2["mapping"]) \
+                and not d2.get("product_id"):
+            # Ни облачного mapping, ни product_id — сборке брать неоткуда
+            # (tuya-local и локальная база опираются на product_id/DP-коды).
+            return d
+        _gen = _enrich_cloud_device(d2).get("dps_map_generated") or {}
+        _filled = {}
+        for _dp, _info in _gen.items():
+            if not isinstance(_info, dict):
+                continue
+            # Служебные ключи источника (_dps_source/_dps_candidates/…) в
+            # devices_config.json не кладём — как в ручном потоке превью.
+            _entry = {k: v for k, v in _info.items()
+                      if not str(k).startswith("_")}
+            if _entry:
+                _filled[str(_dp)] = _entry
+        if not _filled:
+            return d
+        out = dict(d)
+        out["dps_map"] = _filled
+        log.info(f"[Import] {d.get('name', '?')}: пустой dps_map добран "
+                 f"из облачного кэша/tuya-local (+{len(_filled)} DP)")
+        return out
+    except Exception as e:
+        log.warning(f"[Import] {d.get('name', '?')}: авто-добор dps_map "
+                    f"не удался: {e}")
+        return d
 
 
 # v1.28.33.fixup3: датчики — всегда component=sensor, даже если
@@ -657,6 +723,43 @@ def _enrich_dps_map_from_cache(dps_map, cache, tuya_id, friendly_name, product_i
         if _ldb_cnd:
             candidates["local_db"] = _ldb_cnd
 
+    # v1.34.22: кандидаты «тип устройства» tuya-local по алгоритму HA
+    # (matches/match_quality): полное совпадение → источник «📚 tuya-local»
+    # (если он ещё не пришёл по product_id), частичное → «⚠️ Эвристика»
+    # («похожее устройство»). В авто-выбор не подставляем — решает пользователь.
+    if cloud_map:
+        _dev_dps = {str(k): {"type": ((v or {}).get("type")
+                                  if isinstance(v, dict) else None),
+                         "code": ((v or {}).get("code")
+                                  if isinstance(v, dict) else "")}
+                    for k, v in cloud_map.items()}
+        _cands = _tuya_local_candidates(_dev_dps, product_id,
+                                        dev_title=friendly_name)
+        _full = [c for c in _cands if c.get("match")]
+        _part = [c for c in _cands if not c.get("match")]
+        if _full and "tuya_local" not in candidates:
+            _best = _full[0]
+            _cnd = {}
+            for _dp, _m in _tl_entries_for_config(_best["file"]).items():
+                e = dict(_m) if isinstance(_m, dict) else {}
+                e["_dps_source"] = "tuya_local"
+                e["_dps_source_reason"] = _tl_reason(_best)
+                _cnd[str(_dp)] = e
+            if _cnd:
+                candidates["tuya_local"] = _cnd
+        if _part:
+            _sim = _part[0]
+            _note = (f"похоже на тип «{_sim['name']}» ({_sim['file']}), "
+                     f"покрытие {_sim['covered']}/{_sim['dev_total']} DP")
+            _cnd = {}
+            for _dp, _m in _tl_entries_for_config(_sim["file"]).items():
+                e = dict(_m) if isinstance(_m, dict) else {}
+                e["_dps_source"] = "heuristic"
+                e["_dps_source_reason"] = _note
+                _cnd[str(_dp)] = e
+            if _cnd:
+                candidates["heuristic"] = _cnd
+
     # --- сборка результата по приоритету ---
     out = dict(dps_map or {})
     added = 0
@@ -716,6 +819,119 @@ def _enrich_dps_map_from_cache(dps_map, cache, tuya_id, friendly_name, product_i
             if _changed:
                 out[_dp] = _new
     return out
+
+
+def _enrich_cloud_device(d):
+    """Собрать `dps_map_generated` для Cloud-устройства (fetch + кэш).
+
+    v1.34.10: единая точка сборки — используется и в /api/cloud/fetch, и при
+    отдаче /api/cloud/cache (чтобы устаревший кэш переобогащался свежими
+    данными tuya-local, не требуя повторного fetch с облаком).
+    Проставляет `_dps_source` каждому DP и ОБЪЕКТНЫЕ `_dps_candidates`
+    ({источник: запись}) — именно эту форму читает превью импорта.
+    """
+    if not isinstance(d, dict):
+        return d
+    dps_map = mapping_to_dps_map(
+        d.get("mapping", {}) or {},
+        d.get("category", ""),
+        _writable_codes_from_props(d.get("_raw_properties")),
+    )
+    for _dp, _info in dps_map.items():
+        if isinstance(_info, dict) and not _info.get("_dps_source"):
+            _info["_dps_source"] = "cloud"
+    product_id = d.get("product_id", "")
+    # v1.34.22: подбор типа устройства из tuya-local — алгоритм HA
+    # (matches/match_quality/possible_matches): точный product_id, иначе —
+    # совпадение обязательных DP и типов. Полные совпадения → источник
+    # «📚 tuya-local», частичные → «⚠️ Эвристика» (подбор похожего) как
+    # ПОДСКАЗКА (в «Авто» не идёт, см. app.js getDeviceMapping).
+    _dev_dps = {str(k): {"type": ((v or {}).get("type")
+                                  if isinstance(v, dict) else None),
+                         "code": ((v or {}).get("code")
+                                  if isinstance(v, dict) else "")}
+                for k, v in (d.get("mapping") or {}).items()}
+    _tl_cands = _tuya_local_candidates(
+        _dev_dps, product_id,
+        dev_title=f"{d.get('product_name','')} {d.get('model','')}")
+    _tl_full = [c for c in _tl_cands if c.get("match")]
+    _tl_part = [c for c in _tl_cands if not c.get("match")]
+    if _tl_cands:
+        # Список кандидатов для выпадашки «Тип устройства» в превью.
+        d["_tl_candidates"] = [_tl_candidate_public(c) for c in _tl_cands]
+    if _tl_full:
+        _best = _tl_full[0]
+        _a, _c = _tl_insert_entries(dps_map, _tl_entries_for_config(_best["file"]),
+                                    "tuya_local", _tl_reason(_best))
+        log.debug(f"[Cloud] {d.get('name','?')}: тип tuya-local «{_best['name']}» "
+                 f"({_best['file']}, q={_best['quality']}): "
+                 f"+{_a} DP, {_c} кандидатов")
+    if _tl_part:
+        _sim = _tl_part[0]
+        _sim_reason = (f"похоже на тип «{_sim['name']}» ({_sim['file']}), "
+                       f"покрытие {_sim['covered']}/{_sim['dev_total']} DP")
+        _a, _c = _tl_insert_entries(dps_map, _tl_entries_for_config(_sim["file"]),
+                                    "heuristic", _sim_reason)
+        log.debug(f"[Cloud] {d.get('name','?')}: похожий тип «{_sim['name']}» "
+                 f"({_sim['file']}, q={_sim['quality']}): "
+                 f"+{_a} DP, {_c} кандидатов")
+
+    # v1.34.24: «тип по схеме» — справка для карточки и тип для импорта НОВЫХ
+    # приборов. Берём только при уверенном совпадении (product_id либо покрытие
+    # ≥ TL_TYPE_SUGGEST_MIN_Q), иначе молчим: случайное полное совпадение
+    # (температурный датчик ↔ «Temperature alarm», 6/12 DP) даёт неверный тип.
+    # Конфиг УЖЕ работающих приборов при этом не меняется: смена `type`
+    # переписывает MQTT-топики и discovery (см. карточку #1145).
+    d["type_suggest"] = ""
+    d["type_suggest_src"] = ""
+    if _tl_full:
+        _b = _tl_full[0]
+        if _b.get("product_match") or _b.get("quality", 0) >= TL_TYPE_SUGGEST_MIN_Q:
+            _t = _tl_type_from_entries(_tl_entries_for_config(_b["file"]))
+            if _t:
+                d["type_suggest"] = _t
+                d["type_suggest_src"] = f"{_b['name']} ({_b['file']})"
+
+    # v1.34.20: источник «📦 Локальная база» в превью импорта. Раньше кандидаты
+    # local_db подмешивались только в per-device endpoint
+    # (_enrich_dps_map_from_cache), поэтому у облачных устройств эта кнопка
+    # гасла ВСЕГДА. Теперь — та же логика, что и у tuya-local.
+    _writable = _writable_codes_from_props(d.get("_raw_properties"))
+    _dev_type = guess_type_from_category(d.get("category", ""),
+                                         d.get("product_name", ""))
+    _ldb_map = _get_localdb_mapping(d.get("id", ""))
+    if _ldb_map:
+        _ldb_n = 0
+        _ldb_cand = 0
+        for _dp, _m in _ldb_map.items():
+            _e = _cloud_entry(str(_dp), _m, _writable, _dev_type)
+            if not _e:
+                continue
+            _e["_dps_source"] = "local_db"
+            _e["_name_source"] = "local_db"
+            _e["_dps_source_reason"] = ("взято из локальной базы "
+                                        "(tinytuya_devices.json)")
+            _cur = dps_map.get(str(_dp))
+            if isinstance(_cur, dict):
+                _cd = dict(_cur.get("_dps_candidates") or {})
+                _cd.setdefault(_cur.get("_dps_source") or "cloud",
+                               {k: v for k, v in _cur.items()
+                                if not str(k).startswith("_")})
+                _cd["local_db"] = {k: v for k, v in _e.items()
+                                   if not str(k).startswith("_")}
+                _cur["_dps_candidates"] = _cd
+                _ldb_cand += 1
+            else:
+                dps_map[str(_dp)] = _e
+                _ldb_n += 1
+        if _ldb_n or _ldb_cand:
+            log.debug(f"[Cloud] {d.get('name','?')}: локальная база обогатила "
+                     f"{_ldb_n} DP (+{_ldb_cand} кандидатов)")
+
+    d["dps_map_generated"] = dps_map
+    d["type_guess"] = guess_type_from_category(
+        d.get("category", ""), d.get("product_name", ""))
+    return d
 
 
 # ==================== LOGGING ====================
@@ -850,7 +1066,7 @@ def _check_tz_for_quiet():
         # явно UTC/GMT и НЕ задан TZ через env.
         env_tz = os.environ.get("TZ", "")
         if off_h == 0 and off_m == 0 and not env_tz and tzname.upper() in ("UTC", "GMT"):
-            log.warning("[Quiet] TZ=UTC — проверь docker-compose (TZ в docker-compose)")
+            log.warning("[Quiet] TZ=UTC — проверь docker-compose (TZ=Asia/Novosibirsk)")
     except Exception as e:
         log.warning(f"[Quiet] TZ check: {e}")
 
@@ -2149,7 +2365,6 @@ LOG_BUFFER_MAX = 5000
 
 
 def _read_initial_log():
-    global _log_seq
     for path, src in ((LOG_FILE, "bridge"), (LOG_FILE_WEBUI, "webui")):
         if not os.path.exists(path):
             continue
@@ -2386,6 +2601,11 @@ def _on_message(client, userdata, msg):
         if dev == "bridge": return
         with STATE_LOCK:
             if dev not in STATE["devices"]:
+                # v1.34.14: не поднимаем карточку-призрак из retained-сообщения
+                # устройства, которого нет в конфиге (DEVICE_META от моста).
+                if msg.retain and DEVICE_META and not get_device_meta(dev):
+                    log.info(f"[Ghost] ignored retained for unknown device: {dev}")
+                    return
                 STATE["devices"][dev] = {"status": "unknown", "last_seen": None,
                                           "cache": {}, "latency_ms": None, "latency_ts": None,
                                           "udp_alive": False}
@@ -2758,7 +2978,39 @@ def load_tinytuya_devices_json():
 
 
 # ==================== CLOUD CACHE ====================
-CLOUD_CACHE_LOCK = threading.Lock()
+# v1.34.14: RLock — load_cloud_cache может перезаписать очищенный файл.
+CLOUD_CACHE_LOCK = threading.RLock()
+
+# v1.34.14: НЕ-сырые ключи. tuya_cloud_cache.json хранит ТОЛЬКО ответ
+# Cloud; обогащение (dps_map_generated/_dps_source/type_guess) считается
+# на лету при отдаче API и в файл не пишется.
+_CLOUD_ENRICH_KEYS = ("dps_map_generated", "type_guess", "_dps_source",
+                      "_dps_candidates", "_dps_source_reason",
+                      # v1.34.18: тоже ПРОИЗВОДНЫЕ (не из ответа Cloud) —
+                      # в файле им не место. `_cloud_status_meta` собирается
+                      # extract_status_meta(), `_raw_keys` — просто sorted(d.keys()),
+                      # `_key_from_parent` — метка, что ключ взят у шлюза.
+                      "_cloud_status_meta", "_raw_keys", "_key_from_parent",
+                      # v1.34.22: список кандидатов типов tuya-local — тоже
+                      # производное (считается при отдаче, а не приходит из облака).
+                      "_tl_candidates",
+                      # v1.34.24: «тип по схеме» и его источник — производные.
+                      "type_suggest", "type_suggest_src")
+
+
+def _strip_cloud_enrichment(dev):
+    """Убрать производные (не-облачные) поля из записи устройства.
+
+    Возвращает True, если что-то было вычищено.
+    """
+    if not isinstance(dev, dict):
+        return False
+    _changed = False
+    for _k in _CLOUD_ENRICH_KEYS:
+        if _k in dev:
+            dev.pop(_k, None)
+            _changed = True
+    return _changed
 # v1.32.1: разобранный кэш по mtime файла — иначе /api/status перечитывал
 # tuya_cloud_cache.json на каждое устройство (N чтений файла за один опрос).
 _CLOUD_CACHE_MEM = {"mtime": None, "data": None}
@@ -2768,6 +3020,10 @@ def save_cloud_cache(devices, fetched_at=None, access_id="", region="eu"):
     with CLOUD_CACHE_LOCK:
         try:
             os.makedirs(os.path.dirname(TUYA_CLOUD_CACHE_FILE) or ".", exist_ok=True)
+            # v1.34.14: в файл — только сырые данные Cloud.
+            devices = list(devices or [])
+            for _d in devices:
+                _strip_cloud_enrichment(_d)
             payload = {
                 "fetched_at": int(fetched_at or time.time()),
                 "access_id": access_id,
@@ -2815,6 +3071,23 @@ def load_cloud_cache():
                 devices = data.get("devices")
                 if not isinstance(devices, list) or not devices:
                     data = None
+                else:
+                    # v1.34.14: чистим ранее записанное обогащение —
+                    # кэш на диске = только сырые данные Cloud.
+                    _cleaned = False
+                    for _d in devices:
+                        if _strip_cloud_enrichment(_d):
+                            _cleaned = True
+                    if _cleaned:
+                        log.info("[CloudCache] обогащение вычищено из кэша "
+                                 "(оставляем только сырые данные Cloud)")
+                        try:
+                            save_cloud_cache(
+                                devices, fetched_at=data.get("fetched_at"),
+                                access_id=data.get("access_id", ""),
+                                region=data.get("region", "eu"))
+                        except Exception as _e:
+                            log.warning(f"[CloudCache] sanitize save: {_e}")
             _CLOUD_CACHE_MEM["mtime"] = mtime
             _CLOUD_CACHE_MEM["data"] = data
             return data
@@ -3109,8 +3382,71 @@ def download_tuya_local_db(max_retries=3):
 # Строится один раз (при скачивании базы или лениво в фоне) и сохраняется в
 # webui_state/tuya-local-db.json — без сканирования 1962 YAML на каждый запрос.
 _TL_DB = None
+_TL_CFGS = None       # v1.34.22: конфиги tuya-local (файл → схема+мета) из индекса v3
+_TL_DP_INDEX = None   # v1.34.22: обратный индекс dp → конфиги (для подбора типа)
+_TL_BY_PRODUCT = None  # v1.34.22: обратный индекс product_id → конфиги
+_TL_CAND_CACHE = {}    # v1.34.23: кэш подбора типа (подпись устройства → кандидаты)
 _TL_DB_LOCK = threading.Lock()
 _TL_DB_BUILDING = False
+# v1.34.13: версия схемы парсера tuya-local. Индекс (webui_state/tuya-local-db.json)
+# хранит УЖЕ распарсенные dps_map, поэтому при изменении parse_tuya_local_yaml его
+# надо пересобрать — иначе UI показывает старый разбор (например legacy-имена
+# value/sensor, value_redirect-хелперы вроде alt, дубли dp-id).
+# ВАЖНО: увеличивать при ЛЮБОМ изменении parse_tuya_local_yaml/_TUYA_LOCAL_DEVICE_CLASSES.
+# v1.34.22: v3 — индекс хранит КОНФИГИ tuya-local (файл → схема+метаданные),
+# а не только разворот по product_id. Нужно для подбора типа устройства как в
+# HA (`matches()` / `match_quality()`): не только точный product_id, но и
+# совпадение обязательных DP и их типов, плюс список кандидатов.
+# 13.10.2026 06:57 (#1144): v4 — расширен _TUYA_LOCAL_DEVICE_CLASSES (enum, carbon_dioxide,
+# pm1/pm10/pm25/pm4, area, volatile_organic_compounds* и др. классы HA 2026.9);
+# мост (DEVICE_CLASSES_ALLOWED) зеркально расширен тем же списком.
+# 13.10.2026 13:20 (#1144): v5 — дубли id → ключ `id__<имя>`, scale/step из mapping/range.
+# 13.10.2026 13:50 (#1144 срезы 6+8.1): v6 — в dps_map попадает `type` DP
+# (base64/hex/unixtime/json…); value_redirect-цели собираются и с
+# conditions-уровня (иначе мусорные дубли в dps_map).
+# 13.10.2026 13:39 (#1144 срез 7): v7 — в запись попадают `readonly` (True)
+# и `persist` (False); мост гасит команды на readonly-DP.
+# 13.10.2026 13:43 (#1144 срез 4): v8 — `target_range`/`invert` из активной
+# ветки mapping (для light color_temp/std_color_temp min/max → кельвины);
+# поле `invert` — НЕ путать с lock `inverted`.
+# 13.10.2026 13:50 (#1144 срез 5): v9 — в запись попадают `format`
+# (подполя {name,bytes,min,max}), `mask`/`mask_signed`, `endianness`;
+# декод — отдельным этапом.
+# 13.10.2026 13:58 (#1144 срез 3 этап 1): v10 — `constraint` (имя DP-режима)
+# и `conditions` (свёрнутые ветки) информационно; движок — этап 2.
+# 13.10.2026 14:05 (#1144 срез 8.2, чтение): v11 — `redirect` (id-цепочка
+# mapping-ветки dps_val:null) и `redirect_ids` внутри conditions-веток —
+# мост-движок фоллбэка «нет своего значения → кэш DP-цели» (запись — 8.2b).
+# 13.10.2026 15:45 (#1144 batch A): v12 — `hidden: "unavailable"` трактуется
+# как скрытая сущность (≈250 сущностей / ~60 конфигов tuya-local); старый
+# индекс v11 → stale, пересобирается автоматически.
+TL_PARSER_VERSION = 12
+
+# Совместимость ОБЪЯВЛЕННЫХ типов: тип DP в tuya-local ↔ тип DP в облаке.
+# Порт правила HA `_typematch` в терминах наших данных (значения DP на момент
+# подбора у нас нет — есть объявленный облачный тип из mapping).
+TL_TYPE_COMPAT = {
+    "Boolean": ("boolean",),
+    "Integer": ("integer", "unixtime", "bitfield"),
+    # 13.10.2026 07:33 (аудит webui, P0): добавлены собственные lowercased-типы
+    # tuya-local ("enum"/"bitmap"/"raw") — без них каждый Enum/Bitmap/Raw-DP
+    # попадал в conflicts и ломал full-match почти для всех схем.
+    "Enum": ("enum", "string", "integer", "hex", "utf", "base"),
+    "String": ("string", "utf", "json", "hex", "base"),
+    "Bitmap": ("bitmap", "bitfield", "integer"),
+    "Json": ("json", "string"),
+    "Raw": ("raw", "base", "hex", "string", "utf", "json"),
+}
+TL_MATCH_MIN_COVER = 40      # совпадение без product_id: минимум % DP устройства
+TL_PARTIAL_MIN_COVER = 4     # «Эвристика»: минимум общих DP
+TL_PARTIAL_MIN_QUALITY = 50  # «Эвристика»: минимум % покрытия устройства
+TL_CAND_LIMIT = 8            # сколько кандидатов отдавать в UI
+TL_CAND_CACHE_MAX = 400      # v1.34.23: размер кэша подборов (по подписи устройства)
+# v1.34.24: минимальное покрытие схемы, при котором берём тип устройства из
+# tuya-local (плюс product_id всегда считается уверенным совпадением). Нужно,
+# чтобы «тип по схеме» не появлялся из-за случайного полного совпадения
+# (пример: температурный датчик и «Temperature alarm», покрытие 6/12 = 50 %).
+TL_TYPE_SUGGEST_MIN_Q = 80
 
 
 def _prune_tuya_local_db():
@@ -3160,12 +3496,14 @@ def _build_tuya_local_db(progress=None):
     if not HAS_YAML:
         log.warning("[tuya-local] pyyaml не установлен — индекс не строится")
         return None
-    global _TL_DB, _TL_DB_BUILDING
+    global _TL_DB, _TL_DB_BUILDING, _TL_CFGS, _TL_DP_INDEX, _TL_BY_PRODUCT
     with _TL_DB_LOCK:
         if _TL_DB_BUILDING:
             return None
         _TL_DB_BUILDING = True
     db = {}
+    configs = {}
+    by_product = {}
     try:
         if os.path.isdir(TUYA_LOCAL_YAML_DIR):
             files = [f for f in os.listdir(TUYA_LOCAL_YAML_DIR) if f.endswith(".yaml")]
@@ -3179,11 +3517,17 @@ def _build_tuya_local_db(progress=None):
                 except Exception:
                     data = None
                 if isinstance(data, dict):
-                    entries = parse_tuya_local_yaml(data)
-                    if entries:
-                        for p in (data.get("products") or []):
-                            if isinstance(p, dict) and p.get("id"):
-                                db[str(p["id"])] = entries
+                    # v1.34.22: храним КОНФИГ (схема + метаданные подбора типа),
+                    # а не только разворот product_id → схема.
+                    entries, meta = parse_tuya_local_config(data, fname)
+                    if entries and meta:
+                        key = meta["file"] or fname
+                        meta["entries"] = entries
+                        configs[key] = meta
+                        for p in (meta.get("products") or []):
+                            pid = str(p.get("id"))
+                            if pid and pid != "None":
+                                by_product.setdefault(pid, []).append(key)
                 if progress:
                     try:
                         progress(i, total)
@@ -3194,43 +3538,110 @@ def _build_tuya_local_db(progress=None):
             os.makedirs(dir_name, exist_ok=True)
             tmp = TUYA_LOCAL_INDEX_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(db, f, ensure_ascii=False, separators=(",", ":"))
+                json.dump({"__parser_version": TL_PARSER_VERSION,
+                           "configs": configs, "by_product": by_product},
+                          f, ensure_ascii=False, separators=(",", ":"))
             os.replace(tmp, TUYA_LOCAL_INDEX_FILE)
         except Exception as e:
             log.warning(f"[tuya-local] save db: {e}")
-        log.info(f"[tuya-local] БД проиндексирована: {len(db)} product_id")
+        # Разворот product_id → схема (совместимость с lookup_tuya_local).
+        for pid, keys in by_product.items():
+            for k in keys:
+                cfg = configs.get(k)
+                if isinstance(cfg, dict) and isinstance(cfg.get("entries"), dict):
+                    db[pid] = cfg["entries"]
+                    break
+        log.info(f"[tuya-local] БД проиндексирована: {len(configs)} конфигов, "
+                 f"{len(db)} product_id")
     except Exception as e:
         log.warning(f"[tuya-local] build db: {e}")
     finally:
         with _TL_DB_LOCK:
             if db:
                 _TL_DB = db
+            if configs:
+                _TL_CFGS = configs
+                _TL_DP_INDEX = None      # обратные индексы пересоберём по новым
+                _TL_BY_PRODUCT = None
+                _TL_CAND_CACHE.clear()   # 13.10.2026 07:33: кэш кандидатов от старого индекса
             _TL_DB_BUILDING = False
     return db
 
 
 def _load_tuya_local_db():
     """Загрузить webui_state/tuya-local-db.json (один раз в память)."""
-    global _TL_DB
+    global _TL_DB, _TL_CFGS
     with _TL_DB_LOCK:
-        if _TL_DB is not None:
+        if _TL_DB is not None and _TL_CFGS is not None:
             return _TL_DB
         building = _TL_DB_BUILDING
     if building:
         return None
     db = None
+    stale = False
+    cfgs = {}
     try:
         if os.path.exists(TUYA_LOCAL_INDEX_FILE):
             with open(TUYA_LOCAL_INDEX_FILE, "r", encoding="utf-8") as f:
-                db = json.load(f)
-            log.info(f"[tuya-local] БД загружена: {len(db)} product_id")
+                raw = json.load(f)
+            # v1.34.13: индекс помечен версией парсера. Старый формат или
+            # другая версия → считаем устаревшим, пересоберём.
+            # v1.34.22: v3 хранит `configs` + `by_product`.
+            if (isinstance(raw, dict)
+                    and raw.get("__parser_version") == TL_PARSER_VERSION
+                    and isinstance(raw.get("configs"), dict)):
+                cfgs = raw["configs"]
+                by_product = raw.get("by_product") or {}
+                db = {}
+                for pid, keys in by_product.items():
+                    for k in (keys or []):
+                        cfg = cfgs.get(k)
+                        if isinstance(cfg, dict) and isinstance(cfg.get("entries"), dict):
+                            db[str(pid)] = cfg["entries"]
+                            break
+                log.info(f"[tuya-local] БД загружена: {len(db)} product_id, "
+                         f"{len(cfgs)} конфигов (parser v{TL_PARSER_VERSION})")
+            else:
+                stale = True
     except Exception as e:
         log.warning(f"[tuya-local] load db: {e}")
         db = None
+    if stale:
+        # Индекс от другого парсера — не отдаём его и запускаем пересборку
+        # (lookup_tuya_local поднимет фоновый поток). Пока идёт сборка, tuya-local
+        # может временно не отвечать — это ожидаемо и самоисправляется.
+        log.info(f"[tuya-local] индекс устарел (нужен parser v{TL_PARSER_VERSION}) "
+                 f"→ пересборка")
+        return None
     if db is not None:
         with _TL_DB_LOCK:
             _TL_DB = db
+            _TL_CFGS = cfgs
+            _TL_CAND_CACHE.clear()   # 13.10.2026 07:33: индекс загружен заново — кандидаты устарели
     return db
+
+
+def _load_tuya_local_configs():
+    """Конфиги tuya-local (файл → схема + мета) из индекса v3.
+
+    v1.34.22: нужны для подбора типа устройства (как `possible_matches()` в HA).
+    Если индекса нет/он устарел — поднимаем фоновую пересборку и отдаём {}.
+    """
+    global _TL_CFGS
+    with _TL_DB_LOCK:
+        if _TL_CFGS is not None:
+            return _TL_CFGS
+    _load_tuya_local_db()          # заполнит _TL_CFGS либо запустит пересборку
+    with _TL_DB_LOCK:
+        if _TL_CFGS is not None:
+            return _TL_CFGS
+        building = _TL_DB_BUILDING
+    if not building:
+        threading.Thread(target=_build_tuya_local_db, daemon=True,
+                         name="tuya-local-index").start()
+    with _TL_DB_LOCK:
+        _TL_CFGS = {}
+        return _TL_CFGS
 
 
 def lookup_tuya_local(product_id):
@@ -3244,6 +3655,369 @@ def lookup_tuya_local(product_id):
                              name="tuya-local-index").start()
         return None
     return db.get(str(product_id))
+
+
+# ==================== v1.34.22: подбор типа устройства (как в HA) ============
+# Эталон — tuya-local helpers/device_config.py: matches() / match_quality() /
+# _typematch() / possible_matches(). Мы повторяем ту же логику на своих данных
+# (у нас нет значений DP на момент подбора — есть облачный mapping: dp → тип).
+# Зачем: у большинства приборов заказчика схемы в базе tuya-local ЕСТЬ, но под
+# ДРУГИМИ product_id. Точный product_id — редкость, поэтому тип подбираем по
+# совпадению обязательных DP и типов, как это делает HA при добавлении.
+
+def _tl_type_ok(tl_type, cloud_type):
+    """Совместим ли объявленный тип DP tuya-local с облачным типом DP."""
+    tl = str(tl_type or "").lower()
+    if not tl:
+        return True
+    allowed = TL_TYPE_COMPAT.get(str(cloud_type or ""))
+    if not allowed:
+        return True          # облачный тип неизвестен — не мешаем
+    return tl in allowed
+
+
+_TL_TOK = re.compile(r"[^a-z0-9]+")
+
+
+def _tl_tokens(value):
+    """Токены имени/кода DP без цифр (switch_1 → {switch})."""
+    return {t for t in _TL_TOK.split(str(value or "").lower())
+            if t and not t.isdigit()}
+
+
+# v1.34.22: служебные слова не считаем совпадением имён: иначе у протечек
+# («WiFi water sensor») совпадает PIR («pir sensor») — оба «sensor».
+_TL_TITLE_STOP = {"sensor", "smart", "wifi", "wireless", "device", "module",
+                  "with", "and", "the", "pro", "new", "mini", "v2"}
+
+
+def _tl_title_tokens(value):
+    return _tl_tokens(value) - _TL_TITLE_STOP
+
+
+def _tl_dev_type(dev_dps, dp):
+    """(оставлено для совместимости со старыми вызовами подбора)"""
+    v = (dev_dps or {}).get(dp)
+    return v.get("type") if isinstance(v, dict) else v
+
+
+def _tl_build_lookup(cfgs):
+    """Обратные индексы для быстрого подбора: dp → конфиги, pid → конфиги.
+
+    v1.34.23: здесь же готовим предвычисленные множества конфигов
+    (`_prep`) — один раз на процесс, чтобы не считать их в горячем пути.
+    """
+    dp_idx, by_pid = {}, {}
+    for key, cfg in (cfgs or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        if "_prep" not in cfg:
+            try:
+                _tl_prep_config(cfg)
+            except Exception:
+                pass
+        for dp in (cfg.get("dps") or {}):
+            dp_idx.setdefault(str(dp), []).append(key)
+        for p in (cfg.get("products") or []):
+            pid = str((p or {}).get("id") or "")
+            if pid:
+                by_pid.setdefault(pid, []).append(key)
+    return ({k: tuple(v) for k, v in dp_idx.items()},
+            {k: tuple(v) for k, v in by_pid.items()})
+
+
+def _tl_lookup():
+    """(конфиги, индекс по DP, индекс по product_id) — с кэшем в памяти."""
+    global _TL_DP_INDEX, _TL_BY_PRODUCT
+    with _TL_DB_LOCK:
+        cfgs, idx = _TL_CFGS, _TL_DP_INDEX
+    if cfgs is None:
+        cfgs = _load_tuya_local_configs()
+        with _TL_DB_LOCK:
+            idx = _TL_DP_INDEX
+    if idx is None:
+        idx, by_pid = _tl_build_lookup(cfgs)
+        with _TL_DB_LOCK:
+            _TL_DP_INDEX, _TL_BY_PRODUCT = idx, by_pid
+    return cfgs, _TL_DP_INDEX, (_TL_BY_PRODUCT or {})
+
+
+def _tl_prep_config(cfg):
+    """Предвычисленные множества конфига (один раз на процесс).
+
+    v1.34.23: в проде контейнер на CPU-лимите — гонять регулярки и словари по
+    ~1700 конфигам на каждое устройство нельзя (было ~1 с на устройство, 38 с на
+    запрос кэша, healthcheck падал). Всё, что не зависит от устройства, считаем
+    один раз.
+    """
+    dps = cfg.get("dps") or {}
+    ent = cfg.get("entries") or {}
+    dp_tok = {}
+    for dp in dps:
+        e = ent.get(dp) or {}
+        dp_tok[str(dp)] = frozenset(_tl_tokens(e.get("name") or e.get("code") or ""))
+    prep = {
+        "dps": frozenset(str(x) for x in dps),
+        "req": frozenset(str(x) for x in (cfg.get("required") or [])),
+        "tok": frozenset(_tl_title_tokens(cfg.get("name"))),
+        "dp_tok": dp_tok,
+        "pids": frozenset(str(p.get("id")) for p in (cfg.get("products") or [])
+                          if isinstance(p, dict) and p.get("id") is not None),
+    }
+    cfg["_prep"] = prep
+    return prep
+
+
+def _tl_dev_sig(dev_dps, dev_title=""):
+    """Подпись устройства для матчинга: DP, их типы и токены имён."""
+    keys, types, toks = set(), {}, {}
+    for k, v in (dev_dps or {}).items():
+        ks = str(k)
+        keys.add(ks)
+        if isinstance(v, dict):
+            types[ks] = v.get("type")
+            toks[ks] = frozenset(_tl_tokens(v.get("code")))
+        else:
+            types[ks] = v
+            toks[ks] = frozenset()
+    return {"keys": keys, "types": types, "toks": toks,
+            "title": frozenset(_tl_title_tokens(dev_title))}
+
+
+def _tl_match_config(cfg, sig, product_id=""):
+    """Вердикт по конфигу tuya-local (порт HA matches/match_quality).
+
+    sig — подпись устройства из `_tl_dev_sig()`. Возвращает dict:
+      match     — конфиг подходит (product_id ИЛИ все обязательные DP есть и
+                  нет конфликтов типов);
+      quality   — 101 при совпадении product_id, иначе % DP устройства, которые
+                  покрывает конфиг (0..100);
+      missing   — обязательные DP конфига, которых у устройства нет;
+      conflicts — DP с несовместимыми типами;
+      covered / dev_total / cfg_total / extra — числа для честной подписи.
+    """
+    prep = cfg.get("_prep") or _tl_prep_config(cfg)
+    dev_keys = sig["keys"]
+    cfg_dps = cfg.get("dps") or {}
+    product_match = bool(product_id) and str(product_id) in prep["pids"]
+    covered = prep["dps"] & dev_keys
+    missing = prep["req"] - dev_keys
+    _types = sig["types"]
+    conflicts = []
+    for dp in covered:
+        if not _tl_type_ok((cfg_dps.get(dp) or {}).get("type"), _types.get(dp)):
+            conflicts.append(dp)
+    # v1.34.22: совпадение ИМЁН DP (switch_1 ↔ switch) — тай-брейк ранжирования:
+    # без него у приборов с 2-3 DP сверху оказывается случайный тип (у PIR —
+    # «water leak detector»).
+    _toks = sig["toks"]
+    _dp_tok = prep["dp_tok"]
+    agree = 0
+    for dp in covered:
+        _t = _dp_tok.get(dp)
+        if _t and (_t & _toks.get(dp, frozenset())):
+            agree += 1
+    # v1.34.22: имя самого устройства (облачные product_name/model: «PIR»,
+    # «water leak sensor», «WiFi Breaker», «Smart Switch») против имени типа в
+    # tuya-local — самый весомый признак при равном покрытии: у 2-DP датчиков
+    # иначе первым оказывается случайный тип (PIR ↔ water leak detector).
+    title_agree = int(bool(sig["title"] & prep["tok"]))
+    total = len(dev_keys)
+    _cov = len(covered)
+    quality = round(_cov * 100 / total) if total else 0
+    name_agree = round(agree / _cov, 3) if _cov else 0.0
+    if product_match:
+        # v1.34.22: точный product_id — сильнее любого разбора DP (так же, как
+        # продукт-совпадение в HA; конфликты типов тут только логируем).
+        quality, is_match = 101, True
+    else:
+        # Как в HA: обязательные DP должны быть на месте, конфликтов типов быть
+        # не должно; плюс наш порог покрытия — иначе «подходит» любой конфиг
+        # без обязательных DP.
+        is_match = (not missing and not conflicts
+                    and quality >= TL_MATCH_MIN_COVER)
+    return {
+        "file": cfg.get("file", ""),
+        "name": cfg.get("name") or cfg.get("file", ""),
+        "product_match": product_match,
+        "match": bool(is_match),
+        "quality": int(quality),
+        "name_agree": name_agree,
+        "title_agree": title_agree,
+        "covered": _cov,
+        "dev_total": total,
+        "cfg_total": len(cfg_dps),
+        "extra": max(0, len(cfg_dps) - _cov),
+        "missing": [str(x) for x in sorted(missing)[:12]],
+        "conflicts": [str(x) for x in conflicts[:12]],
+    }
+
+
+def _tuya_local_candidates(dev_dps, product_id="", limit=TL_CAND_LIMIT,
+                           dev_title=""):
+    """Кандидаты «тип устройства» tuya-local — как список в HA.
+
+    Сначала полные совпадения (📚 tuya-local), затем частичные (⚠️ Эвристика —
+    «похожее устройство»); каждый набор — по убыванию качества.
+    Полный перебор 1771 конфига на каждое устройство дорог, поэтому берём
+    только конфиги, у которых есть общий DP с устройством (обратный индекс),
+    плюс конфиги с совпавшим product_id.
+    """
+    cfgs, dp_idx, by_pid = _tl_lookup()
+    if not cfgs:
+        return []
+    sig = _tl_dev_sig(dev_dps, dev_title)
+    dev_keys = sig["keys"]
+    # v1.34.23: кэш результата по подписи устройства (DP + их типы + имена DP +
+    # имя устройства + product_id). Обогащение кэша облака считается на каждый
+    # запрос дашборда — без кэша на CPU-лимите это секунды.
+    _key = (str(product_id),
+            tuple(sorted(sig["keys"])),
+            tuple(sorted((dp, str(sig["types"].get(dp)))
+                         for dp in sig["keys"])),
+            tuple(sorted((dp, tuple(sorted(sig["toks"].get(dp) or ())))
+                         for dp in sig["keys"])),
+            tuple(sorted(sig["title"])))
+    _cached = _TL_CAND_CACHE.get(_key)
+    if _cached is not None:
+        return _cached
+    counts = {}
+    for dp in dev_keys:
+        for key in dp_idx.get(dp, ()):
+            counts[key] = counts.get(key, 0) + 1
+    for key in by_pid.get(str(product_id), ()) if product_id else ():
+        counts[key] = counts.get(key, 0) + 1000
+    full, part = [], []
+    for key, covered in counts.items():
+        cfg = cfgs.get(key)
+        if not isinstance(cfg, dict):
+            continue
+        # v1.34.23: дешёвый отсев ДО вердикта. Конфиг может подойти, только
+        # если (а) совпал product_id, (б) все обязательные DP есть на
+        # устройстве (covered >= len(required)), либо (в) частичное совпадение
+        # (covered >= TL_PARTIAL_MIN_COVER). Иначе считать нечего.
+        _prep = cfg.get("_prep") or _tl_prep_config(cfg)
+        if str(product_id) not in _prep["pids"] and \
+                covered < min(len(_prep["req"]), TL_PARTIAL_MIN_COVER):
+            continue
+        try:
+            v = _tl_match_config(cfg, sig, product_id)
+        except Exception:
+            continue
+        if v["match"]:
+            full.append(v)
+        elif (v["covered"] >= TL_PARTIAL_MIN_COVER
+              and v["quality"] >= TL_PARTIAL_MIN_QUALITY):
+            part.append(v)
+    full.sort(key=lambda v: (-v["quality"], -v["title_agree"], -v["name_agree"],
+                             v["extra"], v["file"]))
+    part.sort(key=lambda v: (-v["quality"], -v["title_agree"], -v["name_agree"],
+                             v["extra"], v["file"]))
+    out = (full + part)[:limit]
+    # v1.34.23: кэш по подписи устройства — дашборд дёргает обогащение часто, а
+    # данные прибора между запросами не меняются.
+    if len(_TL_CAND_CACHE) >= TL_CAND_CACHE_MAX:
+        _TL_CAND_CACHE.clear()
+    _TL_CAND_CACHE[_key] = out
+    return out
+
+
+# v1.34.24: тип устройства (как в конфиге моста) по компонентам схемы tuya-local.
+# «Управляющие» платформы — их и считаем: прибор с DP light (подсветка) И DP
+# switch (реле) — это выключатель с подсветкой, а не лампа.
+_TL_COMP_TYPE_ACT = ("light", "climate", "cover", "fan", "media_player",
+                     "vacuum", "humidifier", "switch")
+
+
+def _tl_type_from_entries(entries):
+    """Тип устройства по компонентам схемы tuya-local ("" — если непонятно).
+
+    v1.34.24: считаем ВХОЖДЕНИЯ, а не первый по списку: у 2-гангового
+    выключателя есть и `switch` (реле), и `light` (подсветка) — частый
+    компонент честнее; при равенстве решает порядок _TL_COMP_TYPE_ACT.
+    Если управляющих компонентов нет — это датчик.
+    """
+    cnt = {}
+    for e in (entries or {}).values():
+        if isinstance(e, dict):
+            c = e.get("component")
+            if c:
+                cnt[str(c)] = cnt.get(str(c), 0) + 1
+    if not cnt:
+        return ""
+    best, best_n = "", 0
+    for t in _TL_COMP_TYPE_ACT:
+        _n = cnt.get(t, 0)
+        if _n > best_n:
+            best, best_n = t, _n
+    if best:
+        return best
+    return "binary_sensor" if cnt.get("binary_sensor") else "sensor"
+
+
+def _tl_entries_for_config(file_key):
+    """Схема (dps_map) конфига tuya-local по ключу файла."""
+    cfgs, _idx, _pid = _tl_lookup()
+    cfg = cfgs.get(str(file_key)) if isinstance(cfgs, dict) else None
+    if isinstance(cfg, dict) and isinstance(cfg.get("entries"), dict):
+        return cfg["entries"]
+    return {}
+
+
+def _tl_candidate_public(c):
+    """Кандидат в том виде, в котором его отдаём в UI (без схемы DP)."""
+    return {
+        "file": c.get("file", ""),
+        "name": c.get("name", ""),
+        "quality": c.get("quality", 0),
+        "name_agree": c.get("name_agree", 0),
+        "title_agree": c.get("title_agree", 0),
+        "match": bool(c.get("match")),
+        "product_match": bool(c.get("product_match")),
+        "covered": c.get("covered", 0),
+        "dev_total": c.get("dev_total", 0),
+        "cfg_total": c.get("cfg_total", 0),
+        "missing": c.get("missing") or [],
+        "conflicts": c.get("conflicts") or [],
+    }
+
+
+def _tl_reason(c):
+    """Человеческая причина выбора типа устройства (в UI и в логах)."""
+    if c.get("product_match"):
+        return f"product_id найден в tuya-local: {c['name']} ({c['file']})"
+    return (f"тип tuya-local по совпадению DP: {c['name']} ({c['file']}), "
+            f"покрытие {c.get('covered')}/{c.get('dev_total')} DP")
+
+
+def _tl_insert_entries(dps_map, entries, source, reason, writable=None,
+                       dev_type=None):
+    """Вставить DP конфига tuya-local в dps_map: новые — как источник,
+    занятые — кандидатом (приоритет существующего источника сохраняется).
+
+    Возвращает (добавлено, кандидатов).
+    """
+    added = cand = 0
+    for dp, info in (entries or {}).items():
+        if not isinstance(info, dict):
+            continue
+        e = dict(info)
+        e["_dps_source"] = source
+        e["_dps_source_reason"] = reason
+        cur = dps_map.get(str(dp))
+        if isinstance(cur, dict):
+            cd = dict(cur.get("_dps_candidates") or {})
+            cd.setdefault(cur.get("_dps_source") or "cloud",
+                         {k: v for k, v in cur.items()
+                          if not str(k).startswith("_")})
+            cd[source] = {k: v for k, v in e.items()
+                          if not str(k).startswith("_")}
+            cur["_dps_candidates"] = cd
+            cand += 1
+        else:
+            dps_map[str(dp)] = e
+            added += 1
+    return added, cand
 
 
 def _tuya_local_update_worker():
@@ -3294,37 +4068,505 @@ def _tuya_local_update_worker():
          ok=True, report=_report)
 
 
+# Белые списки device_class — ЗЕРКАЛО моста (bridge main.py:
+# DEVICE_CLASSES_ALLOWED + COVER_DEVICE_CLASSES_ALLOWED). Нужны, чтобы парсер
+# tuya-local не отдавал невалидные для моста классы: tuya-local использует и
+# свои (`enum`, `temperature`...) — лишние молча отбрасываем.
+_TUYA_LOCAL_DEVICE_CLASSES = {
+    # sensor
+    "temperature", "humidity", "battery", "energy", "power", "current",
+    "voltage", "frequency", "power_factor", "illuminance", "pressure",
+    "signal_strength", "timestamp", "duration", "distance",
+    # sensor — расширение 13.10.2026 06:57 (#1144): классы, которые реально использует
+    # tuya-local и которые есть в HA 2026.9 (сверено по устройству стенда)
+    "absolute_humidity", "apparent_power", "aqi", "area", "atmospheric_pressure",
+    "carbon_dioxide", "carbon_monoxide", "conductivity", "data_rate",
+    "data_size", "date", "energy_distance", "energy_storage", "enum",
+    "irradiance", "monetary", "nitrogen_dioxide", "nitrogen_monoxide",
+    "nitrous_oxide", "ozone", "ph", "pm1", "pm10", "pm25", "pm4",
+    "precipitation", "precipitation_intensity", "radon", "reactive_energy",
+    "reactive_power", "sound_pressure", "speed", "sulphur_dioxide",
+    "temperature_delta", "uptime", "volatile_organic_compounds",
+    "volatile_organic_compounds_parts", "volume", "volume_flow_rate",
+    "volume_storage", "water", "weight", "wind_direction", "wind_speed",
+    # binary_sensor
+    "battery", "battery_charging", "problem", "door", "motion", "moisture",
+    "smoke", "gas", "light", "opening", "window", "garage_door", "lock",
+    "presence", "running", "plug", "sound", "vibration", "update",
+    "connectivity", "tamper", "heat", "cold", "moving", "occupancy", "safety",
+    # cover
+    "curtain", "blind", "shade", "shutter", "garage", "gate",
+    "awning", "damper",
+}
+
+
+def _slug_tuya_name(value):
+    """Имя entity/DP из tuya-local → slug для моста (latin alnum + '_')."""
+    s = str(value or "").strip().lower()
+    s = re.sub(r"[^0-9a-z]+", "_", s)
+    return s.strip("_")
+
+
+def _tuya_bool(value):
+    """Значение mapping в tuya-local → bool (для binary_sensor)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "on", "1", "yes")
+    return False
+
+
+def _tl_entities_dps(yaml_data):
+    """Реальные DP конфига tuya-local: [(entity, [dp, ...]), ...].
+
+    v1.34.22: вынесено из парсера — тем же списком пользуются и схема моста
+    (parse_tuya_local_yaml), и метаданные подбора типа (parse_tuya_local_config).
+    Отбрасываются dp-хелперы (`value_redirect`) и дубли id внутри entity.
+    """
+    out = []
+    if not isinstance(yaml_data, dict):
+        return out
+    entities = yaml_data.get("entities", [])
+    if not isinstance(entities, list):
+        return out
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        dps = ent.get("dps", [])
+        if not isinstance(dps, list):
+            continue
+        dps = [d for d in dps if isinstance(d, dict) and d.get("id") is not None]
+        # v1.34.11: `value_redirect: <name>` — dp-хелпер (пример: dp11 `alt`
+        # при dp103). Его значение подставляется другому DP и отдельной
+        # сущностью НЕ является — иначе в HA висит пустой дубль.
+        # 13.10.2026 13:36 (#1144 срез 8.1): цели собираются и с conditions-уровня
+        # (ветки `constraint`/`conditions` — 145 конфигов иначе давали
+        # мусорные дубли в dps_map, проверено на advancedfires_*).
+        redirect_targets = set()
+        for _d in dps:
+            for _m in (_d.get("mapping") or []):
+                if not isinstance(_m, dict):
+                    continue
+                if _m.get("value_redirect"):
+                    redirect_targets.add(_slug_tuya_name(_m.get("value_redirect")))
+                for _c in (_m.get("conditions") or []):
+                    if isinstance(_c, dict) and _c.get("value_redirect"):
+                        redirect_targets.add(_slug_tuya_name(_c.get("value_redirect")))
+        # Реальные под-DP entity: без хелперов и без дублей id (один id дважды
+        # в одной entity у tuya-local — основным считаем первый).
+        eff_dps = []
+        _seen = set()
+        for _d in dps:
+            _id = str(_d.get("id"))
+            if _id in _seen:
+                continue
+            _s = _slug_tuya_name(_d.get("name"))
+            if _s and _s in redirect_targets:
+                continue
+            _seen.add(_id)
+            eff_dps.append(_d)
+        if eff_dps:
+            out.append((ent, eff_dps))
+    return out
+
+
 def parse_tuya_local_yaml(yaml_data):
-    result = {}
+    """Разбор YAML tuya-local → dps_map в схеме моста (v1.33.14).
+
+    Соответствует РЕАЛЬНОЙ схеме tuya-local (а не плоскому срезу ключей):
+      entity: entity (компонент), class (device_class), name, dps[]
+      dp:     id, name, unit, scale, class (state_class у sensor),
+              range: {min, max}, step, options, mapping[]
+      mapping entry: dps_val / value / value_redirect / step
+
+    Что это чинит генерально (для любого устройства):
+      - entity-level `class` → device_class (motion/illuminance/...);
+      - entity-level `name` → имя сущности (иначе у чисел выходило «value»);
+      - вложенный range {min,max} → плоские min/max (мост их требует);
+      - step из mapping ([{step: 10}]) → step;
+      - mapping → map: binary_sensor (dps_val → ON/OFF).
+    """
     if not isinstance(yaml_data, dict):
         return None
     entities = yaml_data.get("entities", [])
     if not isinstance(entities, list):
         return None
-    for ent in entities:
-        if not isinstance(ent, dict):
-            continue
+
+    result = {}
+    for ent, eff_dps in _tl_entities_dps(yaml_data):
         component = ent.get("entity", "sensor")
-        dps = ent.get("dps", [])
-        if not isinstance(dps, list):
-            continue
-        for dp in dps:
-            if not isinstance(dp, dict):
+        ent_class = ent.get("class")
+        ent_name = ent.get("name")
+        # v1.34.11: `hidden: unavailable` — entity показывается только когда
+        # доступна; мост реализует это ленивым Discovery.
+        # 13.10.2026 03:50 (#1152): было bool(...) — строка "unavailable" давала True и
+        # превращалась в «скрывать ВСЕГДА» (bridge ждёт bool: main.py:1604).
+        # Теперь скрываем только явный булев True.
+        # 13.10.2026 15:45 (#1144 batch A): `hidden: "unavailable"` трактуется как
+        # скрытая сущность (bridge делает lazy Discovery). Остальные строковые
+        # значения игнорируются — только явный bool True или строка "unavailable".
+        ent_hidden = ent.get("hidden") is True or ent.get("hidden") == "unavailable"
+        # Имя entity: явное `name`, иначе `class`. У одиночного под-DP оно
+        # задаёт имя сущности (tuya-local оставляет dp-имена «sensor», различая
+        # их только классом) — иначе берём dp-имена.
+        ent_label = _slug_tuya_name(ent_name) or _slug_tuya_name(ent_class)
+        single = len(eff_dps) == 1
+
+        # 13.10.2026 14:15 (#1144 срез 8.2): цели value_redirect ФИЛЬТРУЮТСЯ
+        # ещё в _tl_entities_dps (срез 8.1) — карту имени→id строим из
+        # СЫРЫХ dps сущности (ent["dps"]), как find_dps в tuya-local
+        # (device_config.py:828 — цели всегда внутри своей сущности).
+        # Цепочки: цель → своя цель → … (макс. 4 звена).
+        _raw_dps = ent.get("dps") if isinstance(ent, dict) else None
+        if not isinstance(_raw_dps, list):
+            _raw_dps = eff_dps
+        _id_by_name = {}
+        _dp_by_name = {}
+        for _d in _raw_dps:
+            if not isinstance(_d, dict):
                 continue
+            _dn = _d.get("name")
+            if _dn and _d.get("id") is not None:
+                _id_by_name.setdefault(_dn, str(_d.get("id")))
+                _dp_by_name.setdefault(_dn, _d)
+
+        def _redirect_chain(start_name, _seen=None):
+            """id-цепочка value_redirect от start_name (макс. 4 звена)."""
+            _seen = _seen if _seen is not None else set()
+            _chain = []
+            _name = start_name
+            for _ in range(4):
+                if not _name or _name in _seen:
+                    break
+                _seen.add(_name)
+                _tid = _id_by_name.get(_name)
+                if _tid is None:
+                    break
+                _chain.append(_tid)
+                _tdp = _dp_by_name.get(_name)
+                if _tdp is None or not isinstance(_tdp.get("mapping"), list):
+                    break
+                _name = None
+                for _m in _tdp["mapping"]:
+                    if isinstance(_m, dict) and "value_redirect" in _m \
+                            and "dps_val" in _m and _m["dps_val"] is None \
+                            and _m.get("value_redirect"):
+                        _name = _m["value_redirect"]
+                        break
+            return _chain
+
+        for dp in eff_dps:
             dp_id = dp.get("id")
-            if dp_id is None:
-                continue
             dp_id_str = str(dp_id)
+            raw_name = ent_label if (single and ent_label) else dp.get("name")
             entry = {
                 "component": component,
-                "name": dp.get("name", f"dp_{dp_id}"),
+                "name": _slug_tuya_name(raw_name or f"dp_{dp_id}") or f"dp_{dp_id}",
             }
-            for k in ("device_class", "unit", "state_class", "scale",
-                      "min", "max", "step", "options", "range"):
-                if k in dp:
+
+            # v1.34.11: entity `hidden: unavailable` → ленивый Discovery в мосте
+            # (сущность появляется только когда устройство реально шлёт значение).
+            if ent_hidden:
+                entry["hidden"] = True
+
+            # device_class: entity-level `class` (motion/illuminance/...);
+            # реже — dp-level. Ставим только валидные для моста классы
+            # (tuya-local использует и свои — `enum` и пр., их отбрасываем).
+            dc = dp.get("device_class") or ent_class
+            if dc and component in ("sensor", "binary_sensor", "cover") \
+                    and dc in _TUYA_LOCAL_DEVICE_CLASSES:
+                entry["device_class"] = dc
+
+            if dp.get("unit") is not None:
+                entry["unit"] = dp["unit"]
+            # 13.10.2026 13:39 (#1144 срез 7): readonly/persist из схемы tuya-local.
+            # readonly — мост гасит команды в process_command; persist:false —
+            # значение не персистентно на приборе (информационно, availability).
+            # optional НЕ дублируем — он уже в meta и required (webui.py:4264).
+            if dp.get("readonly") is True:
+                entry["readonly"] = True
+            if dp.get("persist") is False:
+                entry["persist"] = False
+            # 13.10.2026 01:20 (#1144 срез 10): precision/force/sensitive из схемы
+            # tuya-local. precision потребляет мост (округление float в
+            # _publish_sensor_value); force/sensitive — informational
+            # (поллинг-интеграция и лог-маскировка — отдельными этапами).
+            if dp.get("precision") is not None:
+                entry["precision"] = dp["precision"]
+            if dp.get("force") is True:
+                entry["force"] = True
+            if dp.get("sensitive") is True:
+                entry["sensitive"] = True
+            # 13.10.2026 13:36 (#1144 срез 6): тип значения схемы tuya-local
+            # (base64/hex/unixtime/json/utf16hex…) — раньше был только в meta
+            # для матчинга, в dps_map не попадал. Мост публикует значение как
+            # есть (строку), но тип виден в UI/импорте; `_DP_FIELDS_COMMON`
+            # уже содержит "type" — правка моста не нужна.
+            _dtype = dp.get("type")
+            if _dtype is not None:
+                entry["type"] = _dtype
+            # 13.10.2026 13:50 (#1144 срез 5): format/mask — только факт и
+            # параметры (struct.unpack / int(mask,16) — отдельным этапом;
+            # семантика tuya-local: device_config.py:450-509). Этап записи
+            # публикацию не трогает (raw уходит как есть, main.py:7629-7637).
+            _fmt = dp.get("format")
+            if isinstance(_fmt, list) and _fmt:
+                _fl = []
+                for _f in _fmt:
+                    if isinstance(_f, dict) and _f.get("name") is not None:
+                        _fi = {"name": _f.get("name"), "bytes": _f.get("bytes")}
+                        _fr = _f.get("range")
+                        if isinstance(_fr, dict):
+                            if _fr.get("min") is not None:
+                                _fi["min"] = _fr["min"]
+                            if _fr.get("max") is not None:
+                                _fi["max"] = _fr["max"]
+                        _fl.append(_fi)
+                if _fl:
+                    entry["format"] = _fl
+            if dp.get("mask") is not None:
+                entry["mask"] = dp["mask"]
+                if dp.get("mask_signed") is not None:
+                    entry["mask_signed"] = dp["mask_signed"]
+            if dp.get("endianness") is not None:
+                entry["endianness"] = dp["endianness"]
+            # 13.10.2026 08:21 (#1144 срез 2): scale иногда лежит ВНУТРИ mapping
+            # (tuya-local: `mapping: [{scale: 10, ...}]`) — берём его как
+            # fallback; приоритет у плоского scale DP.
+            _scale = dp.get("scale")
+            if _scale is None and isinstance(dp.get("mapping"), list):
+                for _m in dp["mapping"]:
+                    if isinstance(_m, dict) and _m.get("scale") is not None:
+                        _scale = _m["scale"]
+                        break
+            if _scale is not None:
+                entry["scale"] = _scale
+
+            # state_class: у sensor в tuya-local это dp-level `class`.
+            st = dp.get("state_class") or (dp.get("class") if component == "sensor" else None)
+            if st and component == "sensor":
+                entry["state_class"] = st
+
+            # min/max: основной случай — вложенный range {min,max}; плюс плоские.
+            rng = dp.get("range")
+            if isinstance(rng, dict):
+                if rng.get("min") is not None:
+                    entry["min"] = rng["min"]
+                if rng.get("max") is not None:
+                    entry["max"] = rng["max"]
+            for k in ("min", "max"):
+                if dp.get(k) is not None:
                     entry[k] = dp[k]
-            result[dp_id_str] = entry
+
+            # 13.10.2026 13:43 (#1144 срез 4): target_range + invert из активной
+            # ветки mapping (tuya-local: линейное raw→пользовательское отображение,
+            # device_config.py:842-852; invert = -result+min+max, 836-840).
+            # Активная ветка — первая без dps_val (иначе первая словарь).
+            # Срез 4.1 — запись полей; движок маппинга/инверсии — отдельным
+            # этапом на стенде (риски живых штор).
+            _active = None
+            if isinstance(dp.get("mapping"), list):
+                for _m in dp["mapping"]:
+                    if isinstance(_m, dict):
+                        if _active is None:
+                            _active = _m
+                        if _m.get("dps_val") is None:
+                            _active = _m
+                            break
+            _tr = _active.get("target_range") if _active else None
+            if isinstance(_tr, dict) and _tr.get("min") is not None \
+                    and _tr.get("max") is not None:
+                entry["target_range"] = {"min": _tr["min"], "max": _tr["max"]}
+                # light color_temp/std_color_temp: raw 0..100 → кельвины.
+                # Только отображение: имён color_temp нет в LIGHT_DP_NAMES
+                # (main.py:379) — командный путь моста не затрагивается.
+                # При target_range tuya-local отключает scale (device_config:669).
+                if component == "light" \
+                        and entry.get("name") in ("color_temp", "std_color_temp"):
+                    entry["min"] = _tr["min"]
+                    entry["max"] = _tr["max"]
+                    entry.pop("scale", None)
+            # invert: НЕ путать с `inverted` у lock (main.py:5557) — это
+            # инверсия диапазона/значения по схеме tuya-local.
+            if (_active and _active.get("invert") is True) \
+                    or dp.get("invert") is True:
+                entry["invert"] = True
+
+            # step: плоский или первый step внутри mapping ([{step: 10}]).
+            step = dp.get("step")
+            if step is None and isinstance(dp.get("mapping"), list):
+                for m in dp["mapping"]:
+                    if isinstance(m, dict) and m.get("step") is not None:
+                        step = m["step"]
+                        break
+            # 13.10.2026 08:21 (#1144 срез 2): step из range {min,max,step} —
+            # последний fallback (приоритет: плоский > mapping > range).
+            if step is None and isinstance(dp.get("range"), dict) \
+                    and dp["range"].get("step") is not None:
+                step = dp["range"]["step"]
+            if step is not None:
+                entry["step"] = step
+
+            # options (select).
+            if isinstance(dp.get("options"), list) and dp["options"]:
+                entry["options"] = dp["options"]
+
+            # mapping → map: для select/enum конвертируем tuya-local mapping
+            # (список {dps_val, value}) в bridge-конвенцию: options[] + map{dps_val: value}.
+            # Для binary_sensor — отдельно ниже (raw → ON/OFF).
+            mapping = dp.get("mapping")
+            if isinstance(mapping, list) and mapping and component == "select":
+                # Собираем map: dps_val -> value
+                smap = {}
+                opts_from_mapping = []
+                for m in mapping:
+                    if not isinstance(m, dict) or "dps_val" not in m:
+                        continue
+                    dv = m.get("dps_val")
+                    val = m.get("value")
+                    if dv is not None and val is not None:
+                        smap[str(dv)] = str(val)
+                        if val not in opts_from_mapping:
+                            opts_from_mapping.append(val)
+                if smap:
+                    entry["map"] = smap
+                    # Если options нет — заполняем из mapping.value (сохраняем порядок)
+                    if "options" not in entry:
+                        entry["options"] = opts_from_mapping
+
+            # mapping → map (ТОЛЬКО binary_sensor: raw → ON/OFF).
+            # mapping для bitfield/bitmap sensor уже сохранён выше.
+            if isinstance(mapping, list) and component == "binary_sensor":
+                # #1144 batch D: у bitfield/bitmap (sensor и binary_sensor) сохраняем
+                # исходный список mapping в info — единственный источник читаемых
+                # значений (fault_code и т.п.); decode — в _publish_sensor_value.
+                _dtype_yaml = str(dp.get("type") or "").strip().lower()
+                if isinstance(mapping, list) and mapping \
+                        and _dtype_yaml in ("bitfield", "bitmap") \
+                        and component in ("binary_sensor", "sensor"):
+                    entry["mapping"] = mapping
+                bmap = {}
+                for m in mapping:
+                    if not isinstance(m, dict) or "dps_val" not in m:
+                        continue
+                    dv = m.get("dps_val")
+                    if dv is None:
+                        # #1144 batch D: default-ветка tuya-local (dps_val: null →
+                        # value) — легитимное «иначе», не ошибка конфига.
+                        bmap["__default_on__"] = "ON" if _tuya_bool(m.get("value")) else "OFF"
+                        continue
+                    bmap[str(dv)] = "ON" if _tuya_bool(m.get("value")) else "OFF"
+                if bmap:
+                    entry["map"] = bmap
+
+            # 13.10.2026 13:58 (#1144 срез 3, этап 1): constraint/conditions —
+            # «ветки от другого DP» (tuya-local device_config.py:934: без
+            # явного constraint дефолтится имя самого DP). Только запись
+            # факта (info для UI/движка); динамические range/options —
+            # этап 2 на стенде (после движка value_redirect, срез 8).
+            _constraint = None
+            _conds = []
+            if isinstance(mapping, list):
+                for _m in mapping:
+                    if isinstance(_m, dict) and (_m.get("constraint") is not None
+                                                or _m.get("conditions")):
+                        if _m.get("constraint") is not None:
+                            _constraint = _m["constraint"]
+                        _cl = _m.get("conditions")
+                        if isinstance(_cl, list):
+                            _conds.extend(c for c in _cl if isinstance(c, dict))
+            if _constraint is None and _conds:
+                _constraint = dp.get("name")
+            if _constraint is not None:
+                entry["constraint"] = _constraint
+            # 13.10.2026 14:05 (#1144 срез 8.2): ветки conditions несут id-цепочку
+            # цели (redirect_ids) рядом с исходным value_redirect (имя — для UI).
+            if _conds:
+                _ce = []
+                for _c in _conds:
+                    _c2 = dict(_c)
+                    if _c2.get("value_redirect"):
+                        _ch = _redirect_chain(_c2["value_redirect"])
+                        if _ch:
+                            _c2["redirect_ids"] = _ch
+                    _ce.append(_c2)
+                entry["conditions"] = _ce
+            # 13.10.2026 14:05 (#1144 срез 8.2): mapping-уровень — ветка
+            # `dps_val: null` = «своего значения нет» → читаем с DP-цели
+            # (семантика get_value, device_config.py:826-830). Мост заполняет
+            # значение только когда пусто (фоллбек), ветки с реальным dps_val
+            # и conditions без redirect_ids не резолвятся — как сегодня.
+            if isinstance(mapping, list):
+                for _m in mapping:
+                    if isinstance(_m, dict) and "value_redirect" in _m \
+                            and "dps_val" in _m and _m["dps_val"] is None \
+                            and _m.get("value_redirect"):
+                        _ch = _redirect_chain(_m["value_redirect"])
+                        if _ch:
+                            entry["redirect"] = _ch
+                        break
+
+            # 13.10.2026 08:21 (#1144 срез 2): под-DP с одним id у РАЗНЫХ entity
+            # (tuya-local: один физический DP обслуживает несколько сущностей,
+            # напр. abir_x8_vacuum id=28 трижды) раньше ПЕРЕТИРАЛИ друг друга.
+            # Первый оставляет ключ id; второй/последующие получают
+            # `id__<имя>`. Реальный id мост берёт префиксом (dp_int), кэш
+            # состояния — физический (по реальному id), см. publish_state.
+            _key = dp_id_str
+            if _key in result:
+                _sfx = entry.get("name") or "x"
+                _key = f"{dp_id_str}__{_sfx}"
+                _n = 2
+                while _key in result:
+                    _key = f"{dp_id_str}__{_sfx}_{_n}"
+                    _n += 1
+            result[_key] = entry
     return result if result else None
+
+
+def parse_tuya_local_config(yaml_data, fname=""):
+    """v1.34.22: схема + метаданные конфига tuya-local для подбора типа.
+
+    Возвращает (dps_map, meta):
+      meta = {file (без .yaml), file_name, name (описательное имя типа),
+              products[] (id/manufacturer/model/model_id/name),
+              dps {dp: {type, optional, hidden}}, required [dp...]}.
+    Это те данные, по которым HA решает `matches()` / `match_quality()`.
+    """
+    entries = parse_tuya_local_yaml(yaml_data)
+    if not entries:
+        return None, None
+    stem = os.path.splitext(str(fname or ""))[0]
+    meta = {
+        "file": stem,
+        "file_name": str(fname or ""),
+        "name": str(yaml_data.get("name") or stem),
+        "products": [],
+        "dps": {},
+    }
+    for p in (yaml_data.get("products") or []):
+        if isinstance(p, dict) and p.get("id") is not None:
+            meta["products"].append(
+                {k: p[k] for k in ("id", "manufacturer", "model",
+                                   "model_id", "name") if p.get(k) is not None})
+    for ent, eff_dps in _tl_entities_dps(yaml_data):
+        for dp in eff_dps:
+            dp_id = str(dp.get("id"))
+            if dp_id in meta["dps"]:
+                continue
+            meta["dps"][dp_id] = {
+                "type": str(dp.get("type") or "").lower(),
+                "optional": bool(dp.get("optional")),
+                # 13.10.2026 15:45 (#1144 batch A): "unavailable" -> hidden для метаданных
+                # подбора типа (match_quality учитывает hidden).
+                "hidden": ent.get("hidden") is True or ent.get("hidden") == "unavailable",
+            }
+    meta["required"] = sorted(
+        (k for k, v in meta["dps"].items() if not v.get("optional")),
+        key=lambda s: (len(s), s))
+    return entries, meta
 
 
 def merge_dps_maps(base, override):
@@ -3342,7 +4584,121 @@ def merge_dps_maps(base, override):
 
 
 # ==================== REBUILD tinytuya_devices.json ====================
-def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=True):
+def _cloud_only_targets(config_devices):
+    """v1.34.18: устройства из Cloud-кэша, которых нет в конфиге, но которые
+    можно добавить (есть id/ip/local_key).
+
+    «Локальная база» должна строиться от того, что ДОСТУПНО (облако), а не
+    только от уже добавленных устройств — иначе для нового прибора базы нет.
+    """
+    cfg_ids = {(d or {}).get("id") for d in config_devices}
+    cc = (load_cloud_cache() or {}).get("devices") or []
+    # v1.34.21: Cloud не всегда отдаёт IP, а скан может устройство не застать
+    # (спящий радар/батарейный). Берём IP из прежней записи локальной базы —
+    # он уже был найден удачным сканом, и незачем терять устройство из-за
+    # разового промаха discovery.
+    _base_by_id = load_tinytuya_devices_json()
+    out = []
+    seen = set()
+    for c in cc:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "")
+        if not cid or cid in cfg_ids or cid in seen:
+            continue
+        # v1.34.18: ip у облачного устройства может быть пустым (Cloud его не
+        # отдаёт). Не отбрасываем — IP дорезолвим через Tuya-discovery перед
+        # probe. Обязателен только local_key.
+        if not c.get("local_key"):
+            continue
+        seen.add(cid)
+        raw = str(c.get("name") or "").strip()
+        slug = "".join(ch.lower() if (ch.isalnum() or ch in "-_") else "_" for ch in raw)
+        slug = "_".join(p for p in slug.split("_") if p)[:48]
+        if not slug:
+            slug = "cloud_" + cid[-6:]
+        out.append({
+            # v1.34.21: IP из Cloud, иначе — из прежней записи базы.
+            "name": slug, "id": cid,
+            "ip": str(c.get("ip") or ((_base_by_id.get(cid) or {}).get("ip") or "")),
+            "local_key": c.get("local_key", ""),
+            "product_id": c.get("product_id", ""),
+            "model": c.get("product_name", "") or c.get("model", ""),
+            "category": c.get("category", ""),
+            "friendly_name": raw or slug,
+            "enabled": True,
+            "battery_powered": None,   # неизвестно — спросим у пользователя
+        })
+    return out
+
+
+def load_battery_marks():
+    """v1.34.19: отметки «это батарейное» для cloud-only устройств (по cloud id).
+
+    Устройства нет в конфиге → поле battery_powered взять негде. Храним выбор
+    пользователя из модалки пересборки, чтобы в следующий раз галочки были
+    уже проставлены.
+    """
+    try:
+        with open(BATTERY_MARKS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_battery_marks(marks):
+    try:
+        os.makedirs(os.path.dirname(BATTERY_MARKS_FILE) or ".", exist_ok=True)
+        tmp = BATTERY_MARKS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(marks, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, BATTERY_MARKS_FILE)
+        return True
+    except Exception as e:
+        log.warning(f"[BatteryMarks] save: {e}")
+        return False
+
+
+def build_rebuild_plan():
+    """v1.34.19: что попадёт в пересборку локальной базы — ДО скана.
+
+    Возвращает конфиг-часть (сколько всего/включённых/батарейных) и список
+    доступных cloud-only устройств, которых нет в конфиге: по ним питание
+    неизвестно, и пользователь отмечает батарейные галочками.
+    """
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, list):
+        cfg = []
+    cfg_devs = [d for d in cfg if isinstance(d, dict)]
+    enabled = [d for d in cfg_devs if d.get("name") and d.get("enabled", True)]
+    marks = load_battery_marks()
+    unknown = []
+    for e in _cloud_only_targets(cfg):
+        did = e.get("id", "")
+        unknown.append({
+            "name": e.get("name", ""),
+            "friendly_name": e.get("friendly_name") or e.get("name", ""),
+            "model": e.get("model", "") or e.get("product_id", ""),
+            "product_id": e.get("product_id", ""),
+            "category": e.get("category", ""),
+            "id": did,
+            # Никаких секретов (local_key) в браузер не отдаём.
+            "battery": bool(marks.get(did)),
+        })
+    unknown.sort(key=lambda x: (x["friendly_name"] or "").lower())
+    return {
+        "config": {
+            "total": len(cfg_devs),
+            "enabled": len(enabled),
+            "battery": sum(1 for d in enabled if d.get("battery_powered")),
+        },
+        "unknown": unknown,
+    }
+
+
+def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=True, extra_devices=None, battery_names=None):
     with REBUILD_LOCK:
         REBUILD_STATE["running"] = True
         REBUILD_STATE["current"] = 0
@@ -3372,11 +4728,51 @@ def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=Tr
             REBUILD_STATE["errors"].append(f"config: {e}")
         return
 
+    # v1.34.18: у cloud-only устройств IP может быть пустым (Cloud его не
+    # отдаёт) — дорезолвим через Tuya-discovery (bridge). Без IP probe
+    # невозможен, поэтому иначе такие устройства не попадали в базу вовсе.
+    _no_ip = [d for d in (extra_devices or []) if not d.get("ip")]
+    if _no_ip:
+        try:
+            _res = _send_request(f"{TOPIC_PREFIX}/bridge/tuya_discover",
+                                 {}, timeout=SCAN_TIMEOUT_WAIT + 5)
+            _by_id = (_res or {}).get("devices") or {}
+            _filled = 0
+            for _d in _no_ip:
+                _info = _by_id.get(_d.get("id")) or {}
+                if _info.get("ip"):
+                    _d["ip"] = _info["ip"]
+                    _filled += 1
+            log.info(f"[Rebuild] cloud-only: IP дорезолвлен {_filled}/{len(_no_ip)}")
+        except Exception as _e:
+            log.warning(f"[Rebuild] cloud-only IP resolve: {_e}")
+
     config_by_name = {d.get("name"): d for d in config_devices if d.get("name")}
+    extra_by_name = {d.get("name"): d for d in (extra_devices or []) if d.get("name")}
+    # v1.34.19: отметки «батарейное» из модалки пересборки.
+    # battery_names is None = вызов без модалки (по API) → безопасный режим:
+    # новые устройства не опрашиваем, а сообщаем о них в отчёте.
+    _battery_prompted = battery_names is not None
+    _battery_marks = set(battery_names or [])
     results = []
     errors = []
     report = []
     skipped_battery = []
+
+    def _keep_prev(did, nm):
+        """v1.34.21: fail-safe — устройство в этот раз не опросили (нет IP,
+        сбой probe). Прежнюю запись базы НЕ теряем: иначе разовый промах
+        скана выбрасывает прибор из локальной базы целиком (так из базы
+        выпал датчик присутствия при повторной пересборке)."""
+        _old = existing_by_id.get(did) or {}
+        _old_map = _old.get("mapping") or _old.get("dps_map") or {}
+        if _old and _old_map:
+            results.append(_old)
+        report.append({"name": nm, "status": "kept_no_probe",
+                       "versions": [], "dps": 0, "matched": len(_old_map),
+                       "verified": 0, "mismatch": 0, "ambiguous": 0,
+                       "kept_existing": len(_old_map),
+                       "source": "existing" if _old_map else ""})
 
     for idx, name in enumerate(device_names, 1):
         if STOP_EVENT.is_set():
@@ -3385,14 +4781,28 @@ def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=Tr
             REBUILD_STATE["current"] = idx
             REBUILD_STATE["device"] = name
 
-        cfg = config_by_name.get(name)
+        cfg = config_by_name.get(name) or extra_by_name.get(name)
         if not cfg:
             errors.append(f"{name}: нет в {CONFIG_FILE}")
+            continue
+        # v1.34.19: новое (не из конфига) устройство — питание неизвестно.
+        # В модалке пересборки пользователь ДО скана отмечает батарейные;
+        # отмеченные не будим (правило №1), остальные опрашиваем как обычные.
+        # Если список не передан вовсе (API без модалки) — безопасно
+        # пропускаем все новые и сообщаем о них в отчёте (battery_unknown).
+        _extra_unknown = (name in extra_by_name and cfg.get("battery_powered") is None)
+        _skip_as_battery = bool(_extra_unknown and name in _battery_marks)
+        if _extra_unknown and not _skip_as_battery and not _battery_prompted:
+            skipped_battery.append(name)
+            report.append({"name": name, "status": "battery_unknown",
+                           "versions": [], "dps": 0, "matched": 0,
+                           "verified": 0, "mismatch": 0, "ambiguous": 0,
+                           "kept_existing": 0, "source": "cloud"})
             continue
         # v1.31.0: батарейные спят и на probe не отвечают — не тратим TCP
         # (правило №1). Но прежнюю базу для них сохраняем: она — единственный
         # источник маппинга для спящих устройств.
-        if skip_battery and cfg.get("battery_powered"):
+        if _skip_as_battery or (skip_battery and cfg.get("battery_powered")):
             skipped_battery.append(name)
             _b_ex = existing_by_id.get(cfg.get("id", ""))
             _b_map = ((_b_ex or {}).get("mapping") or {}) if _b_ex else {}
@@ -3412,14 +4822,30 @@ def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=Tr
                            "versions": [], "dps": 0, "matched": len(_b_map),
                            "verified": 0, "mismatch": 0, "ambiguous": 0,
                            "kept_existing": len(_b_map),
-                           "source": "existing" if _b_map else ""})
+                           "source": "marked" if _skip_as_battery
+                                     else ("existing" if _b_map else "")})
             continue
         dev_id = cfg.get("id", "")
         ip = cfg.get("ip", "")
         local_key = cfg.get("local_key", "")
-        product_id = cfg.get("product_id", "") or cfg.get("model", "")
-        if not dev_id or not ip or not local_key:
-            errors.append(f"{name}: нет id/ip/local_key")
+        # v1.34.12: как в _enrich_dps_map_from_cache — если в конфиге нет
+        # product_id, берём его из Cloud-кэша. Иначе для устройства без
+        # product_id в конфиге tuya-local lookup не срабатывает и сборка
+        # локальной базы падает в «mapping пуст».
+        product_id = cfg.get("product_id", "")
+        if not product_id:
+            product_id = _get_cloud_product_id(dev_id, cfg.get("friendly_name", name)) or ""
+        if not product_id:
+            product_id = cfg.get("model", "")
+        if not dev_id or not local_key:
+            errors.append(f"{name}: нет id/local_key")
+            if dev_id:
+                _keep_prev(dev_id, name)
+            continue
+        if not ip:
+            # v1.34.18: cloud-only без резолвнутого IP — probe невозможен.
+            errors.append(f"{name}: нет IP (не найден в скане)")
+            _keep_prev(dev_id, name)
             continue
 
         try:
@@ -3428,6 +4854,7 @@ def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=Tr
                                                  name=cfg.get("friendly_name", name))
         except Exception as e:
             errors.append(f"{name}: probe: {e}")
+            _keep_prev(dev_id, name)
             continue
         existing = existing_by_id.get(dev_id)
         existing_mapping = (existing or {}).get("mapping", {}) if existing else {}
@@ -3508,41 +4935,52 @@ def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=Tr
         for dp, m in matched.items():
             if not isinstance(m, dict):
                 continue
-            mapping[dp] = {
+            mapping[str(dp)] = {
                 "code": m.get("code", ""),
                 "type": m.get("type", ""),
                 "values": m.get("values", {}),
                 "name": m.get("name", ""),
             }
 
-        # v1.31.0: устройство на probe отдаёт все свои DP, поэтому прежняя
-        # база берётся ТОЛЬКО для DP, которых сейчас не было (иначе старая
-        # ошибочная привязка жила бы вечно).
-        for dp, m in existing_mapping.items():
-            if dp not in mapping and str(dp) not in (local_dps or {}):
-                mapping[dp] = m
-                item["kept_existing"] += 1
-
-        if not mapping and product_id:
-            tl_map = lookup_tuya_local(product_id)
-            if tl_map:
-                for dp, info in tl_map.items():
-                    mapping[dp] = {
+        # v1.34.20: схема базы = Cloud ∪ tuya-local по номерам DP. Раньше
+        # tuya-local подставлялся ТОЛЬКО при пустом mapping, а «наследие»
+        # одного старого DP (у датчика присутствия — DP 102) делало mapping
+        # непустым и навсегда блокировало полную схему из 10 DP.
+        _tl_added = 0
+        if product_id:
+            _tl_map = lookup_tuya_local(product_id)
+            if _tl_map:
+                for dp, info in _tl_map.items():
+                    if not isinstance(info, dict) or str(dp) in mapping:
+                        continue
+                    mapping[str(dp)] = {
                         "code": info.get("name", f"dp_{dp}"),
                         "type": "Integer" if info.get("unit") else "Boolean",
                         "values": {},
                         "name": info.get("name", ""),
                     }
+                    _tl_added += 1
+        item["tuya_local"] = _tl_added
+
+        # v1.31.0: устройство на probe отдаёт все свои DP, поэтому прежняя
+        # база берётся ТОЛЬКО для DP, которых нет ни в probe, ни в схеме
+        # (иначе старая ошибочная привязка жила бы вечно).
+        _local_dp_keys = {str(k) for k in (local_dps or {})}
+        for dp, m in existing_mapping.items():
+            if str(dp) not in mapping and str(dp) not in _local_dp_keys:
+                mapping[str(dp)] = m
+                item["kept_existing"] += 1
 
         if not mapping:
-            errors.append(f"{name}: mapping пуст (нет Cloud-кэша и tuya-local)")
+            errors.append(f"{name}: mapping пуст (нет Cloud-кэша и tuya-local; product_id={product_id!r})")
             item["status"] = "empty"
             report.append(item)
             continue
 
         item["matched"] = len(mapping)
         if not item["source"]:
-            item["source"] = "cloud" if matched else "existing"
+            item["source"] = ("cloud" if matched else
+                              "tuya_local" if _tl_added else "existing")
         results.append({
             "id": dev_id,
             "name": cfg.get("friendly_name", name),
@@ -3621,10 +5059,21 @@ def _rebuild_tinytuya_json_worker(device_names, stop_first=True, skip_battery=Tr
         "probe_failed": sum(1 for r in report if r["status"] == "probe_failed"),
         "empty": sum(1 for r in report if r["status"] == "empty"),
         "battery_skipped": len(skipped_battery),
+        # v1.34.19: сколько новых устройств пользователь сам отметил батарейными
+        # в модалке (они не опрашивались) и был ли вообще показ модалки.
+        "battery_marked": sum(1 for r in report if r.get("source") == "marked"),
+        "unknown_prompted": bool(_battery_prompted),
+        "battery_unknown": sum(1 for r in report
+                               if r["status"] == "battery_unknown"),
+        "battery_unknown_names": [r["name"] for r in report
+                                  if r["status"] == "battery_unknown"],
         "verified": sum(r["verified"] for r in report),
         "mismatch": sum(r["mismatch"] for r in report),
         "ambiguous": sum(r["ambiguous"] for r in report),
         "kept_existing": sum(r["kept_existing"] for r in report),
+        # v1.34.21: устройства, которые в этот раз не опросили (нет IP/сбой),
+        # но прежняя запись базы сохранена — прибор не выпал.
+        "kept_no_probe": sum(1 for r in report if r["status"] == "kept_no_probe"),
         "errors": len(errors),
         "stop_first": bool(stop_first),
         "skip_battery": bool(skip_battery),
@@ -4216,6 +5665,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
             for name in sorted(_all_names):
                 info = _devs_snap.get(name, {})
                 m = meta_snap.get(name, {})
+                # v1.34.15: не показываем «призрака» — запись есть только в STATE
+                # (из retained), но устройства нет в конфиге (DEVICE_META) и оно
+                # не подавало признаков жизни (пустые cache/last_seen).
+                if (name not in meta_snap
+                        and not info.get("cache")
+                        and not info.get("last_seen")):
+                    continue
                 # v1.25.0 (fix #cloud_dps): дополняем dps_map из Cloud-mapping
                 # теми DP, что bridge прислал в cache, но их нет в config.
                 _dps_map_full = _enrich_dps_map_from_cache(
@@ -4246,6 +5702,12 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     # и «Сбросить по умолчанию» только когда поле задано.
                     "expire_after": m.get("expire_after"),
                     "tuya_id": m.get("tuya_id", ""),
+                    # v1.34.24: Product ID — для карточки прибора (в конфиге
+                    # моста его нет, берём из Cloud-кэша по tuya_id).
+                    "product_id": (m.get("product_id")
+                                   or _get_cloud_product_id(
+                                       m.get("tuya_id", ""),
+                                       m.get("friendly_name", name)) or ""),
                     "local_key_present": bool(m.get("local_key")),
                     "dps_map": _dps_map_full,
                     "presets": m.get("presets", []), "preset_map": m.get("preset_map", {}),
@@ -4380,13 +5842,72 @@ class WebUIHandler(BaseHTTPRequestHandler):
             if data is None:
                 self._send_json(200, {"ok": True, "exists": False})
             else:
+                # v1.34.10: переобогащаем устройства при отдаче — устаревший
+                # кэш получает свежие данные tuya-local и _dps_candidates,
+                # не требуя повторного fetch с облаком.
+                _devs = data.get("devices", [])
+                try:
+                    _devs = [_enrich_cloud_device(dict(x))
+                             for x in _devs if isinstance(x, dict)]
+                except Exception as _e:
+                    log.debug(f"[Cloud/cache] enrich: {_e}")
+                # v1.34.38 (#1175): индекс tuya-local ещё собирается или ещё не
+                # загружен — обогащение уходит БЕЗ tuya-local/heuristic (нет
+                # _tl_candidates, нет _dps_source). Если молча отдать такую
+                # копию, клиент закэширует её и превью импорта покажет
+                # «источник не прилипает» до ручной перезагрузки страницы.
+                # Флагом просим клиента перезапросить кэш после сборки.
+                # Проверка НЕ блокирующая: сам _load_tuya_local_db() тут не
+                # вызываем (он при stale-индексе запускает фоновую пересборку).
+                with _TL_DB_LOCK:
+                    _tl_pending = (_TL_DB is None) or _TL_DB_BUILDING
                 self._send_json(200, {
                     "ok": True, "exists": True,
                     "fetched_at": data.get("fetched_at", 0),
                     "access_id": data.get("access_id", ""),
                     "region": data.get("region", "eu"),
-                    "devices": data.get("devices", []),
+                    "devices": _devs,
+                    "tl_pending": bool(_tl_pending),
                 })
+            return
+
+        if path == "/api/tuya-local/variant":
+            # v1.34.22: схема выбранного пользователем «типа устройства»
+            # tuya-local (выпадашка в превью импорта). Считаем по требованию:
+            # держать схемы всех кандидатов в ответе /api/cloud/cache дорого.
+            _file = (qs.get("file") or [""])[0]
+            _tid = (qs.get("id") or [""])[0]
+            _label = (qs.get("name") or [""])[0] or _file
+            _entries = _tl_entries_for_config(_file)
+            if not _entries:
+                self._send_json(404, {"ok": False,
+                                      "error": f"конфиг tuya-local не найден: {_file!r}"})
+                return
+            _dev = {}
+            try:
+                for _d in (load_cloud_cache() or {}).get("devices", []):
+                    if str(_d.get("id") or "") == str(_tid):
+                        _dev = _d
+                        break
+            except Exception:
+                _dev = {}
+            _writable = _writable_codes_from_props(_dev.get("_raw_properties"))
+            _cm = mapping_to_dps_map(_dev.get("mapping") or {},
+                                     _dev.get("category", ""), _writable)
+            _reason = f"тип tuya-local: {_label} ({_file})"
+            _out = {}
+            for _dp, _info in _entries.items():
+                _e = dict(_info) if isinstance(_info, dict) else {}
+                _e["_dps_source"] = "tuya_local"
+                _e["_dps_source_reason"] = _reason
+                _c = _cm.get(str(_dp))
+                if isinstance(_c, dict):
+                    _e["_dps_candidates"] = {
+                        "cloud": {k: v for k, v in _c.items()
+                                  if not str(k).startswith("_")}}
+                _out[str(_dp)] = _e
+            self._send_json(200, {"ok": True, "file": _file, "name": _label,
+                                  "dps": _out})
             return
 
         dev = self._parse_dev_path(path, "/secret")
@@ -4596,6 +6117,16 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "message": "обновление запущено"})
             return
 
+        if path == "/api/base/tinytuya/rebuild/plan":
+            # v1.34.19: список того, что попадёт в пересборку, ДО скана.
+            # Отдельная модалка показывает новые (cloud-only) устройства,
+            # чтобы пользователь отметил батарейные до опроса.
+            try:
+                self._send_json(200, {"ok": True, **build_rebuild_plan()})
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": f"plan: {e}"})
+            return
+
         if path == "/api/base/tinytuya/rebuild":
             with REBUILD_LOCK:
                 if REBUILD_STATE["running"]:
@@ -4605,6 +6136,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                 names = [d.get("name") for d in cfg if d.get("name") and d.get("enabled", True)]
+                # v1.34.18: + доступные устройства из Cloud, которых нет в конфиге.
+                extra = _cloud_only_targets(cfg)
+                names = names + [e["name"] for e in extra]
             except Exception as e:
                 self._send_json(500, {"ok": False, "error": f"config: {e}"})
                 return
@@ -4616,15 +6150,37 @@ class WebUIHandler(BaseHTTPRequestHandler):
             #  skip_battery — не опрашивать спящие батарейные (правило №1).
             _stop_first = bool(body.get("stop_first", True)) if body else True
             _skip_batt = bool(body.get("skip_battery", True)) if body else True
+            # v1.34.19: отметки «батарейное» из модалки (для устройств не из
+            # конфига). None (поле не передано) = безопасный режим без опроса
+            # новых. Переданный список запоминаем — в следующий раз галочки
+            # будут уже проставлены.
+            _battery_names = None
+            if body is not None and isinstance(body.get("battery_names"), list):
+                _battery_names = [str(x) for x in body["battery_names"]
+                                  if isinstance(x, (str, int))]
+                if _battery_names is not None:
+                    _marks = load_battery_marks()
+                    _marked = set(_battery_names)
+                    for _e in extra:
+                        _eid = _e.get("id") or ""
+                        if not _eid:
+                            continue
+                        if _e.get("name") in _marked:
+                            _marks[_eid] = True
+                        else:
+                            _marks.pop(_eid, None)
+                    save_battery_marks(_marks)
             # v1.32.2: флаг «уже запущено» ставим ДО старта потока (и после всех
             # ранних выходов) — иначе два быстрых POST успевали оба пройти проверку.
             with REBUILD_LOCK:
                 REBUILD_STATE["running"] = True
             threading.Thread(target=_rebuild_tinytuya_json_worker,
-                             args=(names, _stop_first, _skip_batt),
+                             args=(names, _stop_first, _skip_batt, extra, _battery_names),
                              daemon=True, name="tinytuya-rebuild").start()
             self._send_json(200, {"ok": True, "message": "пересборка запущена",
                                   "total": len(names),
+                                  "unknown": len(extra),
+                                  "battery_marked": len(_battery_names or []) if _battery_names is not None else None,
                                   "stop_first": _stop_first,
                                   "skip_battery": _skip_batt})
             return
@@ -4994,7 +6550,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     }
 
             result = _send_request(f"{TOPIC_PREFIX}/bridge/edit_config",
-                                   {"device": dev, "changes": body["changes"], "validate": False},
+                                   {"device": dev, "changes": body["changes"], "validate": False,
+                                    "engineer_mode": bool(body.get("engineer_mode", False))},
                                    timeout=EDIT_TIMEOUT_WAIT)
             if result.get("ok"):
                 # v1.27.0: если менялся dps_map — полная перезагрузка
@@ -5101,6 +6658,21 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "hosts": hosts, "subnet": result.get("subnet", subnet)})
             return
 
+        if path == "/api/scan/tuya_discover":
+            # v1.34.9: широковещательный Tuya-discovery в bridge → {gwId: {ip, ...}}.
+            # Нужен для «🔍 Найти IP»: bridge-скан отдаёт IP, но без gwId, поэтому
+            # сопоставить устройство по Tuya id нельзя (unicast-проба gwId не даёт).
+            subnet = (body or {}).get("subnet", "").strip()
+            payload = {"subnet": subnet} if subnet else {}
+            result = _send_request(f"{TOPIC_PREFIX}/bridge/tuya_discover",
+                                   payload, timeout=SCAN_TIMEOUT_WAIT + 5)
+            if not result.get("ok"):
+                self._send_json(400, {"ok": False, "error": result.get("error", "unknown")})
+                return
+            self._send_json(200, {"ok": True, "devices": result.get("devices", {}),
+                                  "subnet": result.get("subnet", subnet)})
+            return
+
         if path == "/api/cloud/fetch":
             if not body:
                 self._send_json(400, {"ok": False, "error": "empty body"})
@@ -5117,27 +6689,18 @@ class WebUIHandler(BaseHTTPRequestHandler):
             if not result["ok"]:
                 self._send_json(400, {"ok": False, "error": result.get("error")})
                 return
+            # v1.34.14: в кэш — ТОЛЬКО сырые данные Cloud; обогащение считаем
+            # на лету и отдаём копией (в файл не попадает).
+            raw = result["devices"]
+            save_cloud_cache(raw, access_id=aid, region=region)
             enriched = []
-            for d in result["devices"]:
-                mapping = d.get("mapping", {}) or {}
-                dps_map = mapping_to_dps_map(
-                    mapping,
-                    d.get("category", ""),
-                    _writable_codes_from_props(d.get("_raw_properties")),
-                )
-                product_id = d.get("product_id", "")
-                if product_id:
-                    tl_map = lookup_tuya_local(product_id)
-                    if tl_map:
-                        dps_map = merge_dps_maps(dps_map, tl_map)
-                        log.info(f"[Cloud] {d.get('name','?')}: tuya-local обогатил {len(tl_map)} DP")
-                d["dps_map_generated"] = dps_map
-                d["type_guess"] = guess_type_from_category(d.get("category", ""), d.get("product_name", ""))
+            for d in raw:
+                # v1.34.10: единая сборка dps_map_generated — та же функция,
+                # что и при отдаче /api/cloud/cache (объектные _dps_candidates).
                 # v1.29.2: version_guess убран — облако версию протокола не отдаёт,
                 # а подставлять константу «3.3» как факт было враньём.
                 # Версия определяется пробой (🔍) или задаётся вручную.
-                enriched.append(d)
-            save_cloud_cache(enriched, access_id=aid, region=region)
+                enriched.append(_enrich_cloud_device(dict(d)))
             # v1.25.0 (fix #cloud_dps): Cloud-кэш обновился —
             # перечитываем mapping-индексы для обогащения dps_map.
             _load_cloud_mappings()
@@ -5152,8 +6715,18 @@ class WebUIHandler(BaseHTTPRequestHandler):
             if not isinstance(devices, list) or not devices:
                 self._send_json(400, {"ok": False, "error": "list empty"})
                 return
+            # v1.34.30 (#1166): пустой dps_map добираем на сервере ДО отправки
+            # в мост — иначе мост запишет пустую карту (наследование #15
+            # срабатывает только при ОТСУТСТВИИ ключа dps_map), и у прибора
+            # не будет MQTT-сущностей (см. #1165: select unknown).
+            devices = [_import_fill_empty_dps_map(d) for d in devices]
+            # v1.34.31 (#1167): ручной инженерный режим — overwrite + без валидации dps_map.
+            _eng = bool(body.get("engineer_mode", False))
             result = _send_request(f"{TOPIC_PREFIX}/bridge/import_devices",
-                                   {"devices": devices, "overwrite": bool(body.get("overwrite", False))},
+                                   {"devices": devices,
+                                    "overwrite": bool(body.get("overwrite", False)) or _eng,
+                                    "engineer_mode": _eng,
+                                    "validate_dps_map": not _eng},
                                    timeout=IMPORT_TIMEOUT_WAIT + 5)
             if result.get("ok"):
                 load_device_meta()
@@ -5203,7 +6776,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
             # Шлём в bridge через edit_config
             result = _send_request(
                 f"{TOPIC_PREFIX}/bridge/edit_config",
-                {"device": dev, "changes": {"dps_map": new_map}, "validate": False},
+                {"device": dev, "changes": {"dps_map": new_map}, "validate": False,
+                 "engineer_mode": bool(body.get("engineer_mode", False))},
                 timeout=EDIT_TIMEOUT_WAIT,
             )
             if result.get("ok"):

@@ -355,7 +355,7 @@
     <div style="padding:16px;">
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
         <div class="form-group"><label for="scan-subnet">Сеть (первые 3 октета)</label>
-          <input id="scan-subnet" type="text" placeholder="192.168.0" value="192.168.0" oninput="updateScanHint()">
+          <input id="scan-subnet" type="text" placeholder="192.168.1" value="192.168.1" oninput="updateScanHint()">
         </div>
         <div class="form-group"><label>&nbsp;</label>
           <button class="primary" onclick="doScanExtended()" id="scan-btn" style="width:100%;">🔍 Безопасный скан</button>
@@ -418,6 +418,31 @@
             в «📜 Историю конфига».
           </p>
           <button class="danger" id="cfg-normalize-btn" onclick="openNormalizeConfig()">⚠️ Проверить и нормализовать</button>
+        </div>
+      </details>
+
+      <details style="margin-top:12px; border:1px solid var(--yellow); border-radius:6px; background:rgba(215,170,0,0.08);">
+        <summary style="cursor:pointer; padding:8px 12px; color:var(--yellow); font-weight:600;">
+          🛠️ Ручной инженерный режим
+        </summary>
+        <div style="padding:0 12px 12px 12px;">
+          <p class="muted" style="font-size:12px;">
+            <b>ВНИМАНИЕ:</b> отключает <b>все</b> валидации при редактировании DP и настроек
+            конфига — и в интерфейсе, и на мосте. Поля <code>Code</code>, <code>Component</code>,
+            <code>options</code>, <code>map</code>, <code>min/max/step</code>,
+            <code>device_class</code> и др. становятся свободно редактируемыми; метки 🔒
+            остаются видимыми, но не блокируют ввод.
+            <br>Также позволяет <b>полностью перезаписать</b> конфиг уже добавленного устройства
+            через «Превью импорта».
+            <br><b>Только для отладки.</b> Изменения могут сломать MQTT Discovery.
+          </p>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+            <input type="checkbox" id="engineer-mode-toggle" onchange="setEngineerMode(this.checked)">
+            <span>Включить ручной инженерный режим</span>
+          </label>
+          <div id="engineer-mode-hint" class="muted" style="font-size:11px; margin-top:6px; display:none; color:var(--yellow);">
+            Режим активен — валидации отключены (клиент и мост). Будьте осторожны.
+          </div>
         </div>
       </details>
     </div>
@@ -757,6 +782,30 @@
         <input type="checkbox" id="rebuild-skip-battery" checked>
         <label for="rebuild-skip-battery">Не опрашивать батарейные — они спят и не отвечают</label>
       </div>
+      <!-- v1.34.19: новые устройства из Cloud — питание неизвестно, спрашиваем
+           ДО скана, а не нативным confirm() после пересборки. -->
+      <div id="rebuild-unknown-block" style="display:none;">
+        <h3 style="margin:14px 0 4px 0; font-size:14px;">Новые устройства из Cloud
+          <span id="rebuild-unknown-count" class="muted" style="font-weight:400;"></span></h3>
+        <p class="muted" style="font-size:12px; margin:0 0 6px 0;">
+          Их нет в конфиге, поэтому неизвестно, батарейные ли они (спящие не
+          отвечают на опрос — их лучше не будить). Отметь <b>«батарейное»</b> —
+          такие не опрашиваются, их mapping останется из прежней базы.
+          Остальные будут опрошены.
+        </p>
+        <div class="radio-row" style="padding-bottom:2px;">
+          <input type="checkbox" id="rebuild-unknown-all" onchange="rebuildToggleAllUnknown(this.checked)">
+          <label for="rebuild-unknown-all"><b>Отметить все как батарейные</b></label>
+        </div>
+        <div id="rebuild-unknown-list" class="rebuild-unknown-list"></div>
+        <div id="rebuild-unknown-hint" class="muted" style="font-size:11px; margin-top:6px;"></div>
+      </div>
+      <div id="rebuild-unknown-empty" class="muted" style="font-size:12px; margin:10px 0 0 0; display:none;">
+        Новых устройств из Cloud нет — пересборка пойдёт по конфигу.
+      </div>
+      <div id="rebuild-unknown-loading" class="muted" style="font-size:12px; margin:10px 0 0 0; display:none;">
+        <span class="spin"></span> смотрю, что доступно в Cloud…
+      </div>
       <div class="radio-row" style="align-items:flex-start;">
         <input type="checkbox" id="rebuild-stop-first" checked>
         <label for="rebuild-stop-first">Останавливаться на первой ответившей версии протокола</label>
@@ -822,6 +871,11 @@
 <div id="dps-preview-overlay" class="modal-overlay top" onclick="closeDpsPreview(event)">
   <div class="modal" style="max-width:600px;" onclick="event.stopPropagation()">
     <div class="modal-header">
+      <!-- v1.34.26: кнопка проверки DP — одна иконка ✅ (по умолчанию включена; нажатие — выключить). -->
+      <button id="dps-validate-toggle" class="modal-title-btn" aria-pressed="true"
+              style="margin-right:auto; background:transparent; border:1px solid rgba(128,128,128,.45); border-radius:6px; padding:2px 8px; font-size:14px; line-height:1.4; cursor:pointer; opacity:0.95;"
+              title="Проверка DP включена — нажмите, чтобы выключить"
+              onclick="toggleDpsValidate()">✅</button>
       <h2>Применить изменения DP?</h2>
       <button class="modal-close" onclick="closeDpsPreview()">×</button>
     </div>

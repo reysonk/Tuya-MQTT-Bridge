@@ -58,6 +58,10 @@ DISCOVERY_PREFIX = os.getenv("DISCOVERY_PREFIX") or "homeassistant"
 TOPIC_PREFIX = os.getenv("TOPIC_PREFIX") or "tuya"
 # v1.14.0 (B): кэш последнего UDP-статуса устройства (для публикации в MQTT).
 _udp_alive_cache = {}
+# 13.10.2026 07:09 (аудит моста): защита от неограниченного роста кэша — значения
+# пишутся с меткой времени, устаревшие имена вычищаются при переполнении.
+_UDP_ALIVE_CACHE_MAX = 4096
+_UDP_ALIVE_CACHE_TTL = 3600
 
 
 def _config_topic(component, unique_id):
@@ -187,7 +191,7 @@ _LEGACY_ORPHAN_FALLBACK = (
     "_humidity", "_temperature",
 )
 
-DISCOVERY_VERSION = "1.14.24"
+DISCOVERY_VERSION = "1.15.4"
 RETAINED_DUP_WINDOW = 10
 
 # v1.12.32: пул команд — per-device (DEVICE_EXECS, команды и повторы отдельно),
@@ -342,12 +346,24 @@ DEVICE_CLASSES_ALLOWED = {
     # sensor
     "temperature", "humidity", "battery", "energy", "power", "current",
     "voltage", "frequency", "power_factor", "illuminance", "pressure",
-    "signal_strength", "timestamp", "duration",
+    "signal_strength", "timestamp", "duration", "distance",
+    # sensor — расширение 13.10.2026 06:57 (#1144): классы, которые реально использует
+    # tuya-local и которые есть в HA 2026.9 (сверено по устройству стенда)
+    "absolute_humidity", "apparent_power", "aqi", "area", "atmospheric_pressure",
+    "carbon_dioxide", "carbon_monoxide", "conductivity", "data_rate",
+    "data_size", "date", "energy_distance", "energy_storage", "enum",
+    "irradiance", "monetary", "nitrogen_dioxide", "nitrogen_monoxide",
+    "nitrous_oxide", "ozone", "ph", "pm1", "pm10", "pm25", "pm4",
+    "precipitation", "precipitation_intensity", "radon", "reactive_energy",
+    "reactive_power", "sound_pressure", "speed", "sulphur_dioxide",
+    "temperature_delta", "uptime", "volatile_organic_compounds",
+    "volatile_organic_compounds_parts", "volume", "volume_flow_rate",
+    "volume_storage", "water", "weight", "wind_direction", "wind_speed",
     # binary_sensor
-    "problem", "door", "motion", "moisture", "smoke", "gas", "light",
-    "opening", "window", "garage_door", "lock", "presence", "running",
-    "plug", "sound", "vibration", "update", "connectivity", "tamper",
-    "heat", "cold", "moving", "occupancy", "safety",
+    "battery", "battery_charging", "problem", "door", "motion", "moisture",
+    "smoke", "gas", "light", "opening", "window", "garage_door", "lock",
+    "presence", "running", "plug", "sound", "vibration", "update",
+    "connectivity", "tamper", "heat", "cold", "moving", "occupancy", "safety",
 }
 
 STATE_CLASSES_ALLOWED = {
@@ -606,6 +622,20 @@ def _published_entity_wants(dev):
         wants += [("fan",)]
     else:
         wants += [("sensor",), ("binary_sensor",)]
+        # v1.14.33 (баг: orphan-чистка удаляла живые number/select у
+        # sensor-устройств): publish_discovery ветка else публикует
+        # number/select с v1.33.14 (см. publish_discovery, комментарий
+        # «тип sensor/binary_sensor может нести number/select DP»),
+        # а wants об этом не знал → _discovery_topics_for_device не
+        # включал их uid в ожидаемые → retained-конфиги живых сущностей
+        # (mmWave-настройки, select радара) считались orphan и удалялись.
+        # Зеркалим publish_discovery: берём number/select из dps_map.
+        for _info in dev.get("dps_map", {}).values():
+            if (isinstance(_info, dict)
+                    and _info.get("component") in ("number", "select")):
+                _comp = (_info["component"],)
+                if _comp not in wants:
+                    wants.append(_comp)
     return wants
 
 
@@ -618,7 +648,6 @@ def _discovery_topics_for_device(dev):
     """
     topics = set()
     dev_name = dev["name"]
-    dtype = dev.get("type", "sensor")
 
     # battery_alert + battery_last_seen
     if dev.get("battery_powered"):
@@ -728,8 +757,8 @@ def scan_retained_discovery(wait_sec=3.0, filter_by_devices=True):
         scan_client.loop_stop()
         try:
             scan_client.disconnect()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"[Discovery] scan_client disconnect: {e}")
     except Exception as e:
         log.warning(f"[Discovery] scan failed: {e}")
 
@@ -773,6 +802,79 @@ def _save_known_device_names(names):
             raise
     except Exception as e:
         log.warning(f"[Discovery] known names save: {e}")
+
+def _scan_retained_under(dev_name, wait_sec=2.0):
+    """v1.14.28: собрать retained-топики под поддеревом {prefix}/<dev>/#."""
+    found = set()
+    found_lock = threading.Lock()
+    prefix = f"{TOPIC_PREFIX}/{dev_name}/"
+
+    def _on_sweep_message(client, userdata, msg):
+        if msg.retain and msg.topic.startswith(prefix):
+            with found_lock:
+                found.add(msg.topic)
+
+    try:
+        sc = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"tuya_bridge_sweep_{int(time.time())}",
+        )
+        if MQTT_USERNAME:
+            sc.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        sc.on_message = _on_sweep_message
+        sc.connect(MQTT_BROKER, MQTT_PORT, 60)
+        sc.subscribe(f"{prefix}#", qos=1)
+        sc.loop_start()
+        time.sleep(wait_sec)
+        sc.loop_stop()
+        try:
+            sc.disconnect()
+        except Exception as e:
+            log.debug(f"[Sweep] disconnect: {e}")
+    except Exception as e:
+        log.warning(f"[Sweep] scan {dev_name}: {e}")
+    with found_lock:
+        return set(found)
+
+
+def clear_device_data_topics(dev_name, wait_sec=2.0):
+    """v1.14.28: погасить retained по всему поддереву {prefix}/<dev>/#.
+
+    WebUI создаёт карточку устройства по ЛЮБОМУ сообщению
+    {prefix}/<dev>/<key>, включая retained. Без этой зачистки после удаления
+    устройства на дашборде остаётся «призрак».
+    """
+    cleaned = 0
+    for topic in sorted(_scan_retained_under(dev_name, wait_sec=wait_sec)):
+        try:
+            mqtt_client.publish(topic, payload=None, qos=1, retain=True)
+            cleaned += 1
+        except Exception as e:
+            log.warning(f"[Sweep] clear {topic}: {e}")
+    if cleaned:
+        log.info(f"[Sweep] {dev_name}: погашено retained {cleaned}")
+    return cleaned
+
+
+def sweep_stale_device_topics():
+    """v1.14.28: стартовая реконсиляция retained-мусора.
+
+    Для имён из истории (known_device_names), которых нет в текущем конфиге,
+    гасим retained-поддеревья и вычищаем историю (prune).
+    """
+    with DEVICES_LOCK:
+        current = {d["name"] for d in ALL_DEVICES}
+    history = _load_known_device_names()
+    stale = sorted(history - current)
+    if not stale:
+        return 0
+    log.info(f"[Sweep] устаревших имён в истории: {len(stale)} — чищу retained")
+    total = 0
+    for name in stale:
+        total += clear_device_data_topics(name, wait_sec=1.5)
+    _save_known_device_names(current)
+    log.info(f"[Sweep] готово: имён {len(stale)}, топиков погашено {total}")
+    return total
 
 
 def _filter_orphan_by_suffix(topics, all_dev_names):
@@ -1007,6 +1109,19 @@ def get_device_conn(dev):
         d.set_version(float(dev["version"]))
         d.set_socketPersistent(True)
         d.set_socketTimeout(SOCKET_TIMEOUT_CMD)
+        # v1.15.3 (#1226): ГАСИМ встроенные повторы tinytuya. Дефолты библиотеки —
+        # retry=True, socketRetryLimit=5, socketRetryDelay=5 с. При нашем таймауте
+        # сокета 0.3 с «нет ответа» уходило в цикл повторов, и ОТПРАВКА ДЕРЖАЛА
+        # device-лок до ~11 с (замер: [T] multi-DP отправка 10875 мс). Из-за этого
+        # следующая команда (OFF) ждала лок, а люстра физически горела 10-15 с.
+        # Прибор отвечает за 10-11 мс (прямой замер) — повторы не нужны.
+        for _setter, _val in (("set_retry", False),
+                              ("set_socketRetryLimit", 1),
+                              ("set_socketRetryDelay", 0)):
+            try:
+                getattr(d, _setter)(_val)
+            except Exception as _e:
+                log.debug(f"[Tuya] {dev['name']}: {_setter} недоступен: {_e}")
         DEVICE_CONN[name] = (_sig, d)
         return d
 
@@ -1218,8 +1333,13 @@ def parse_payload(payload):
 
 
 def dp_int(dp_str):
+    """Ключ dps_map → числовой id физического DP.
+
+    Ключ может нести суффикс `id__<имя>` (под-DП с одним id — #1144 срез 2):
+    реальный id = цифровая часть до первого `__`."""
+    s = str(dp_str).split("__", 1)[0] if dp_str is not None else ""
     try:
-        return int(dp_str)
+        return int(s)
     except (TypeError, ValueError):
         return None
 
@@ -1232,6 +1352,344 @@ def find_dp_by_name(dev, name, component=None):
             continue
         return dp_str, info
     return None, None
+
+
+def _redirect_write_dp(dev, dp_str, info, dp, value):
+    """#1144 срез 8.2b: физический DP для записи с учётом value_redirect.
+
+    Семантика tuya-local get_values_to_set (device_config.py:1004-1064):
+    запись уходит на DP цели, когда активная ветка conditions имеет
+    value_redirect (1056-1064). Приоритет активной ветки (933-976):
+    cond["value"] == записываемое значение (973-974), иначе dps_val совпадает
+    с текущим значением constraint-DP (949-963; дефолт constraint — имя
+    самого DP, 934). Безусловная mapping-ветка dps_val: null (entry["redirect"],
+    срез 8.2a) зеркалит case2 (1004-1010): запись уходит на цель, только если
+    собственное значение DP в кэше отсутствует/None. Цель — последнее звено
+    redirect_ids (рекурсия find_dps(redirect).get_values_to_set, 1060-1064).
+    Сравнение значений — приближение (str-эквивалент, без bitfield/sequence
+    _equal_or_in). Возвращает исходный dp, если редирект не применим."""
+    if not isinstance(info, dict) or dp is None:
+        return dp
+    try:
+        chain = None
+        conds = info.get("conditions")
+        if isinstance(conds, list) and conds:
+            active = None
+            for c in conds:
+                if (
+                    isinstance(c, dict)
+                    and c.get("redirect_ids")
+                    and "value" in c
+                    and str(c.get("value")) == str(value)
+                ):
+                    active = c
+                    break
+            if active is None:
+                cname = info.get("constraint") or info.get("name")
+                cval = None
+                if cname:
+                    ckey, _ci = find_dp_by_name(dev, cname)
+                    if ckey is not None:
+                        cval = STATE_CACHE.get(dev.get("name", ""), {}).get(ckey)
+                if cval is not None:
+                    for c in conds:
+                        if (
+                            isinstance(c, dict)
+                            and c.get("redirect_ids")
+                            and "dps_val" in c
+                            and str(c.get("dps_val")) == str(cval)
+                        ):
+                            active = c
+                            break
+            if active is not None:
+                chain = active.get("redirect_ids")
+        if not chain:
+            red = info.get("redirect")
+            if isinstance(red, list) and red:
+                own = STATE_CACHE.get(dev.get("name", ""), {}).get(dp_str)
+                if own is None:
+                    chain = red
+        if chain:
+            target = dp_int(str(chain[-1]))
+            if target is not None and target != dp:
+                log.debug(
+                    f"[Redirect] {dev.get('name')}: запись DP {dp} -> цель {target} "
+                    f"(value={value!r}, {info.get('name')})"
+                )
+                return target
+    except Exception as e:
+        log.warning(f"[Redirect] _redirect_write_dp({dev.get('name')}, {dp}): {e}")
+    return dp
+
+
+def _active_cond_branch(dev, info):
+    """#1144 срез 3 (этап 2): активная conditions-ветка по constraint-DP.
+
+    Семантика tuya-local _active_condition (device_config.py:933-976),
+    упрощённо (без bitfield/None-кейсов — как в _redirect_write_dp):
+    constraint дефолтит на имя самого DP (934), сопоставление dps_val ==
+    текущему значению constraint-DP из STATE_CACHE (str-эквивалент).
+    Возвращает словарь активной ветки или None."""
+    conds = info.get("conditions") if isinstance(info, dict) else None
+    if not isinstance(conds, list) or not conds:
+        return None
+    cname = info.get("constraint") or info.get("name")
+    if not cname:
+        return None
+    ckey, _ci = find_dp_by_name(dev, cname)
+    if ckey is None:
+        return None
+    cval = STATE_CACHE.get(dev.get("name", ""), {}).get(ckey)
+    if cval is None:
+        return None
+    for c in conds:
+        if isinstance(c, dict) and "dps_val" in c and str(c.get("dps_val")) == str(cval):
+            return c
+    return None
+
+
+def _apply_cond_overrides(dev, info, config, kind):
+    """#1144 срез 3 (этап 2): перекрыть min/max/step/options значениями
+    активной conditions-ветки (range/step/mapping из tuya-local-ветки).
+    kind: "number" (range/step) или "select" (mapping → options меток).
+    Тихий no-op без conditions/активной ветки; исключение — warning."""
+    try:
+        cond = _active_cond_branch(dev, info)
+        if not cond:
+            return
+        if kind == "number":
+            rng = cond.get("range")
+            if isinstance(rng, dict):
+                if rng.get("min") is not None:
+                    config["min"] = rng["min"]
+                if rng.get("max") is not None:
+                    config["max"] = rng["max"]
+            if cond.get("step") is not None:
+                config["step"] = cond["step"]
+        elif kind == "select":
+            omap = cond.get("mapping")
+            if isinstance(omap, list) and omap:
+                opts = [
+                    (m.get("value") if m.get("value") is not None else m.get("dps_val"))
+                    for m in omap if isinstance(m, dict)
+                ]
+                opts = [o for o in opts if o is not None]
+                if opts:
+                    config["options"] = opts
+        log.debug(
+            f"[CondRange] {dev.get('name')}: ветка активна для {info.get('name')} "
+            f"(constraint={info.get('constraint')!r}, dps_val={cond.get('dps_val')!r})"
+        )
+    except Exception as e:
+        log.warning(f"[CondRange] _apply_cond_overrides({dev.get('name')}, {info.get('name')}): {e}")
+
+
+def _apply_invert(info, val, lo, hi):
+    """#1144 срез 4 (этап 2): инверсия диапазона tuya-local
+    (device_config.py:836-840: result = -result + min + max).
+    lo/hi — границы ДИАПАЗОНА ЗНАЧЕНИЯ val (сырые, с учётом scale).
+    Без invert-флага или на None/мусоре — значение как есть."""
+    if not isinstance(info, dict) or not info.get("invert") or val is None:
+        return val
+    try:
+        return (lo + hi) - val
+    except Exception:
+        return val
+
+
+# #1144 срез 5 (этап 2): декод `mask`/`endianness` — под-поле из сырого DP.
+# Семантика tuya-local device_config.py:476-509: (value & mask) со сдвигом на
+# младший бит mask, опц. mask_signed (знаковое); байты — с учётом endianness.
+def _mask_int(info):
+    """mask-строка (hex) → int; None, если маски нет или она битая."""
+    if not isinstance(info, dict):
+        return None
+    m = info.get("mask")
+    if not m:
+        return None
+    try:
+        mi = int(str(m), 16)
+    except (TypeError, ValueError):
+        return None
+    return mi if mi > 0 else None
+
+
+def _raw_to_int(info, raw_val):
+    """Сырое значение DP → int.
+
+    int/float/bool — как есть; hex/base64-строка — байты по endianness.
+    None — не удалось разобрать (вызывающий откатывается на raw как есть)."""
+    if isinstance(raw_val, bool):
+        return int(raw_val)
+    if isinstance(raw_val, int):
+        return raw_val
+    if isinstance(raw_val, float):
+        return int(raw_val)
+    if not isinstance(raw_val, str):
+        return None
+    s = raw_val.strip()
+    if not s:
+        return None
+    typ = str(info.get("type") or "").strip().lower()
+    if s.lower().startswith("0x"):
+        try:
+            return int(s, 16)
+        except ValueError:
+            return None
+    if typ in ("hex", "integer|hex", "hex|integer"):
+        try:
+            return int(s, 16)
+        except ValueError:
+            return None
+    if typ in ("base64", "utf16b64"):
+        try:
+            return int.from_bytes(base64.b64decode(s), info.get("endianness", "big"))
+        except Exception:
+            return None
+    # голая hex-строка чётной длины (тупой детект, не мешает int-значениям)
+    if len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+        try:
+            return int(s, 16)
+        except ValueError:
+            return None
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_mask(info, raw_val):
+    """#1144 срез 5 (этап 2): выделить под-поле `mask` из raw DP.
+
+    (value & mask) >> младший_бит(mask); при mask_signed — знаковое.
+    Нет mask / raw не разобрали — значение как есть (обратная совместимость)."""
+    mask = _mask_int(info)
+    if mask is None or raw_val is None:
+        return raw_val
+    v = _raw_to_int(info, raw_val)
+    if v is None:
+        return raw_val
+    shift = (mask & -mask).bit_length() - 1
+    res = (v & mask) >> shift
+    if info.get("mask_signed"):
+        bits = bin(mask).count("1")
+        if bits and res >= (1 << (bits - 1)):
+            res -= (1 << bits)
+    return res
+
+
+def _compose_mask(dev, dp_str, info, sub_val):
+    """#1144 срез 5 (этап 2): вписать sub_val в поле `mask` текущего raw DP.
+
+    Возвращает собранный raw; None — если текущее значение недоступно
+    (не клоббим вслепую остальные биты)."""
+    mask = _mask_int(info)
+    if mask is None:
+        return sub_val
+    with STATE_LOCK:
+        cur = STATE_CACHE.get(dev.get("name", ""), {}).get(str(dp_str))
+    base = _raw_to_int(info, cur)
+    if base is None:
+        return None
+    try:
+        sub = int(sub_val)
+    except (TypeError, ValueError):
+        return None
+    shift = (mask & -mask).bit_length() - 1
+    return (base & ~mask) | ((sub << shift) & mask)
+
+
+# #1144 срез 3 (этап 2): память последней активной ветки per устройство/DP —
+# смена constraint-DP меняет range/options в Discovery (HA увидит минимум/максимум).
+_COND_BRANCH_MEM = {}
+
+
+def _cond_branch_refresh(device, dps_map):
+    """Смена активной ветки conditions → перепубликация Discovery устройства.
+
+    Вызывается из publish_state ПОСЛЕ обновления STATE_CACHE: если dps_val
+    активной ветки изменился (или ветка появилась/пропала) относительно
+    прошлого замера — перепубликуем Discovery (min/max/options пересобираются
+    в device_entities через _apply_cond_overrides). Первый замер только
+    запоминается (стартовый Discovery публикуется отдельно)."""
+    dev_name = device.get("name", "")
+    changed = False
+    mem = _COND_BRANCH_MEM.setdefault(dev_name, {})
+    for dp_str, info in dps_map.items():
+        if not info.get("conditions"):
+            continue
+        if info.get("component") not in ("number", "select"):
+            continue
+        cond = _active_cond_branch(device, info)
+        key = cond.get("dps_val") if isinstance(cond, dict) else None
+        if dp_str in mem and mem[dp_str] != key:
+            changed = True
+            log.debug(
+                f"[CondRange] {dev_name}/{info.get('name')}: ветка {mem[dp_str]!r} -> {key!r}"
+            )
+        mem[dp_str] = key
+    if changed:
+        try:
+            _republish_discovery_for([dev_name])
+        except Exception as e:
+            log.warning(f"[CondRange] {dev_name}: republish discovery: {e}")
+
+
+# #1144 срез 8.2: маркер «DP-цели физически нет в кэше» (None — валидное значение).
+_REDIR_ABSENT = object()
+
+
+def _fill_redirected(dps_map, cached, phys):
+    """#1144 срез 8.2a: фоллбек «нет своего значения → кэш DP-цели».
+
+    Семантика tuya-local get_value (device_config.py:826-830): при активном
+    value_redirect значение читается с целевого DP. Цели отфильтрованы из
+    dps_map (срез 8.1), поэтому парсер кладёт их ФИЗИЧЕСКИЕ id:
+    entry["redirect"] — mapping-ветка `dps_val: null` (безусловный фоллбек),
+    у conditions-веток — redirect_ids внутри conditions (ветка активна при
+    dps_val == значение constraint-DP из кэша). Кандидаты перебираются по
+    цепочке (ampbolt: sensor → single_phase → phase_a), максимум 4 звена
+    (лимит в парсере). Только ЧТЕНИЕ: записи уходят на исходный DP —
+    запись-редирект (8.2b) отдельным этапом. Сырой кэш цели публикуется как
+    есть; scale-разворот источника применяется дальше обычным ходом (когда
+    scale у source и цели совпадают — результат идентичен tuya-local)."""
+    def _phys_get(pid):
+        if pid in phys:
+            return phys[pid]
+        try:
+            k = str(int(pid))
+        except (TypeError, ValueError):
+            return _REDIR_ABSENT
+        return phys.get(k, _REDIR_ABSENT)
+
+    for dp_str, info in dps_map.items():
+        if dp_str in cached and cached[dp_str] is not None:
+            continue  # своё значение есть — redirect не нужен
+        cands = info.get("redirect")
+        if not isinstance(cands, list) or not cands:
+            # условная ветка: резолв по constraint-DP из кэша
+            cond_l = info.get("conditions")
+            cname = info.get("constraint")
+            if isinstance(cond_l, list) and cname:
+                _cv = _REDIR_ABSENT
+                for _k, _i in dps_map.items():
+                    if _i.get("name") == cname and _k in cached:
+                        _cv = cached[_k]
+                        break
+                if _cv is not _REDIR_ABSENT:
+                    for c in cond_l:
+                        if not isinstance(c, dict) or "value_redirect" not in c:
+                            continue
+                        if str(c.get("dps_val")) == str(_cv):
+                            cands = c.get("redirect_ids")
+                            break
+        if not isinstance(cands, list) or not cands:
+            continue
+        for pid in cands:
+            v = _phys_get(str(pid))
+            if v is not _REDIR_ABSENT and v is not None:
+                cached[dp_str] = v
+                break
 
 
 def get_bright_bounds(info):
@@ -1350,7 +1808,7 @@ def _validate_dps_map(dev_type, dps_map):
       - number: min < max, step > 0
       - select: options непустой, без дубликатов; map ⊆ options
       - sensor: scale int >= 0, state_class/device_class из белых списков
-      - binary_sensor: device_class из белого списка
+      - binary_sensor: device_class из белого списка; map — значения строго ON/OFF
       - phase_a: name == "phase_a"
       - preset: name == "preset_mode"
       - cover: name из COVER_DP_NAMES; device_class из COVER_DEVICE_CLASSES_ALLOWED
@@ -1372,9 +1830,18 @@ def _validate_dps_map(dev_type, dps_map):
         # --- DP ID ---
         if not isinstance(dp_str, str):
             return False, f"dp id must be string: {dp_str!r}", warnings
-        if not dp_str.isdigit():
+        # 13.10.2026 08:21 (#1144 срез 2): ключ может нести суффикс id__<имя> для
+        # под-DП с одним id — id = цифровая часть до первого "__".
+        _id_part = dp_str.split("__", 1)[0]
+        if not _id_part.isdigit():
             return False, f"dp id must be digits: {dp_str!r}", warnings
-        dp_int_val = int(dp_str)
+        if dp_str != _id_part:
+            _suffix = dp_str.split("__", 1)[1]
+            if not _suffix or any(
+                    c not in "0123456789abcdefghijklmnopqrstuvwxyz_"
+                    for c in _suffix):
+                return False, f"dp id suffix must be [0-9a-z_]+: {dp_str!r}", warnings
+        dp_int_val = int(_id_part)
         if not (1 <= dp_int_val <= 255):
             return False, f"dp id out of range (1..255): {dp_str}", warnings
 
@@ -1490,9 +1957,12 @@ def _validate_dps_map(dev_type, dps_map):
             if m is not None:
                 if not isinstance(m, dict):
                     return False, f"dp {dp_str}: map must be dict", warnings
-                for k in m.keys():
-                    if k not in opts:
-                        return False, f"dp {dp_str}: map key {k!r} not in options", warnings
+                # Для Tuya select: map = {raw_tuya_value -> human_option}
+                # Ключ = сырое значение от Tuya (power_on, power_off, last, 0, 1, 2, ...)
+                # Значение = человекочитаемая опция (on, off, memory, state, locator, ...)
+                for v in m.values():
+                    if v not in opts:
+                        return False, f"dp {dp_str}: map value {v!r} not in options", warnings
 
         # --- sensor: scale / state_class / device_class ---
         if comp == "sensor":
@@ -1509,11 +1979,27 @@ def _validate_dps_map(dev_type, dps_map):
             if dc is not None and dc not in DEVICE_CLASSES_ALLOWED:
                 return False, f"dp {dp_str}: unknown device_class {dc!r}", warnings
 
-        # --- binary_sensor: device_class ---
+        # --- binary_sensor: device_class / map ---
         if comp == "binary_sensor":
             dc = info.get("device_class")
             if dc is not None and dc not in DEVICE_CLASSES_ALLOWED:
                 return False, f"dp {dp_str}: unknown device_class {dc!r}", warnings
+            # v1.33.14: map (raw → ON/OFF) — как у select, но значения строго
+            # ON/OFF (мост публикует состояние в HA именно ими).
+            bmap = info.get("map")
+            if bmap is not None:
+                if not isinstance(bmap, dict):
+                    return False, f"dp {dp_str}: binary_sensor map must be dict", warnings
+                for _mv in bmap.values():
+                    if _mv not in ("ON", "OFF"):
+                        return False, (f"dp {dp_str}: binary_sensor map values "
+                                       f"must be 'ON'/'OFF' (got {_mv!r})"), warnings
+
+        # --- hidden: ленивый Discovery (tuya-local `hidden: unavailable`) ---
+        # v1.14.27: dp с hidden=true не публикуется сразу; мост отдаёт его
+        # Discovery только когда устройство реально прислало значение.
+        if info.get("hidden") is not None and not isinstance(info.get("hidden"), bool):
+            return False, f"dp {dp_str}: hidden must be bool", warnings
 
         # --- phase_a: name == phase_a ---
         if comp == "phase_a":
@@ -1680,6 +2166,47 @@ def _probe_tuya_udp(ip, timeout=1.0):
                 pass
     # TCP 6668 открыт, но UDP не ответил — вероятно, не Tuya
     return {"port_6668": True, "tuya_probable": True}
+
+
+# v1.14.26: широковещательный Tuya-discovery → {gwId: {ip, productKey, version}}.
+# Unicast-проба (_probe_tuya_udp) на многих приборах gwId не отдаёт, а broadcast —
+# отдаёт (шифрованный REQ_DEVINFO на порт 7000, ответ на эфемерный порт источника).
+# Делаем это штатным tinytuya.deviceScan — он и держит сокет на эфемерном порту,
+# поэтому НЕ конфликтует с пассивным UDP-детектором (udp_detect.py, порт 6667).
+def _tuya_broadcast_discover(subnet_prefix=None, wait_sec=5.0):
+    devices = {}
+    # v1.14.29: deviceScan биндится на 6667 и конфликтует с пассивным
+    # UDP-детектором (EADDRINUSE) — на время скана ставим его на паузу.
+    try:
+        udp_detect.pause()
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[Discover] udp pause: {e}")
+    try:
+        try:
+            found = tinytuya.deviceScan(verbose=False, maxretry=4) or {}
+        except Exception as e:
+            log.warning(f"[Discover] deviceScan: {e}")
+            return devices
+    finally:
+        try:
+            udp_detect.resume()
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Discover] udp resume: {e}")
+    # deviceScan возвращает {ip: {ip, gwId, productKey, version, ...}} — а нам нужен
+    # {gwId: {...}} для сопоставления по Tuya id устройства из Cloud.
+    for _ip, info in found.items():
+        if not isinstance(info, dict):
+            continue
+        gwid = str(info.get("gwId") or "")
+        if not gwid:
+            continue
+        devices[gwid] = {
+            "ip": str(info.get("ip") or _ip or ""),
+            "productKey": info.get("productKey", ""),
+            "version": info.get("version", ""),
+        }
+    log.info(f"[Discover] Tuya-устройств найдено: {len(devices)}")
+    return devices
 
 
 def _scan_subnet(subnet_prefix):
@@ -1867,6 +2394,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
         client.subscribe(f"{TOPIC_PREFIX}/bridge/delete_device")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/import_devices")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/scan_network")
+        client.subscribe(f"{TOPIC_PREFIX}/bridge/tuya_discover")
         # v1.11.0: инструменты конфига (отчёт / expire_after / нормализация)
         client.subscribe(f"{TOPIC_PREFIX}/bridge/config_report")
         client.subscribe(f"{TOPIC_PREFIX}/bridge/expire_clear")
@@ -1916,6 +2444,89 @@ def is_duplicate_retained(topic, payload, window=RETAINED_DUP_WINDOW):
 # повторами — и новые команды, например включение, не отправлялись).
 DEVICE_EXECS = {}
 DEVICE_EXECS_LOCK = threading.Lock()
+# v1.14.24 (#1087 P0-2): предохранитель глубины очереди команд на устройство.
+# При молчащем/медленном приборе (облачный ACK 2-7 с) очередь ThreadPoolExecutor
+# росла неограниченно: старые команды уходили в хвост, новые ждали десятки секунд,
+# и вся система выглядела как «залип». Лимит ОГРАНИЧИВАЕТ накопление и делает
+# переполнение видимым в логе, вместо тихого роста памяти.
+# 0 — предохранитель выключен. Настраивается TUYA_MAX_QUEUE_DEPTH.
+MAX_DEVICE_QUEUE_DEPTH = int(os.environ.get("TUYA_MAX_QUEUE_DEPTH", "10") or 10)
+
+# v1.15.1 (#1226): СЛОТ "ПОСЛЕДНЕЕ НАМЕРЕНИЕ" ВМЕСТО FIFO.
+# Причина (замер на проде 16.10.2026 16:17, карточка #1226): FIFO-очередь ThreadPoolExecutor
+# не даёт удалить старый элемент, поэтому переполнение приходилось гасить дропом НОВОЙ
+# команды — прибор докатывал УСТАРЕВШИЕ значения, а свежее намерение терялось
+# («залип» + поздний синк двух сторон). Лог: `очередь команд переполнена (11 > 10)`.
+# Теперь на пару (прибор, компонент) хранится ОДНО последнее значение, а на прибор
+# планируется ОДИН разгребатель: переполнение структурно невозможно, побеждает
+# последнее намерение (дружественный rustuya-bridge: «теряется старое, не новое»).
+_CMD_SLOT = {}                      # (имя, компонент) -> (parts, cmd, seq)
+_CMD_SLOT_LOCK = threading.Lock()
+_DRAIN_ACTIVE = set()               # приборы с запланированным разгребателем
+_CMD_SEQ = [0]
+_CMD_SUPERSEDED = [0]               # значений вытеснено новым ДО отправки
+_CMD_OVERFLOW = [0]                 # срабатываний предохранителя (страховка)
+_RETRY_SKIPPED = [0]                # ретраев отложено (в очереди есть команда)
+
+
+def _device_has_user_cmd(name):
+    """v1.15.1 (#1226): есть ли у прибора неотправленное пользовательское намерение."""
+    with _CMD_SLOT_LOCK:
+        return any(k[0] == name for k in _CMD_SLOT) or name in _DRAIN_ACTIVE
+
+
+def _drain_device_commands(dev):
+    """v1.15.1 (#1226): разгребатель прибора — отправляет только последнее по ключу.
+
+    Пока он активен, новые команды лишь обновляют слот (last-wins), поэтому глубина
+    очереди исполнителя не превышает числа приборов и предохранитель не срабатывает.
+    """
+    name = dev["name"]
+    while not STOP_EVENT.is_set():
+        with _CMD_SLOT_LOCK:
+            keys = [k for k in _CMD_SLOT if k[0] == name]
+            if not keys:
+                # Флаг снимаем В ТОМ ЖЕ локе, что и постановка слота: если offer
+                # придёт сразу после, он увидит флаг снятым и запланирует
+                # разгребатель заново — «застрять» в слоте команда не может.
+                _DRAIN_ACTIVE.discard(name)
+                return
+            batch = [(k[1], _CMD_SLOT.pop(k)) for k in keys]
+        for component, (parts, cmd, _seq) in batch:
+            try:
+                process_command(dev, component, parts, cmd)
+            except Exception as e:
+                log.debug(f"[Cmd] {name}/{component}: drain: {e}")
+    with _CMD_SLOT_LOCK:
+        _DRAIN_ACTIVE.discard(name)
+
+
+def _publish_cmd_stats():
+    """v1.15.1 (#1226): счётчики пути команд (retain) — залип виден числом, а не на слух."""
+    try:
+        payload = json.dumps({
+            "slot_pending": len(_CMD_SLOT),
+            "superseded": _CMD_SUPERSEDED[0],
+            "overflow": _CMD_OVERFLOW[0],
+            "retry_skipped": _RETRY_SKIPPED[0],
+            "queue_depth_max": MAX_DEVICE_QUEUE_DEPTH,
+        })
+        mqtt_client.publish(f"{TOPIC_PREFIX}/bridge/cmd_stats", payload,
+                            qos=0, retain=True)
+    except Exception as e:
+        log.debug(f"[Cmd] stats: {e}")
+
+
+def _device_queue_depth(ex):
+    """Глубина очереди ThreadPoolExecutor.
+
+    В CPython ThreadPoolExecutor хранит работу в `_work_queue` (SimpleQueue) —
+    публичного API у очереди нет, но атрибут стабилен начиная с 3.2. Если его
+    вдруг не окажется, возвращаем 0 — предохранитель молча выключается,
+    поведение остаётся прежним (никакой деградации).
+    """
+    q = getattr(ex, "_work_queue", None)
+    return q.qsize() if q is not None else 0
 
 
 def get_device_exec(dev_name):
@@ -1925,6 +2536,34 @@ def get_device_exec(dev_name):
             ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dev-" + dev_name)
             DEVICE_EXECS[dev_name] = ex
         return ex
+
+
+# v1.14.24 (#1087 P0-1, скорректировано): КОАЛЕСЦЕНЦИЯ ПОВТОРЯЮЩИХСЯ КОМАНД.
+# ЯКОРЬ ОСОЗНАННО ВЫБРАН ЗДЕСЬ (а не рядом с DEVICE_EXECS): патч P0-2 вставляет
+# свой блок в ту же точку, и оба диффа перестали бы накладываться друг на друга.
+# ИСХОДНАЯ ИДЕЯ (latest-wins стриминговых DP через CMD_PENDING) НЕ РАБОТАЕТ и
+# здесь намеренно НЕ реализована: bright_value/temp_value/colour_data/temp_set
+# входят в _NO_RETRY_NAMES и в _pending_mark отбрасываются через `continue`,
+# т.е. в CMD_PENDING они не попадают вообще — coalesce там был бы пустой правкой.
+# Стриминговые значения приходят внутри `cmd` у компонента light, а `parts` —
+# это MQTT-топик, а не имя DP, поэтому «ловить DP» в submit невозможно.
+# РЕАЛЬНЫЙ рычаг: дедуп идентичной команды, поставленной подряд в пределах окна
+# (Adaptive Lighting неоднократно присылает одно и то же значение яркости/цвета).
+# Такая команда не создаёт новую запись в очереди. 0 — coalesce выключен.
+# Память ОГРАНИЧЕНА: одна запись на пару (прибор, компонент), а не словарь на все
+# команды — иначе сам предохранитель утекал бы в память.
+TUYA_CMD_DEDUP_WINDOW_MS = int(os.environ.get("TUYA_CMD_DEDUP_WINDOW_MS", "200") or 0)
+_CMD_LAST_SUBMIT = {}                # {(name, component): (fingerprint, monotonic)}
+_CMD_LAST_SUBMIT_LOCK = threading.Lock()
+
+
+def _cmd_fingerprint(parts, cmd):
+    """Отпечаток команды для дедупа. hashlib не импортирован в мосте — берём repr;
+    отпечаток живёт только внутри процесса, устойчивость к hash-seed не нужна."""
+    try:
+        return repr((list(parts), cmd))
+    except Exception:
+        return repr((str(parts), str(cmd)))
 
 
 # v1.12.31: у повторов — ОТДЕЛЬНЫЙ маленький пул на устройство, чтобы [Retry]
@@ -1944,8 +2583,50 @@ def get_device_retry_exec(dev_name):
 def submit_device_command(dev, component, parts, cmd):
     """Поставить команду в очередь КОНКРЕТНОГО устройства."""
     name = dev["name"]
+    # v1.14.24 (#1087 P0-1): дедуп подряд идущих одинаковых команд.
+    # ЯКОРЬ — ДО try: не случайно. Патч P0-2 добавляет свою проверку ВНУТРИ try,
+    # и если дедуп стоял бы там же, два диффа накладывались бы друг на друга и
+    # не применялись бы вместе (проверено: git apply отклонял второй патч).
+    if TUYA_CMD_DEDUP_WINDOW_MS > 0:
+        key = (name, component)
+        fp = _cmd_fingerprint(parts, cmd)
+        now = time.monotonic()
+        with _CMD_LAST_SUBMIT_LOCK:
+            prev = _CMD_LAST_SUBMIT.get(key)
+            if (prev is not None and prev[0] == fp
+                    and (now - prev[1]) < TUYA_CMD_DEDUP_WINDOW_MS / 1000.0):
+                log.debug(f"[Cmd] {name}: команда {component} дедуплицирована "
+                          f"(окно {TUYA_CMD_DEDUP_WINDOW_MS} мс)")
+                return
+            _CMD_LAST_SUBMIT[key] = (fp, now)
     try:
-        get_device_exec(name).submit(process_command, dev, component, parts, cmd)
+        ex = get_device_exec(name)
+        # v1.15.1 (#1226): команда идёт в СЛОТ (last-wins), а не в FIFO.
+        key = (name, component)
+        with _CMD_SLOT_LOCK:
+            if key in _CMD_SLOT:
+                _CMD_SUPERSEDED[0] += 1
+            _CMD_SEQ[0] += 1
+            _CMD_SLOT[key] = (parts, cmd, _CMD_SEQ[0])
+            need_drain = name not in _DRAIN_ACTIVE
+            if need_drain:
+                _DRAIN_ACTIVE.add(name)
+        # Предохранитель оставлен СТРАХОВКОЙ: слот + один разгребатель на прибор
+        # переполнить нельзя; если глубина всё же выросла — это чужой писатель
+        # в очередь исполнителя, и об этом должно быть слышно.
+        if MAX_DEVICE_QUEUE_DEPTH > 0 and \
+                _device_queue_depth(ex) > MAX_DEVICE_QUEUE_DEPTH:
+            _CMD_OVERFLOW[0] += 1
+            log.warning(f"[Cmd] {name}: очередь исполнителя глубже "
+                        f"{MAX_DEVICE_QUEUE_DEPTH} — команда ушла в слот "
+                        f"(last-wins): {component}/{parts}={cmd}")
+        if need_drain:
+            try:
+                ex.submit(_drain_device_commands, dev)
+            except Exception:
+                with _CMD_SLOT_LOCK:
+                    _DRAIN_ACTIVE.discard(name)
+                raise
     except Exception as e:
         log.debug(f"[Cmd] {name}: submit: {e}")
 
@@ -2042,6 +2723,13 @@ def on_message(client, userdata, msg):
                          daemon=True, name="scan-network").start()
         return
 
+    if topic == f"{TOPIC_PREFIX}/bridge/tuya_discover":
+        log.info("[MQTT] Получена команда tuya_discover")
+        payload_str = msg.payload.decode("utf-8", errors="replace")
+        threading.Thread(target=_handle_tuya_discover, args=(payload_str,),
+                         daemon=True, name="tuya-discover").start()
+        return
+
     # v1.11.0: инструменты конфига
     if topic == f"{TOPIC_PREFIX}/bridge/config_report":
         log.info("[MQTT] Получена команда config_report")
@@ -2110,22 +2798,20 @@ def on_message(client, userdata, msg):
         return
 
     cmd = parse_payload(payload)
-    # v1.12.27: публикуем состояние сразу (до очереди устройства и device-лока),
-    # чтобы HA не ждал, пока освободится «зависшая» предыдущая команда прибора.
-    # В Tuya команда уходит по очереди, а HA уже видит целевое состояние.
-    try:
-        optimistic_prepublish(dev, component, parts, cmd)
-    except Exception as e:
-        log.debug(f"[Set] {dev_name}: prepublish: {e}")
-    # v1.12.22: при спаме кликов HA шлёт серию switch/light-команд. Первую
-    # отправляем сразу (без задержки), остальные в окне склеиваем в одну финальную
-    # (см. SwitchDebouncer). По умолчанию выключено (SWITCH_DEBOUNCE_MS=0).
+    # v1.15.0: СНАЧАЛА решает дебаунсер. Съеденную (склеенную) команду НЕ пре-публикуем
+    # и не регистрируем в трекере — иначе gen/pending росли бы для команды, которая
+    # никуда не уйдёт; отложенный финал публикуется из debounce_worker/debounced_set.
+    # v1.12.27: не съеденную команду публикуем сразу (HA видит целевое состояние),
+    # затем отправляем в очередь конкретного устройства (v1.12.31).
     if SWITCH_DEBOUNCER.window > 0 and component in _DEBOUNCE_COMPONENTS:
         entity = parts[3] if len(parts) > 4 else ""
         if SWITCH_DEBOUNCER.offer(f"{dev_name}/{component}/{entity}", cmd,
                                   (dev, component, parts)):
             return
-    # v1.12.31: команда уходит в очередь конкретного устройства (свой пул).
+    try:
+        optimistic_prepublish(dev, component, parts, cmd)
+    except Exception as e:
+        log.debug(f"[Set] {dev_name}: prepublish: {e}")
     submit_device_command(dev, component, parts, cmd)
 
 
@@ -2149,7 +2835,13 @@ def _merge_payload(old, new):
 
 
 class SwitchDebouncer:
-    """Склейка быстрых команд: ведущий край сразу + хвост одной командой."""
+    """Склейка быстрых команд: ведущий край сразу + хвост ОДНОЙ командой.
+
+    v1.15.1 (#1226): хвост отправляется не по фиксированному таймеру от первой
+    команды, а по затишью (окно от последней) с жёстким потолком от начала серии.
+    Иначе при непрерывном шторме каждые `window` мс вылетала промежуточная,
+    уже устаревшая команда — прибор мигал ON->OFF, а финал приходил позже.
+    """
 
     def __init__(self, window_ms, max_ms):
         self.window = max(0, int(window_ms)) / 1000.0
@@ -2169,13 +2861,16 @@ class SwitchDebouncer:
                 # Хвост серии (после недавней отправки) — копим.
                 if now - self._last_sent.get(key, 0.0) <= self.window:
                     self._items[key] = {"payload": payload, "meta": meta,
-                                        "first": now, "n": 1}
+                                        "first": now, "last": now, "n": 1}
                     return True
                 self._last_sent[key] = now
                 return False
             item["payload"] = _merge_payload(item["payload"], payload)
             item["meta"] = meta
             item["n"] += 1
+            # v1.15.1 (#1226): окно тянется за ПОСЛЕДНЕЙ командой — пока шторм идёт,
+            # промежуточные значения не отправляем (иначе мигание ON->OFF и поздний финал).
+            item["last"] = now
             return True
 
     def due(self, now=None):
@@ -2184,7 +2879,7 @@ class SwitchDebouncer:
         out = []
         with self._lock:
             for key, item in list(self._items.items()):
-                if (item["first"] + self.window - now) <= 0 or \
+                if (item["last"] + self.window - now) <= 0 or \
                    (item["first"] + self.max_delay - now) <= 0:
                     out.append((key, item["payload"], item["meta"], item["n"],
                                 now - item["first"]))
@@ -2223,17 +2918,37 @@ def debounce_worker():
 
 def process_command(dev, component, parts, cmd):
     name = dev["name"]
+    _t_pc = time.monotonic()
     lock = get_device_cmd_lock(name)
+    _t_pcl = time.monotonic()
     if not lock.acquire(timeout=1.0):
         # v1.14.10: 0.2 → 1.0 — лок почти всегда занят deviceworker'ом,
         # команда терялась при коротком таймауте (задержка юзера #848).
-        log.warning(f"[ProcessCommand] {name}: unable to acquire device command lock")
+        log.warning(f"[ProcessCommand] {name}: unable to acquire device command lock "
+                    f"(ждал {int((time.monotonic() - _t_pcl) * 1000)} мс)")
         return
     try:
         with DEVICES_LOCK:
             if name not in DEVICE_INDEX:
                 return
+        # 13.10.2026 13:39 (#1144 срез 7): DP с `readonly: true` из схемы tuya-local
+        # — запись запрещена (там get_values_to_set возвращает пусто).
+        # Единая точка: гасим команду ДО rate-limit/соединения, с WARNING.
+        if len(parts) >= 5 and isinstance(parts[3], str):
+            _ename = parts[3]
+            for _info in dev.get("dps_map", {}).values():
+                if isinstance(_info, dict) and _info.get("name") == _ename \
+                        and _info.get("component") == component \
+                        and _info.get("readonly") is True:
+                    log.warning(f"[Command] {name}: {component}/{_ename} "
+                                f"readonly по схеме tuya-local — команда отклонена")
+                    return
+        log.debug(f"[T] {name}: process_command лок +"
+                 f"{int((time.monotonic() - _t_pc) * 1000)} мс")
+        _t_rl2 = time.monotonic()
         wait_device_rate_limit(name, component)
+        log.debug(f"[T] {name}: rate-limit {int((time.monotonic() - _t_rl2) * 1000)} мс, "
+                 f"итого от команды +{int((time.monotonic() - _t_pc) * 1000)} мс")
         try:
             tuya = get_device_conn(dev)
             if component == "light":
@@ -2327,7 +3042,7 @@ CMD_ACK = {}                   # {name: [ms, ...]}  v1.12.19
 CMD_ACK_LOCK = threading.Lock()
 CMD_ACK_LAST_PUB = [0.0]       # throttle публикации retained-статистики
 CMD_ACK_LAST_PUB_LOCK = threading.Lock()
-CMD_ACK_LOG_SIG = [""]         # лог только при смене набора скорректированных окон
+CMD_ACK_LOG_SIG = [{}]         # лог только при смене набора скорректированных окон
 
 # v1.12.29: авто-повтор команды, если прибор не подтвердил её за окно.
 # Наблюдали: люстра применила OFF только через 46 с (устройство «зависло»), при
@@ -2341,15 +3056,30 @@ CMD_RETRY_AFTER_SEC = 5.0      # v1.14.23 (09.10.2026 04:22, #1035): 2.5 → 5.0
 CMD_GUARD_PENDING_MAX_SEC = 8.0
 CMD_RETRY_MAX = 3              # максимум переотправок на команду
 CMD_RETRY_SWEEP_SEC = 0.5      # период проверки
-CMD_PENDING = {}               # {dev_name: {dp_str: {"v": val, "ts": t, "tries": n, "gen": g}}}
-CMD_PENDING_LOCK = threading.Lock()
-# v1.14.23 (09.10.2026 04:22, #1035): LATEST-WINS. Поколение (gen) желаемого значения на пару
-# (прибор, DP). Новая команда по DP поднимает gen; отложенный send сверяет свой gen с
-# текущим и, если его перезаписали, НЕ отправляет устаревшее значение (иначе ретрай старого
-# ON мог прилететь ПОСЛЕ финального OFF и снова зажечь люстру — наблюдали 09.10 ночью).
-CMD_GEN = {}                   # {dev_name: {dp_str: int}}
-CMD_GEN_LOCK = threading.Lock()
-_CMD_GEN_SEQ = [0]
+# v1.15.0 (этап 2 рефактора механики команд): ЕДИНЫЙ ТРЕКЕР вместо CMD_PENDING/CMD_GEN.
+# Один владелец на пару (прибор, DP): desired/gen/sent_at/last_send_at/attempts/deadline.
+# КЛЮЧЕВОЙ ИНВАРИАНТ: deadline АБСОЛЮТНЫЙ и ставится только при СМЕНЕ значения; дубль той же
+# команды его НЕ продлевает и НЕ обнуляет attempts/gen — это лечит «вечный повтор #1»,
+# от которого заказчик видел залип выключателя на 15–20 с (карточка #1226).
+# v1.14.23 (09.10.2026 13:50, #1035): LATEST-WINS сохранён — у каждого желания свой gen; отложенный
+# send со старым gen не отправляется (устаревший ON не прилетит после финального OFF).
+try:
+    from cmd_tracker import CommandTracker as _CommandTracker
+except ImportError:
+    # Тесты грузят main.py по файловому пути (spec_from_file_location) — каталога нет в sys.path.
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from cmd_tracker import CommandTracker as _CommandTracker
+
+TRACK_TTL_SEC = float(os.environ.get("TUYA_TRACK_TTL_SEC", "10") or 10)
+TRACK_RETRY_AT_SEC = float(os.environ.get("TUYA_TRACK_RETRY_SEC", "3") or 3)
+TRACK_RETRY_BACKOFF = float(os.environ.get("TUYA_TRACK_BACKOFF", "1.7") or 1.7)
+TRACK_RETRY_MAX = int(os.environ.get("TUYA_TRACK_RETRY_MAX", "3") or 3)
+TRACK_RETRY_SWEEP_SEC = float(os.environ.get("TUYA_TRACK_SWEEP_SEC", "0.5") or 0.5)
+TRACKER = _CommandTracker(
+    TRACK_TTL_SEC, TRACK_RETRY_AT_SEC, TRACK_RETRY_BACKOFF, TRACK_RETRY_MAX,
+    avg_sec_fn=lambda n: cmd_avg6_sec(n),
+)
 # v1.14.16: cmd_echo — признак «этой публикацией мы подтверждаем НАШУ команду». Больше НЕ
 # глобальный одноразовый флаг: передаётся явным аргументом `echo=` в publish_state от источника
 # (оптимистичная публикация команды / отчёт, совпавший с командой по значению в _cmd_guard_filter).
@@ -2400,69 +3130,46 @@ def _publish_pending(dev_name, pending, dev=None, echo=False):
 
 
 def _pending_any(dev_name):
-    """v1.14.3: есть ли хотя бы один неподтверждённый DP у устройства."""
-    with CMD_PENDING_LOCK:
-        return bool(CMD_PENDING.get(dev_name))
+    """v1.14.3/v1.15.0: есть ли хотя бы один неподтверждённый DP (в пределах дедлайна)."""
+    return TRACKER.pending_any(dev_name)
 
 
 def _pending_mark(dev, updates):
+    """v1.15.0: регистрируем желаемые значения в едином трекере.
+
+    Дубль того же значения (пока не истёк абсолютный дедлайн) — no-op: не сбрасывает
+    прогресс ретрая и не поднимает gen. Это лечит «вечный повтор #1», от которого был
+    залип выключателя 15–20 с (карточка #1226).
+    """
     name = dev["name"]
     dps_map = dev.get("dps_map") or {}
-    now = time.time()
     marked = False
-    with CMD_PENDING_LOCK:
-        d = CMD_PENDING.setdefault(name, {})
-        with CMD_GEN_LOCK:
-            gd = CMD_GEN.setdefault(name, {})
-            for dp, v in updates.items():
-                info = dps_map.get(str(dp))
-                if not info:                   # неизвестный/стримовый DP — не повторяем
-                    continue
-                if info.get("name") in _NO_RETRY_NAMES:
-                    continue
-                prev = d.get(str(dp))
-                # v1.14.23: дубль той же команды в окне повторов — НЕ сбрасываем прогресс
-                # ретрая (иначе каждый повторный ON от HA давал вечный «повтор #1» + шторм).
-                if (prev is not None and _val_eq(prev.get("v"), v)
-                        and (now - prev.get("ts", 0)) < CMD_RETRY_AFTER_SEC * 3):
-                    continue
-                _CMD_GEN_SEQ[0] += 1
-                gd[str(dp)] = _CMD_GEN_SEQ[0]
-                d[str(dp)] = {"v": v, "ts": now, "tries": 0, "gen": gd[str(dp)]}
-                marked = True
-        if not d:
-            CMD_PENDING.pop(name, None)
-            with CMD_GEN_LOCK:
-                if not CMD_GEN.get(name):
-                    CMD_GEN.pop(name, None)
+    for dp, v in updates.items():
+        info = dps_map.get(str(dp))
+        if not info:                   # неизвестный/стримовый DP — не повторяем
+            continue
+        if info.get("name") in _NO_RETRY_NAMES:
+            continue
+        if TRACKER.offer(name, str(dp), v, source="set") is not None:
+            marked = True
     if marked:
         _publish_pending(name, True, dev)   # v1.13.10: HA видит «не подтверждено»
 
 
 def _pending_clear(dev_name, dp):
-    empty = False
-    with CMD_PENDING_LOCK:
-        d = CMD_PENDING.get(dev_name)
-        if not d:
-            return
-        d.pop(str(dp), None)
-        if not d:
-            CMD_PENDING.pop(dev_name, None)
-            empty = True
-    if empty:
-        # v1.13.10: подтверждено — снимаем признак
+    TRACKER.drop(dev_name, str(dp))
+    if not TRACKER.pending_any(dev_name):
+        # v1.13.10: подтверждено — снимаем признак.
         # v1.14.3: dev нужен для атрибута work_mode; публикуем ВСЕГДА, даже если
-        # устройство уже не найдено (иначе retained pending:true зависнет навсегда)
+        # устройство уже не найдено (иначе retained pending:true зависнет навсегда).
         with DEVICES_LOCK:
             dev = DEVICE_INDEX.get(dev_name)
         _publish_pending(dev_name, False, dev)
 
 
 def _pending_active(dev_name, dp):
-    """v1.13.8: команда по этому DP ещё не подтверждена прибором (повторы не исчерпаны)."""
-    with CMD_PENDING_LOCK:
-        d = CMD_PENDING.get(dev_name)
-        return bool(d) and str(dp) in d
+    """v1.13.8/v1.15.0: команда по этому DP ещё не подтверждена (в пределах дедлайна)."""
+    return TRACKER.snapshot(dev_name, str(dp)) is not None
 
 
 def _val_eq(a, b):
@@ -2588,14 +3295,17 @@ def _publish_cmd_ack_stats(force=False):
     # лог — только когда набор скорректированных окон изменился (без спама)
     _adj = {n: d["guard"] for n, d in devs.items()
             if d["n"] >= CMD_GUARD_ACK_MIN_N and abs(d["guard"] - CMD_GUARD_SEC) > 0.05}
-    sig = ",".join(f"{n}={g}" for n, g in sorted(_adj.items()))
-    if sig != CMD_ACK_LOG_SIG[0]:
+    if _adj != CMD_ACK_LOG_SIG[0]:
+        prev = CMD_ACK_LOG_SIG[0]
         with CMD_ACK_LOCK:
-            CMD_ACK_LOG_SIG[0] = sig
-        if sig:
-            log.info(f"[CmdAck] окно защиты от «эха» подстроено: {sig}")
-        else:
-            log.info("[CmdAck] окно защиты от «эха» — по умолчанию (1.2 с)")
+            CMD_ACK_LOG_SIG[0] = dict(_adj)
+        changed = {n: g for n, g in _adj.items() if prev.get(n) != g}
+        gone = [n for n in prev if n not in _adj]
+        parts = [f"{n}={g}" for n, g in sorted(changed.items())]
+        parts += [f"{n}:{prev[n]}→default" for n in sorted(gone)]
+        if parts:
+            # v1.15.0: тише — логируем ТОЛЬКО изменившееся устройство, а не всю карту.
+            log.info("[CmdAck] окно защиты от «эха»: " + ", ".join(parts))
     payload = json.dumps({
         "ts": int(now),
         "default_sec": CMD_GUARD_SEC,
@@ -2728,16 +3438,67 @@ def optimistic_update(dev, dp, value):
 TUYA_SEND_MIN_INTERVAL_MS = int(os.environ.get("TUYA_SEND_MIN_INTERVAL_MS", "100") or 0)
 GLOBAL_SEND_LOCK = threading.Lock()
 GLOBAL_SEND_LAST = [0.0]
+# v1.14.24 (#1087 P1-1): пейсинг ПО УСТРОЙСТВУ вместо общего глобального гейта.
+# Глобальный лок означал: медленный прибор (облачный ACK 6-7 с, замер 27.09
+# lyustra_gostinnaya p50 7218 мс) удерживает общий таймер и тормозит ОСТАЛЬНЫЕ —
+# один зависший прибор останавливал фан-аут всей сцены на всех остальных.
+# Свой лок на прибор даёт независимый пейсинг.
+# Обратная совместимость сохранена: пока TUYA_SEND_PER_DEVICE_MS не задан —
+# работает прежний глобальный режим, поведение не меняется.
+TUYA_SEND_PER_DEVICE_MS = int(os.environ.get("TUYA_SEND_PER_DEVICE_MS", "0") or 0)
+DEVICE_SEND_LAST = {}                # {dev_name: monotonic последней отправки}
+# v1.14.39: лок ПО УСТРОЙСТВУ, а не общий (заказчик 14.10.2026 22:40: «после
+# нескольких подряд недолгих переключений света мост держит ЕЩЁ устройства»).
+# v1.14.24 объявил пейсинг «по устройству», но оставил ОДИН общий DEVICE_SEND_LOCK —
+# и под ним же спал (time.sleep). Частые команды на одном приборе удерживали общий
+# лок и тормозили отправку на ОСТАЛЬНЫХ. Теперь у каждого прибора свой лок, а sleep
+# вынесен ЗА критическую секцию (лок держим только на чтение/запись метки времени).
+DEVICE_SEND_LOCKS = {}               # {dev_name: threading.Lock}
+DEVICE_SEND_LOCKS_LOCK = threading.Lock()
 
 
-def _send_gate():
-    """Пропустить отправку не чаще, чем раз в TUYA_SEND_MIN_INTERVAL_MS."""
+def _device_send_lock(dev_name):
+    """Лок пейсинга конкретного прибора (создаётся лениво)."""
+    with DEVICE_SEND_LOCKS_LOCK:
+        lk = DEVICE_SEND_LOCKS.get(dev_name)
+        if lk is None:
+            lk = threading.Lock()
+            DEVICE_SEND_LOCKS[dev_name] = lk
+        return lk
+
+
+def _send_gate(dev_name=None):
+    """Пропустить отправку не чаще, чем раз в интервал.
+
+    P1-1 (#1087): при заданном TUYA_SEND_PER_DEVICE_MS интервал считается и
+    удерживается ПО УСТРОЙСТВУ — медленный прибор держит только свою очередь.
+    Без этой переменной или без dev_name — прежний глобальный режим.
+    """
+    if TUYA_SEND_PER_DEVICE_MS > 0 and dev_name:
+        interval = TUYA_SEND_PER_DEVICE_MS / 1000.0
+        lock = _device_send_lock(dev_name)
+        with lock:
+            now = time.monotonic()
+            last = DEVICE_SEND_LAST.get(dev_name, 0.0)
+            wait = last + interval - now
+            if wait <= 0:
+                DEVICE_SEND_LAST[dev_name] = now
+                return
+        # Спим ВНЕ лока — иначе держали бы очередь чужого прибора.
+        if wait > 0.05:
+            log.debug(f"[T] send-gate {dev_name}: пауза {int(wait * 1000)} мс")
+        time.sleep(wait)
+        with lock:
+            DEVICE_SEND_LAST[dev_name] = time.monotonic()
+        return
     if TUYA_SEND_MIN_INTERVAL_MS <= 0:
         return
     with GLOBAL_SEND_LOCK:
         now = time.monotonic()
         wait = GLOBAL_SEND_LAST[0] + (TUYA_SEND_MIN_INTERVAL_MS / 1000.0) - now
         if wait > 0:
+            if wait > 0.05:
+                log.debug(f"[T] send-gate (global): пауза {int(wait * 1000)} мс")
             time.sleep(wait)
             now = time.monotonic()
         GLOBAL_SEND_LAST[0] = now
@@ -2755,12 +3516,11 @@ def _retry_send(dev_name, dp, v, attempt, rec=None):
     # v1.14.23: latest-wins — не отправляем повтор, если значение по DP уже перезаписано
     # свежей командой (иначе устаревший ON прилетит после финального OFF).
     if rec is not None:
-        with CMD_PENDING_LOCK:
-            cur = (CMD_PENDING.get(dev_name) or {}).get(str(dp))
-            gen_now = (CMD_GEN.get(dev_name) or {}).get(str(dp))
-        if cur is not rec or (rec.get("gen") is not None and rec.get("gen") != gen_now):
-            log.info(f"[Retry] {dev_name} dp={dp}: пропуск — команда перезаписана "
-                     f"(gen {rec.get('gen')}→{gen_now})")
+        snap = TRACKER.snapshot(dev_name, str(dp))
+        gen_now = (snap or {}).get("gen")
+        if snap is None or rec.get("gen") != gen_now:
+            log.debug(f"[Retry] {dev_name} dp={dp}: пропуск — команда перезаписана "
+                      f"(gen {rec.get('gen')}→{gen_now})")
             return False
     with DEVICES_LOCK:
         dev = DEVICE_INDEX.get(dev_name)
@@ -2778,7 +3538,7 @@ def _retry_send(dev_name, dp, v, attempt, rec=None):
         try:
             tuya = get_device_conn(dev)
             dp_i = int(dp) if str(dp).lstrip("-").isdigit() else dp
-            _send_gate()
+            _send_gate(dev_name)
             tuya.set_value(dp_i, v)
             return True
         except Exception as e:
@@ -2790,65 +3550,45 @@ def _retry_send(dev_name, dp, v, attempt, rec=None):
 
 
 def cmd_retry_worker():
-    """v1.12.29: переотправка команд, которые прибор не подтвердил."""
+    """v1.15.0: переотправка по единому трекеру (абсолютный дедлайн, без сброса часов).
+
+    Планирование ведёт трекер (due/mark_sent/expire); сброс часов дублями невозможен,
+    поэтому «повтор #1» не повторяется вечно (карточка #1226).
+    """
     while not STOP_EVENT.is_set():
-        STOP_EVENT.wait(CMD_RETRY_SWEEP_SEC)
+        STOP_EVENT.wait(TRACK_RETRY_SWEEP_SEC)
         if STOP_EVENT.is_set():
             break
         now = time.time()
-        due = []
-        lost = []   # v1.14.14: устройства с исчерпанными повторами — снять флаг pending в HA
-        with CMD_PENDING_LOCK:
-            for dev_name, dps in list(CMD_PENDING.items()):
-                for dp, rec in list(dps.items()):
-                    age = now - rec["ts"]
-                    # v1.13.9: экспоненциальный backoff (2,5 → 5 → 7,5 с) вместо фиксированного
-                    # интервала — меньше шторма команд, когда прибор молчит.
-                    # v1.13.11: и не раньше удвоенного среднего отклика прибора (avg6) —
-                    # не подкидываем работу занятому устройству (иначе повторы копятся
-                    # и прибор отвечает ещё позже).
-                    _backoff = max(CMD_RETRY_AFTER_SEC * (rec["tries"] + 1),
-                                   2.0 * cmd_avg6_sec(dev_name))
-                    if rec["tries"] < CMD_RETRY_MAX and age >= _backoff:
-                        # v1.14.10: счётчик попыток — ЗДЕСЬ, при планировании.
-                        # v1.14.8/9 считали только в _retry_send после захвата
-                        # лока, но лок почти всегда занят (deviceworker держит
-                        # ~0.1 с из цикла ~0.13 с) → return до апдейта →
-                        # tries вечно 0 → шторм «повтор #1» каждые 2*avg6 (#848).
-                        # Планируемая попытка уже ограничена CMD_RETRY_MAX →
-                        # шторм гарантированно закрывается при любой причине.
-                        rec["tries"] += 1
-                        rec["ts"] = now
-                        due.append((dev_name, dp, rec["v"], rec, rec["tries"]))
-                    elif rec["tries"] >= CMD_RETRY_MAX and age >= CMD_RETRY_AFTER_SEC * 6:
-                        dps.pop(dp, None)          # сдались — дальше правда прибора
-                if not dps:
-                    CMD_PENDING.pop(dev_name, None)
-                    lost.append(dev_name)
-        # v1.14.14 (карточка #878): «сдались» — обязательно снимаем признак pending.
-        # Раньше здесь только чистили CMD_PENDING, а retained-топик pending:true оставался
-        # висеть до следующей публикации состояния → HA считала команду неподтверждённой
-        # (гарды «not pending» ложно резали живые нажатия).
-        for dev_name in lost:
+        due = TRACKER.due(now)
+        # v1.14.14 (карточка #878): «сдались» по абсолютному дедлайну — снимаем pending в HA.
+        for dev_name in TRACKER.expire(now):
             with DEVICES_LOCK:
                 _dev = DEVICE_INDEX.get(dev_name)
             _publish_pending(dev_name, False, _dev)
-        for dev_name, dp, v, rec, attempt in due:
-            # v1.12.30: первый повтор — INFO, дальше DEBUG (меньше шума в логе).
-            msg = f"[Retry] {dev_name} dp={dp}: прибор не подтвердил, повтор #{attempt}"
-            if attempt == 1:
+        for dev_name, dp, v, gen, attempt in due:
+            # v1.15.1 (#1226): не встаём в очередь прибора, если там уже ждёт
+            # пользовательская команда — ретрай не должен её вытеснять/раздувать
+            # глубину (именно это давало `очередь команд переполнена`).
+            if _device_has_user_cmd(dev_name):
+                _RETRY_SKIPPED[0] += 1
+                log.debug(f"[Retry] {dev_name} dp={dp}: пропуск — в очереди "
+                          f"прибора есть команда")
+                continue
+            if not TRACKER.mark_sent(dev_name, dp, gen):
+                continue   # команду перезаписали — устаревшее значение не отправляем
+            # v1.15.0 (тихий лог): шумим только эскалациями (#2+); первый повтор — DEBUG.
+            msg = f"[Retry] {dev_name} dp={dp}: прибор не подтвердил, повтор #{attempt + 1}"
+            if attempt + 1 >= 2:
                 log.info(msg)
             else:
                 log.debug(msg)
             try:
-                # v1.14.13: ретрай идёт на ТОТ ЖЕ per-device executor, что и команды
-                # (get_device_exec, max_workers=1). Раньше ретраи жили в отдельном
-                # executor'е и конкурировали с process_command за device_cmd_lock:
-                # пока ретрай держал лок (rate-gate + set_value), входящая команда
-                # не получала лок за 1.0с и ДРОПАЛАСЬ (лог «unable to acquire device
-                # command lock» → залипание люстры, карточка #878). Один писатель
-                # на устройство — лок больше не контендится, команды не теряются.
-                get_device_exec(dev_name).submit(_retry_send, dev_name, dp, v, attempt, rec)
+                # v1.14.13: ретрай идёт на ТОТ ЖЕ per-device executor (max_workers=1) —
+                # один писатель на устройство, лок не контентится, команды не теряются.
+                get_device_exec(dev_name).submit(
+                    _retry_send, dev_name, dp, v, attempt + 1,
+                    TRACKER.snapshot(dev_name, dp))
             except Exception as e:
                 log.debug(f"[Retry] submit: {e}")
 
@@ -2861,6 +3601,7 @@ DEBOUNCE_LOCK = threading.Lock()
 def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component="light"):
     if window_ms is None:
         window_ms = DEBOUNCE_BY_TYPE.get(dp_type, 0) if dp_type else 0
+    _t_in = time.monotonic()
 
     if window_ms <= 0:
         # v1.12.24: публикуем состояние (optimistic) ДО блокирующей команды.
@@ -2873,8 +3614,14 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
         # правду прибора вернёт request_status.
         optimistic_update(dev, dp, value)
         try:
-            _send_gate()
+            _send_gate(dev["name"])
+            _t_send = time.monotonic()
             tuya.set_value(dp, value)
+            _send_ms = int((time.monotonic() - _t_send) * 1000)
+            log.debug(f"[T] {dev['name']} dp={dp}: прямая отправка {_send_ms} мс")
+            if _send_ms > 1000:
+                log.warning(f"[SlowCmd] {dev['name']} dp={dp}: отправка в прибор "
+                            f"{_send_ms} мс (>1 с) — проверь соединение")
         except Exception as e:
             log.warning(f"[Set] {dev['name']} dp={dp}: {e}")
             drop_device_conn(dev["name"])
@@ -2902,6 +3649,7 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
             # delay pop until after lock release below; another debounced_set may
             # have recreated the entry, and we must not remove it out from under it.
             lock = get_device_cmd_lock(dev_name)
+            _t_lock = time.monotonic()
             if not lock.acquire(timeout=1.0):
                 # v1.14.10: 0.2 → 1.0 — см. process_command: при коротком
                 # таймауте отложенная команда терялась (задержка юзера #848).
@@ -2942,19 +3690,35 @@ def debounced_set(tuya, dev, dp, value, dp_type=None, window_ms=None, component=
                     # втупик на первом же проходе (таймер уже не тот)
                     _t_ref["timer"] = retry_t
                     retry_t.start()
+                    log.debug(f"[T] {dev_name} dp={dp}: лок занят +"
+                             f"{int((time.monotonic() - _t_in) * 1000)} мс")
                     log.warning(f"[Debounce fire] {dev_name}: lock busy, команда отложена "
                                 f"(попытка {cur['tries']}/{DEBOUNCE_RETRY_MAX})")
                     return
+            log.debug(f"[T] {dev_name} dp={dp}: лок взят +"
+                     f"{int((time.monotonic() - _t_in) * 1000)} мс "
+                     f"(ждал {int((time.monotonic() - _t_lock) * 1000)} мс)")
             try:
                 with DEVICES_LOCK:
                     if dev_name not in DEVICE_INDEX:
                         return
+                _t_rl = time.monotonic()
                 wait_device_rate_limit(dev_name, component)
+                _rl_ms = int((time.monotonic() - _t_rl) * 1000)
                 try:
                     d = get_device_conn(dev)
                     # v1.12.26: публикуем ДО блокирующей команды (см. debounced_set)
                     optimistic_update(dev, dp, value)
+                    _t_set = time.monotonic()
                     d.set_value(dp, value)
+                    _set_ms = int((time.monotonic() - _t_set) * 1000)
+                    log.debug(f"[T] {dev_name} dp={dp}: rate-limit {_rl_ms} мс, "
+                             f"отправка {_set_ms} мс, "
+                             f"итого от команды +"
+                             f"{int((time.monotonic() - _t_in) * 1000)} мс")
+                    if _set_ms > 1000:
+                        log.warning(f"[SlowCmd] {dev_name} dp={dp}: отправка "
+                                    f"{_set_ms} мс (>1 с) — следующая команда ждёт лок")
                 except Exception as e:
                     log.warning(f"[Debounce] {dev_name} dp={dp}: {e}")
                     drop_device_conn(dev_name)
@@ -3227,8 +3991,14 @@ def handle_light_command(tuya, dev, cmd):
     # конца), поэтому свой лок здесь брать нельзя — будет дедлок. Лок берёт только process_command.
     optimistic_update_many(dev, cache)
     try:
-        _send_gate()
+        _send_gate(dev["name"])
+        _t_multi = time.monotonic()
         tuya.set_multiple_values(payload)
+        _multi_ms = int((time.monotonic() - _t_multi) * 1000)
+        log.debug(f"[T] {dev['name']}: multi-DP ({len(payload)} dp) отправка {_multi_ms} мс")
+        if _multi_ms > 1000:
+            log.warning(f"[SlowCmd] {dev['name']}: multi-DP ({len(payload)} dp) отправка "
+                        f"{_multi_ms} мс (>1 с) — следующая команда ждёт лок")
     except Exception as e:
         log.warning(f"[Light] set_multiple_values failed: {e}; fallback")
         for dp, v in payload.items():
@@ -3236,7 +4006,7 @@ def handle_light_command(tuya, dev, cmd):
                 # v1.14.20 (08.10.2026 20:36): rate-limit и на fallback-ветке — иначе при пачке
                 # multi-DP команды летят в облакоTuya без интервала и копятся там (лаг).
                 wait_device_rate_limit(dev["name"], "light")
-                _send_gate()
+                _send_gate(dev["name"])
                 tuya.set_value(dp, v)
             except Exception as ee:
                 log.warning(f"[Light] set_value({dp}) failed: {ee}")
@@ -3257,6 +4027,7 @@ def handle_light_work_mode_command(tuya, dev, cmd):
         log.debug(f"[Light] {dev['name']}: игнорирую work_mode='{val}' (допустимы {options})")
         return
 
+    dp = _redirect_write_dp(dev, dp_str, info, dp, val)
     debounced_set(tuya, dev, dp, val, window_ms=0, component="select")
 
 
@@ -3290,6 +4061,9 @@ def handle_switch_command(tuya, dev, topic_parts, cmd):
     dp, val = switch_dp_val(dev, topic_parts, cmd)
     if dp is None:
         return
+    dp_str, info = find_dp_by_name(dev, topic_parts[3], component="switch")
+    if info is not None:
+        dp = _redirect_write_dp(dev, dp_str, info, dp, val)
     debounced_set(tuya, dev, dp, val, window_ms=0, component="switch")
 
 
@@ -3325,6 +4099,7 @@ def handle_climate_command(tuya, dev, topic_parts, cmd):
 
         if subtopic == "mode" and name == "switch":
             val = str(cmd).upper() in ("HEAT", "ON", "1", "TRUE")
+            dp = _redirect_write_dp(dev, dp_str, info, dp, val)
             debounced_set(tuya, dev, dp, val, window_ms=0, component="climate")
             return
 
@@ -3332,8 +4107,10 @@ def handle_climate_command(tuya, dev, topic_parts, cmd):
             try:
                 temp = float(cmd) if not isinstance(cmd, dict) else float(cmd.get("temperature", 0))
             except (TypeError, ValueError):
+                log.warning(f"[Climate] {dev.get('name')}: invalid temperature {cmd!r} — command ignored")
                 return
             val = int(temp * 10)
+            dp = _redirect_write_dp(dev, dp_str, info, dp, val)
             debounced_set(tuya, dev, dp, val, dp_type="temp_set", component="climate")
             return
 
@@ -3342,6 +4119,7 @@ def handle_climate_command(tuya, dev, topic_parts, cmd):
             preset_map = dev.get("preset_map", {})
             reverse_map = {v: k for k, v in preset_map.items()}
             val = reverse_map.get(val_ha, val_ha).lower()
+            dp = _redirect_write_dp(dev, dp_str, info, dp, val)
             debounced_set(tuya, dev, dp, val, window_ms=0, component="climate")
             return
 
@@ -3364,6 +4142,7 @@ def handle_select_command(tuya, dev, topic_parts, cmd):
             rev = {v: k for k, v in smap.items()}
             val = rev.get(val, val)
 
+        dp = _redirect_write_dp(dev, dp_str, info, dp, val)
         debounced_set(tuya, dev, dp, val, window_ms=0, component="select")
         return
 
@@ -3384,9 +4163,37 @@ def handle_number_command(tuya, dev, topic_parts, cmd):
         try:
             raw = float(cmd)
         except (TypeError, ValueError):
+            log.warning(f"[Number] {dev.get('name')}: invalid value {cmd!r} for {entity_name} — command ignored")
             return
         val = int(round(raw * (10 ** scale)))
-
+        # #1144 срез 3 (этап 2): клип к диапазону активной ветки conditions
+        # (range в единицах HA → raw через scale).
+        cond = _active_cond_branch(dev, info)
+        if cond and isinstance(cond.get("range"), dict):
+            _r = cond["range"]
+            _sc = 10 ** int(scale or 0)
+            if _r.get("min") is not None:
+                val = max(val, int(round(float(_r["min"]) * _sc)))
+            if _r.get("max") is not None:
+                val = min(val, int(round(float(_r["max"]) * _sc)))
+        elif info.get("invert"):
+            # #1144 срез 4 (этап 2): инверсия на записи (без активной ветки
+            # conditions — иначе диапазон ветки и инверсия конфликтуют).
+            _sc = 10 ** int(scale or 0)
+            val = int(round(_apply_invert(info, val,
+                                          info.get("min", 0) * _sc,
+                                          info.get("max", 100) * _sc)))
+        # #1144 срез 5 (этап 2): mask — вписать под-поле в текущий raw DP
+        # (read-modify-write; без текущего raw — не клоббим, команду пропускаем).
+        if info.get("mask"):
+            _nm = _compose_mask(dev, dp_str, info, val)
+            if _nm is None:
+                log.warning(
+                    f"[Number] {dev.get('name')}.{entity_name}: mask-DP — "
+                    f"нет текущего raw в кэше, команда пропущена")
+                return
+            val = _nm
+        dp = _redirect_write_dp(dev, dp_str, info, dp, val)
         debounced_set(tuya, dev, dp, val, dp_type="number", component="number")
         return
 
@@ -3397,6 +4204,7 @@ def _to_int_percent(val):
     try:
         n = int(round(float(val)))
     except (TypeError, ValueError):
+        log.warning(f"[Bridge] invalid numeric value {val!r} (expected 0..100) — command ignored")
         return None
     return max(0, min(100, n))
 
@@ -3422,20 +4230,26 @@ def handle_cover_command(tuya, dev, topic_parts, cmd):
         pos = _to_int_percent(cmd if not isinstance(cmd, dict) else cmd.get("position"))
         if pos is None:
             return
-        dp_str, _info = find_dp_by_name(dev, "percent_control", component="cover")
+        dp_str, info = find_dp_by_name(dev, "percent_control", component="cover")
         if dp_str is None:
             return
-        debounced_set(tuya, dev, dp_int(dp_str), pos, window_ms=0, component="cover")
+        # #1144 срез 4 (этап 2): invert — позиция шторы «наоборот»
+        # (амплитуда та же, зеркалим 0..100; зеркальность чтения — выше).
+        if info and info.get("invert"):
+            pos = 100 - pos
+        dp = _redirect_write_dp(dev, dp_str, info, dp_int(dp_str), pos)
+        debounced_set(tuya, dev, dp, pos, window_ms=0, component="cover")
         return
 
     action = str(cmd).strip().strip('"').lower()
     payload = {"open": "open", "close": "close", "stop": "stop"}.get(action)
     if payload is None:
         return
-    dp_str, _info = find_dp_by_name(dev, "control", component="cover")
+    dp_str, info = find_dp_by_name(dev, "control", component="cover")
     if dp_str is None:
         return
-    debounced_set(tuya, dev, dp_int(dp_str), payload, window_ms=0, component="cover")
+    dp = _redirect_write_dp(dev, dp_str, info, dp_int(dp_str), payload)
+    debounced_set(tuya, dev, dp, payload, window_ms=0, component="cover")
 
 
 def handle_fan_command(tuya, dev, topic_parts, cmd):
@@ -3452,10 +4266,11 @@ def handle_fan_command(tuya, dev, topic_parts, cmd):
         if isinstance(cmd, dict):
             return
         val = str(cmd).upper() in ("ON", "1", "TRUE")
-        dp_str, _info = find_dp_by_name(dev, "switch", component="fan")
+        dp_str, info = find_dp_by_name(dev, "switch", component="fan")
         if dp_str is None:
             return
-        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+        dp = _redirect_write_dp(dev, dp_str, info, dp_int(dp_str), val)
+        debounced_set(tuya, dev, dp, val, window_ms=0, component="fan")
         return
 
     if sub == "preset":
@@ -3466,7 +4281,8 @@ def handle_fan_command(tuya, dev, topic_parts, cmd):
         smap = get_select_map(info)
         if smap:
             val = {v: k for k, v in smap.items()}.get(val, val)
-        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+        dp = _redirect_write_dp(dev, dp_str, info, dp_int(dp_str), val)
+        debounced_set(tuya, dev, dp, val, window_ms=0, component="fan")
         return
 
     if sub == "speed":
@@ -3477,17 +4293,19 @@ def handle_fan_command(tuya, dev, topic_parts, cmd):
         if val is None:
             return
         val = max(info.get("min", 1), min(info.get("max", 100), val))
-        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+        dp = _redirect_write_dp(dev, dp_str, info, dp_int(dp_str), val)
+        debounced_set(tuya, dev, dp, val, window_ms=0, component="fan")
         return
 
     if sub == "direction":
         val = str(cmd).strip().strip('"').lower()
         if val not in ("forward", "reverse"):
             return
-        dp_str, _info = find_dp_by_name(dev, "fan_direction", component="fan")
+        dp_str, info = find_dp_by_name(dev, "fan_direction", component="fan")
         if dp_str is None:
             return
-        debounced_set(tuya, dev, dp_int(dp_str), val, window_ms=0, component="fan")
+        dp = _redirect_write_dp(dev, dp_str, info, dp_int(dp_str), val)
+        debounced_set(tuya, dev, dp, val, window_ms=0, component="fan")
 
 
 def handle_lock_command(tuya, dev, topic_parts, cmd):
@@ -3510,6 +4328,7 @@ def handle_lock_command(tuya, dev, topic_parts, cmd):
         if dp is None:
             return
         val = (not wanted_locked) if info.get("inverted") else wanted_locked
+        dp = _redirect_write_dp(dev, dp_str, info, dp, val)
         debounced_set(tuya, dev, dp, val, window_ms=0, component="lock")
         return
 
@@ -3860,6 +4679,10 @@ def _handle_edit_config(payload_str):
     dev_name = data.get("device")
     changes = data.get("changes", {})
     validate = data.get("validate", VALIDATE_ON_EDIT)
+    # v1.34.31 (#1167): ручной инженерный режим — формат-валидации значений отключены.
+    engineer_mode = bool(data.get("engineer_mode", False))
+    if engineer_mode:
+        validate = False
 
     if not dev_name or not isinstance(dev_name, str):
         _publish_edit_result(None, False, "device required (string)",
@@ -3909,27 +4732,29 @@ def _handle_edit_config(payload_str):
 
     # --- Валидация ip ---
     if "ip" in filtered:
-        if not _is_valid_ip(filtered["ip"]):
+        # v1.34.31 (#1167): в инженерном режиме формат IP и занятость не проверяем.
+        if not engineer_mode and not _is_valid_ip(filtered["ip"]):
             _publish_edit_result(dev_name, False, f"invalid ip: {filtered['ip']}",
                                  request_id=request_id)
             return
         filtered["ip"] = str(filtered["ip"]).strip()
-        # v1.9.10: IP не должен быть занят другим устройством.
-        with DEVICES_LOCK:
-            for _d in ALL_DEVICES:
-                if _d.get("name") == dev_name:
-                    continue
-                if _d.get("ip") == filtered["ip"]:
-                    _publish_edit_result(
-                        dev_name, False,
-                        f"IP {filtered['ip']} уже занят устройством '{_d['name']}'",
-                        request_id=request_id,
-                    )
-                    return
+        if not engineer_mode:
+            # v1.9.10: IP не должен быть занят другим устройством.
+            with DEVICES_LOCK:
+                for _d in ALL_DEVICES:
+                    if _d.get("name") == dev_name:
+                        continue
+                    if _d.get("ip") == filtered["ip"]:
+                        _publish_edit_result(
+                            dev_name, False,
+                            f"IP {filtered['ip']} уже занят устройством '{_d['name']}'",
+                            request_id=request_id,
+                        )
+                        return
 
     # --- Валидация local_key ---
     if "local_key" in filtered:
-        if not _is_valid_key(filtered["local_key"]):
+        if not engineer_mode and not _is_valid_key(filtered["local_key"]):
             _publish_edit_result(dev_name, False, "invalid local_key",
                                  request_id=request_id)
             return
@@ -3937,7 +4762,7 @@ def _handle_edit_config(payload_str):
 
     # --- Валидация version ---
     if "version" in filtered:
-        if not _is_valid_version(filtered["version"]):
+        if not engineer_mode and not _is_valid_version(filtered["version"]):
             _publish_edit_result(dev_name, False, f"invalid version: {filtered['version']}",
                                  request_id=request_id)
             return
@@ -3946,7 +4771,7 @@ def _handle_edit_config(payload_str):
     # --- Валидация enabled (v1.8.6) ---
     if "enabled" in filtered:
         v_en = filtered["enabled"]
-        if not isinstance(v_en, bool):
+        if not engineer_mode and not isinstance(v_en, bool):
             _publish_edit_result(dev_name, False,
                                  f"invalid enabled (must be bool): {v_en!r}",
                                  request_id=request_id)
@@ -3955,7 +4780,7 @@ def _handle_edit_config(payload_str):
     # --- Валидация battery_powered (v1.9.14) ---
     if "battery_powered" in filtered:
         v_bp = filtered["battery_powered"]
-        if not isinstance(v_bp, bool):
+        if not engineer_mode and not isinstance(v_bp, bool):
             _publish_edit_result(dev_name, False,
                                  f"invalid battery_powered (must be bool): {v_bp!r}",
                                  request_id=request_id)
@@ -3968,7 +4793,7 @@ def _handle_edit_config(payload_str):
         if v_exp is None:
             filtered.pop("expire_after")
             _expire_delete = True
-        else:
+        elif not engineer_mode:
             if isinstance(v_exp, bool) or not isinstance(v_exp, int):
                 _publish_edit_result(dev_name, False,
                                      f"invalid expire_after (must be int): {v_exp!r}",
@@ -3986,7 +4811,7 @@ def _handle_edit_config(payload_str):
     # --- Валидация type (v1.10.21) ---
     _new_type = filtered.get("type")
     if _new_type is not None:
-        if not _is_valid_type(_new_type):
+        if not engineer_mode and not _is_valid_type(_new_type):   # v1.34.31 (#1167)
             _publish_edit_result(
                 dev_name, False,
                 f"invalid type: {_new_type!r} (allowed: {', '.join(ALLOWED_TYPES)})",
@@ -4000,7 +4825,8 @@ def _handle_edit_config(payload_str):
     # (например, type=light требует имена DP из LIGHT_DP_NAMES).
     _type_changed = (_new_type is not None
                      and _new_type != dev.get("type", "sensor"))
-    if _type_changed and "dps_map" not in filtered:
+    # v1.34.31 (#1167): в инженерном режиме карту по новому типу не проверяем.
+    if not engineer_mode and _type_changed and "dps_map" not in filtered:
         ok_t, err_t, warn_t = _validate_dps_map(_new_type, dev.get("dps_map", {}))
         if not ok_t:
             _publish_edit_result(
@@ -4013,17 +4839,18 @@ def _handle_edit_config(payload_str):
         warnings.extend(warn_t)
 
     if "dps_map" in filtered:
-        # v1.10.21: если в том же запросе меняется type — валидируем карту
-        # по НОВОМУ типу (иначе смена прошла бы и сломала Discovery).
-        dev_type = _new_type or dev.get("type", "sensor")
-        ok_dps, err_dps, warn_dps = _validate_dps_map(dev_type, filtered["dps_map"])
-        if not ok_dps:
-            _publish_edit_result(dev_name, False, f"invalid dps_map: {err_dps}",
-                                 request_id=request_id)
-            return
-        # v1.14.22: extend, а не replace — иначе при одновременной смене type+dps_map
-        # терялись warning'и от валидации старой карты (type_changed без dps_map выше).
-        warnings.extend(warn_dps)
+        if not engineer_mode:
+            # v1.10.21: если в том же запросе меняется type — валидируем карту
+            # по НОВОМУ типу (иначе смена прошла бы и сломала Discovery).
+            dev_type = _new_type or dev.get("type", "sensor")
+            ok_dps, err_dps, warn_dps = _validate_dps_map(dev_type, filtered["dps_map"])
+            if not ok_dps:
+                _publish_edit_result(dev_name, False, f"invalid dps_map: {err_dps}",
+                                     request_id=request_id)
+                return
+            # v1.14.22: extend, а не replace — иначе при одновременной смене type+dps_map
+            # терялись warning'и от валидации старой карты (type_changed без dps_map выше).
+            warnings.extend(warn_dps)
         # Нормализация ключей в строки (на случай, если пришли числа)
         filtered["dps_map"] = {str(k): v for k, v in filtered["dps_map"].items()}
 
@@ -4261,6 +5088,26 @@ def _handle_edit_config(payload_str):
             except Exception as e:
                 log.warning(f"[EditConfig] {dev_name}: publish_discovery "
                             f"после смены type: {e}")
+            # v1.14.30 (жалоба заказчика 12.10.2026 23:21): после смены type HA
+            # показывал сущности как unknown/unavailable до первого DP-обновления
+            # от устройства — «лечилось» только выключением/включением прибора.
+            # Причина: выше _remove_discovery_for_device снял старые state-топики,
+            # а новые (у них сегмент = новый type) никто не заполнил. Повторяем
+            # ровно то, что делает ветка enable false→true: availability=online
+            # и реплей кэша состояний на НОВЫЕ топики.
+            try:
+                publish_availability(dev, True)
+            except Exception as e:
+                log.warning(f"[EditConfig] {dev_name}: availability после смены "
+                            f"type: {e}")
+            with STATE_LOCK:
+                _cached_type = dict(STATE_CACHE.get(dev_name, {}))
+            if _cached_type:
+                try:
+                    publish_state(dev, _cached_type)
+                except Exception as e:
+                    log.warning(f"[EditConfig] {dev_name}: publish_state после "
+                                f"смены type: {e}")
             refresh_our_ids()
         else:
             log.info(f"[EditConfig] {dev_name}: type={_new_type}, устройство "
@@ -4555,6 +5402,18 @@ def _handle_delete_device(payload_str):
     except Exception as e:
         log.warning(f"[Delete] discovery cleanup {dev_name}: {e}")
 
+    # v1.14.28: гасим всё поддерево {prefix}/<dev>/# (retained) — иначе
+    # WebUI поднимает «призрака» из retained-сообщения устройства.
+    try:
+        clear_device_data_topics(dev_name)
+    except Exception as e:
+        log.warning(f"[Delete] sweep {dev_name}: {e}")
+    # v1.14.28: имя удалённого устройства убираем из истории имён.
+    try:
+        _save_known_device_names(_load_known_device_names() - {dev_name})
+    except Exception as e:
+        log.warning(f"[Delete] known names prune {dev_name}: {e}")
+
     with STATE_LOCK:
         STATE_CACHE.pop(dev_name, None)
     remove_battery_last_up(dev_name)   # v1.10.0
@@ -4708,6 +5567,10 @@ def _handle_import_devices(payload_str):
     request_id = data.get("request_id") or req_id
     new_devices = data.get("devices", [])
     overwrite = bool(data.get("overwrite", False))
+    # v1.34.31 (#1167): ручной инженерный режим — как overwrite, без валидации dps_map.
+    engineer_mode = bool(data.get("engineer_mode", False))
+    if engineer_mode:
+        overwrite = True
 
     if not isinstance(new_devices, list) or not new_devices:
         _publish_import_result(request_id, False, "devices list required")
@@ -4833,7 +5696,7 @@ def _handle_import_devices(payload_str):
                     if isinstance(_old_dm, dict) and _old_dm:
                         _import_dps_map = dict(_old_dm)
                     break
-        _validate_dps = data.get("validate_dps_map", True)
+        _validate_dps = data.get("validate_dps_map", True) and not engineer_mode   # v1.34.31 (#1167)
         if _import_dps_map:
             if _validate_dps:
                 _ok_dps, _err_dps, _warn_dps = _validate_dps_map(dev_type, _import_dps_map)
@@ -5108,6 +5971,59 @@ def _publish_scan_result(request_id, ok, error, hosts=None, subnet=None):
         log.warning(f"[Scan] publish result failed: {e}")
 
 
+def _handle_tuya_discover(payload_str):
+    # v1.14.26: широковещательный поиск Tuya-устройств → ответ {gwId: {ip, ...}}.
+    req_id = _extract_request_id(payload_str)
+    try:
+        data = json.loads(payload_str) if payload_str else {}
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    request_id = data.get("request_id") or req_id
+    subnet = data.get("subnet", "")
+    if not isinstance(subnet, str):
+        subnet = ""
+    subnet = subnet.strip()
+    if not subnet:
+        with DEVICES_LOCK:
+            for _d in DEVICES:
+                _parts = (_d.get("ip") or "").split(".")
+                if len(_parts) == 4:
+                    subnet = ".".join(_parts[:3])
+                    break
+    if subnet and not re.match(
+            r"^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$", subnet):
+        _publish_tuya_discover_result(request_id, False, f"invalid subnet: {subnet}")
+        return
+    try:
+        devices = _tuya_broadcast_discover(subnet)
+        _publish_tuya_discover_result(request_id, True, None,
+                                      devices=devices, subnet=subnet)
+    except Exception as e:
+        log.warning(f"[Discover] error: {e}")
+        _publish_tuya_discover_result(request_id, False, str(e))
+
+
+def _publish_tuya_discover_result(request_id, ok, error, devices=None, subnet=None):
+    payload = {
+        "request_id": request_id,
+        "ok": bool(ok),
+        "error": error,
+        "devices": devices or {},
+        "subnet": subnet,
+        "ts": int(time.time()),
+    }
+    try:
+        mqtt_client.publish(
+            f"{TOPIC_PREFIX}/bridge/tuya_discover_result",
+            json.dumps(payload, ensure_ascii=False),
+            qos=1, retain=False,
+        )
+    except Exception as e:
+        log.warning(f"[Discover] publish result failed: {e}")
+
+
 # ==================== RELOAD ALL_DEVICES (v1.10.8) ====================
 def _reload_all_devices():
     """Перечитать ALL_DEVICES из CONFIG_FILE.
@@ -5172,11 +6088,30 @@ DEVICE_FIELDS_KEEP = (
 
 # DP-поля: что bridge читает у конкретного компонента + то, что нужно UI
 # (code/type/values), плюс любые "_"-маркеры источника — их не трогаем.
-_DP_FIELDS_COMMON = ("component", "name", "code", "type", "values")
+# 13.10.2026 13:39 (#1144 срез 7): readonly/persist — универсальные (любой компонент),
+# иначе «Нормализовать конфиг» вырежет их у прод-устройств.
+# 13.10.2026 13:43 (#1144 срез 4): target_range/invert — тоже универсальные
+# (invert у cover/sensor/number/light; target_range — сырой диапазон
+# для движка маппинга, отдельным этапом).
+# 13.10.2026 13:50 (#1144 срез 5): format/mask/mask_signed/endianness —
+# факт и параметры упаковки (декод — отдельным этапом).
+# 13.10.2026 13:58 (#1144 срез 3 этап 1): constraint/conditions —
+# информационные ветки (движок dynamic range/options — этап 2).
+# 13.10.2026 14:05 (#1144 срез 8.2): redirect — id-цепочка цели value_redirect
+# (фоллбек чтения в publish_state; внутри conditions лежит redirect_ids —
+# там глубже не копаем, значение conditions сохраняется целиком).
+# 13.10.2026 01:20 (#1144 срез 10): precision/force/sensitive — флаги tuya-local
+# в dps_map (precision потребляется в _publish_sensor_value; force/sensitive
+# informational — polling-интеграция и лог-маскировка отдельными этапами).
+_DP_FIELDS_COMMON = ("component", "name", "code", "type", "values", "hidden",
+                     "readonly", "persist", "target_range", "invert",
+                     "format", "mask", "mask_signed", "endianness",
+                     "constraint", "conditions", "redirect",
+                     "precision", "force", "sensitive")
 DP_FIELDS_KEEP = {
     "switch": (),
     "sensor": ("scale", "unit", "device_class", "state_class"),
-    "binary_sensor": ("device_class",),
+    "binary_sensor": ("device_class", "map"),
     "select": ("options", "map"),
     "number": ("min", "max", "step", "scale", "unit"),
     "light": ("min", "max", "kelvin_min", "kelvin_max"),
@@ -5806,7 +6741,44 @@ class EntitySpec:
     source: str = ""
 
 
-def device_entities(dev, sources=("phase_a",)):
+# v1.14.27: DP-записи, чей ленивый Discovery уже опубликован —
+# ключ (dev_name, dp_str). Живёт в памяти процесса; при рестарте моста
+# скрытые сущности переопубликуются в момент первого значения (идемпотентно).
+_HIDDEN_PUBLISHED = set()
+
+
+def publish_hidden_discovery(device, dp_str):
+    """Ленивый Discovery одного `hidden` DP. True — сущность найдена и опубликована."""
+    for src in ("sensor", "number", "select", "switch", "light",
+                "cover", "fan", "lock", "climate"):
+        for spec in device_entities(device, (src,), include_hidden=True):
+            if not spec.state_topic.endswith(f"/dps/{dp_str}/state"):
+                continue
+            mqtt_client.publish(_config_topic(spec.component, spec.unique_id),
+                                json.dumps(spec.config,
+                                           ensure_ascii=spec.ensure_ascii),
+                                qos=spec.qos, retain=spec.retain)
+            log.info("[Discovery/hidden] " + spec.log_tag)
+            return True
+    return False
+
+
+def _ensure_hidden_discovered(device, dps_map, cached):
+    """Для hidden DP, у которого появилось значение, — разово опубликовать Discovery."""
+    dev_name = device.get("name")
+    for dp_str, info in dps_map.items():
+        if not isinstance(info, dict) or not info.get("hidden"):
+            continue
+        if dp_str not in cached:
+            continue
+        key = (dev_name, dp_str)
+        if key in _HIDDEN_PUBLISHED:
+            continue
+        if publish_hidden_discovery(device, dp_str):
+            _HIDDEN_PUBLISHED.add(key)
+
+
+def device_entities(dev, sources=("phase_a",), include_hidden=False):
     """Registry of entity descriptors of one device.
 
     sources -> which registry branches to build. Every migrated publisher
@@ -5860,6 +6832,19 @@ def device_entities(dev, sources=("phase_a",)):
     """
     want = set(sources)
     specs = []
+
+    # v1.14.27: `hidden` DP (tuya-local `hidden: unavailable`) — ЛЕНИВЫЙ Discovery.
+    # По умолчанию такие DP в реестр не попадают (иначе HA заводит вечно-
+    # недоступную сущность и «зомби» в дашборде). С include_hidden=True они
+    # доступны, чтобы publish_state опубликовал сущность в момент появления
+    # реального значения. Одна точка отсечения — все ветки ниже читают dev.
+    if not include_hidden:
+        _dps = dev.get("dps_map")
+        if isinstance(_dps, dict) and any(
+                isinstance(i, dict) and i.get("hidden") for i in _dps.values()):
+            dev = dict(dev)
+            dev["dps_map"] = {k: v for k, v in _dps.items()
+                              if not (isinstance(v, dict) and v.get("hidden"))}
 
     # v1.13.7 (баг дублирования имён): `device.name` = friendly (как было), а
     # `name` сущности — только её роль. Для «целых» устройств шлём name: None,
@@ -6004,6 +6989,9 @@ def device_entities(dev, sources=("phase_a",)):
                 "device": device_info,
                 **avail,
             }
+            # #1144 срез 3 (этап 2): options активной conditions-ветки
+            # (mapping ветки перекрывает плоский список).
+            _apply_cond_overrides(dev, info, config, "select")
             specs.append(EntitySpec(
                 component="select",
                 unique_id=unique_id,
@@ -6037,6 +7025,9 @@ def device_entities(dev, sources=("phase_a",)):
                 "device": device_info,
                 **avail,
             }
+            # #1144 срез 3 (этап 2): min/max/step активной conditions-ветки
+            # (range/step ветки перекрывают плоские значения схемы).
+            _apply_cond_overrides(dev, info, config, "number")
             if info.get("unit"):
                 config["unit_of_measurement"] = info["unit"]
             specs.append(EntitySpec(
@@ -6560,6 +7551,10 @@ def publish_discovery(device):
     dev_type = device.get("type", "sensor")
     dev_name = device["name"]
     friendly = device["friendly_name"]
+    # v1.14.27: сброс ленивого Discovery этого устройства — при (ре)публикации
+    # скрытые сущности пересобираются по факту появления значений.
+    for _k in [k for k in _HIDDEN_PUBLISHED if k[0] == dev_name]:
+        _HIDDEN_PUBLISHED.discard(_k)
     model = device.get("model", "Tuya Device")
 
     device_info = {
@@ -6604,6 +7599,11 @@ def publish_discovery(device):
     elif dev_type == "fan":
         publish_fan(device, device_info)
     else:
+        # v1.33.14: тип sensor/binary_sensor может нести number/select DP
+        # (приходит из tuya-local) — публикуем их Discovery так же, как ветка
+        # switch, иначе числа/селекты не появляются в HA.
+        publish_numbers(device, device_info)
+        publish_selects(device, device_info)
         publish_sensors(device, device_info)
 
 
@@ -6811,7 +7811,40 @@ def publish_state(device, dps, echo=False):
         _cache_update(dev_name, {str(k): v for k, v in dps.items()})
 
     with STATE_LOCK:
-        cached = dict(STATE_CACHE.get(dev_name, {}))
+        _phys = dict(STATE_CACHE.get(dev_name, {}))
+    # 13.10.2026 08:21 (#1144 срез 2): кэш состояния ФИЗИЧЕСКИЙ (ключи — реальные id
+    # DP), а ключи dps_map могут нести суффикс id__<имя> для под-DП с одним
+    # id — разворачиваем кэш под ключи схемы, чтобы ниже ничего не менять.
+    cached = {}
+    for _k in dps_map:
+        if _k in _phys:
+            cached[_k] = _phys[_k]
+        else:
+            _pid = dp_int(_k)
+            if _pid is not None and str(_pid) in _phys:
+                cached[_k] = _phys[str(_pid)]
+
+    # 13.10.2026 14:05 (#1144 срез 8.2a): value_redirect — фоллбек «нет
+    # своего значения → кэш DP-цели» (только чтение; запись — этап 8.2b).
+    try:
+        _fill_redirected(dps_map, cached, _phys)
+    except Exception as e:
+        log.warning(f"[Redirect] {dev_name}: {e}")
+
+    # 13.10.2026 16:19 (#1144 срез 3, этап 2): смена constraint-DP меняет активную
+    # ветку conditions → перепубликация Discovery (dynamic range/options).
+    try:
+        _cond_branch_refresh(device, dps_map)
+    except Exception as e:
+        log.warning(f"[CondRange] {dev_name}: {e}")
+
+    # v1.14.27: ленивый Discovery для hidden DP — сущность появляется в HA
+    # только когда устройство реально прислало значение (иначе — вечно
+    # недоступный «зомби» в дашборде).
+    try:
+        _ensure_hidden_discovered(device, dps_map, cached)
+    except Exception as e:
+        log.warning(f"[Discovery/hidden] {dev_name}: {e}")
 
     # v1.14.7 (#779): у части устройств (WiFi Breaker, ver 3.4) прошивка НЕ шлёт
     # по LAN нулевой bitmap-аварии (fault) — DP отсутствует в отчёте вообще, и
@@ -6868,8 +7901,49 @@ def publish_state(device, dps, echo=False):
                     v = 0
                 color_temp_val = int(kmin + (v / 1000) * (kmax - kmin))
             elif name == "colour_data":
-                r, g, b = tuya_hsv_to_rgb(str(val))
-                color_val = {"r": r, "g": g, "b": b}
+                # #1144 batch C: colour_data может быть base64+format (RGB/HSV
+                # под-поля с bytes/min/max/endianness) — раскладываем как в
+                # срезе 5 (mask), т.к. tuya_hsv_to_rgb ожидает hex-строку HSV.
+                # Схема tuya-local: format=[{name:r,bytes:1,range:{min,max}},...],
+                # type=base64. Фолбэк — прежнее поведение (hex HSV string).
+                _processed = None
+                if info.get("format") and isinstance(val, (str, bytes)):
+                    try:
+                        import base64 as _b64
+                        _raw = _b64.b64decode(str(val))
+                        _endian = info.get("endianness", "big")
+                        _vals = {}
+                        _off = 0
+                        for _f in info["format"]:
+                            _fname = _f.get("name")
+                            _fbytes = _f.get("bytes", 1)
+                            if _off + _fbytes > len(_raw):
+                                break
+                            _chunk = _raw[_off:_off + _fbytes]
+                            _off += _fbytes
+                            _v = int.from_bytes(_chunk, _endian)
+                            _rng = _f.get("range")
+                            if isinstance(_rng, dict):
+                                _mn = _rng.get("min")
+                                _mx = _rng.get("max")
+                                if _mn is not None and _mx is not None and _mx > _mn:
+                                    # масштабируем в 0..1000 — шкала tuya_hsv_to_rgb
+                                    _v = int((_v - _mn) * 1000 / (_mx - _mn))
+                            _vals[_fname] = _v
+                        if "h" in _vals and "s" in _vals and "v" in _vals:
+                            _hex = "%04x%04x%04x" % (_vals["h"], _vals["s"], _vals["v"])
+                            r, g, b = tuya_hsv_to_rgb(_hex)
+                            _processed = {"r": r, "g": g, "b": b}
+                        elif "r" in _vals and "g" in _vals and "b" in _vals:
+                            _processed = {"r": _vals["r"], "g": _vals["g"],
+                                          "b": _vals["b"]}
+                    except Exception:
+                        _processed = None
+                if _processed is None:
+                    # прежнее поведение: val — hex-строка HSV (hsv*1000)
+                    r, g, b = tuya_hsv_to_rgb(str(val))
+                    _processed = {"r": r, "g": g, "b": b}
+                color_val = _processed
 
         if state["state"] == "OFF":
             mqtt_client.publish(
@@ -6957,6 +8031,18 @@ def publish_state(device, dps, echo=False):
                 )
             elif comp == "number":
                 scale = info.get("scale", 0)
+                # #1144 срез 5 (этап 2): mask/endianness — под-поле из raw.
+                if info.get("mask"):
+                    _mv = _apply_mask(info, val)
+                    if _mv is not None:
+                        val = _mv
+                # #1144 срез 4 (этап 2): инверсия диапазона на чтении
+                # (границы — сырые: min/max * 10^scale).
+                if info.get("invert"):
+                    _sc = 10 ** int(scale or 0)
+                    val = _apply_invert(info, val,
+                                        info.get("min", 0) * _sc,
+                                        info.get("max", 100) * _sc)
                 try:
                     nval = float(val) / (10 ** scale) if scale else val
                 except (TypeError, ValueError):
@@ -7040,8 +8126,14 @@ def publish_state(device, dps, echo=False):
                 control = str(val).strip().lower()
             elif name == "percent_state":
                 position = _to_int_percent(val)
+                # #1144 срез 4 (этап 2): invert — штора «наоборот»
+                # (am24_blind_motor: позиция 0..100 инвертирована).
+                if info.get("invert") and position is not None:
+                    position = 100 - position
             elif name == "percent_control" and position is None:
                 position = _to_int_percent(val)
+                if info.get("invert") and position is not None:
+                    position = 100 - position
 
         if control in ("open", "opening"):
             mqtt_client.publish(f"{TOPIC_PREFIX}/cover/{dev_name}/state", "OPEN", retain=True)
@@ -7088,14 +8180,49 @@ def publish_state(device, dps, echo=False):
         return
 
     for dp_str, info in dps_map.items():
-        # v1.12.14: у type=sensor публикуем только sensor/binary_sensor — остальные
-        # компоненты Discovery для такого типа не создаёт (был мусорный retained
-        # в tuya/sensor/<dev>/dps/... без Discovery).
-        if info.get("component") in ("switch", "light", "preset", "select",
-                                     "phase_a", "number", "cover", "fan", "lock"):
+        if dp_str not in cached:
             continue
-        if dp_str in cached:
-            _publish_sensor_value(dev_type, dev_name, dp_str, info, cached[dp_str])
+        comp = info.get("component")
+        val = cached[dp_str]
+        name = info.get("name")
+        # v1.33.14: type=sensor теперь публикует и number/select (Discovery для
+        # них создаётся в publish_discovery) — раньше они молча терялись.
+        if comp == "number":
+            scale = info.get("scale", 0)
+            # #1144 срез 5 (этап 2): mask/endianness — под-поле из raw.
+            if info.get("mask"):
+                _mv = _apply_mask(info, val)
+                if _mv is not None:
+                    val = _mv
+            # #1144 срез 4 (этап 2): инверсия диапазона на чтении (sensor-ветка)
+            # (границы — сырые: min/max * 10^scale).
+            if info.get("invert"):
+                _sc = 10 ** int(scale or 0)
+                val = _apply_invert(info, val,
+                                    info.get("min", 0) * _sc,
+                                    info.get("max", 100) * _sc)
+            try:
+                nval = float(val) / (10 ** scale) if scale else val
+            except (TypeError, ValueError):
+                nval = val
+            mqtt_client.publish(
+                f"{TOPIC_PREFIX}/number/{dev_name}/{name}/state",
+                str(nval), retain=True,
+            )
+        elif comp == "select":
+            sval = str(val)
+            smap = get_select_map(info)
+            if smap:
+                sval = smap.get(sval, sval)
+            mqtt_client.publish(
+                f"{TOPIC_PREFIX}/select/{dev_name}/{name}/state",
+                sval, retain=True,
+            )
+        elif comp in ("switch", "light", "preset", "phase_a", "cover", "fan", "lock"):
+            # эти компоненты у type=sensor не публикуются (Discovery их не создаёт).
+            continue
+        else:
+            _publish_sensor_value(dev_type, dev_name, dp_str, info, val)
 
 
 def _publish_lock_state(dev_name, info, raw_val):
@@ -7106,13 +8233,89 @@ def _publish_lock_state(dev_name, info, raw_val):
                         payload, retain=True)
 
 
+_UNMAPPED_BIN_WARNED = set()
+
+
+def _warn_unmapped_binary(dev_name, dp_str, info, raw_val, why):
+    """v1.14.30: не молчать, когда строковое состояние binary_sensor не размечено.
+
+    Жалоба заказчика 12.10.2026 23:21: DP 101 «motion» датчика присутствия отдаёт
+    строки 'presence'/'none', а в конфиге DP не было `map` → мост публиковал
+    OFF всегда, и в HA движение «не срабатывало» (искали причину в типе устройства).
+    Такое должно быть видно в логе: пишем один раз на DP за жизнь процесса.
+    """
+    key = (dev_name, str(dp_str))
+    if key in _UNMAPPED_BIN_WARNED:
+        return
+    _UNMAPPED_BIN_WARNED.add(key)
+    name = info.get("name", f"dp_{dp_str}")
+    log.warning(
+        f"[BinarySensor] {dev_name}.{name} (dp {dp_str}): значение {raw_val!r} "
+        f"не размечено ({why}) — сущность всегда OFF. Добавьте в конфиг DP "
+        f'"map" вида {{"presence": "ON", "none": "OFF"}} (raw → ON/OFF).')
+
+
 def _publish_sensor_value(dev_type, dev_name, dp_str, info, raw_val):
     component = info.get("component", "sensor")
     scale = info.get("scale", 0)
     name = info.get("name", "")
 
+    # #1144 срез 5 (этап 2): mask/endianness — под-поле из raw DP.
+    # Только sensor/number/binary_sensor (light идёт своей ветвью —
+    # colour_data не трогаем).
+    if component in ("sensor", "number", "binary_sensor") and info.get("mask"):
+        _mv = _apply_mask(info, raw_val)
+        if _mv is not None:
+            raw_val = _mv
+
+    # #1144 batch B: специальные типы значений DP (parser кладёт type в dps_map).
+    # Декодим ПЕРЕД scale/map — сырое значение может быть base64/epoch/utf16.
+    _dtype = str(info.get("type") or "").strip().lower()
+    if _dtype == "unixtime":
+        # Эпоха-секунды → ISO8601 UTC (HA timestamp sensor).
+        try:
+            raw_val = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(raw_val)))
+        except (TypeError, ValueError, OverflowError):
+            pass  # оставим как есть, мост опубликует raw
+    elif _dtype == "utf16b64":
+        # base64 → bytes → UTF-16BE/LE (tuya-local: endianness="big" по умолчанию).
+        try:
+            _endian = info.get("endianness", "big")
+            _bytes = base64.b64decode(str(raw_val))
+            raw_val = _bytes.decode("utf-16-" + ("be" if _endian == "big" else "le"))
+        except Exception:
+            pass  # оставим как есть
+    elif _dtype == "json":
+        # JSON-строка → распаковываем; публикуем как JSON (атрибуты HA).
+        # Не ломаем существующие типы — только если type=="json" явно.
+        try:
+            import json as _json
+            raw_val = _json.loads(str(raw_val))
+        except Exception:
+            pass
+    # base64/hex/bitmap/bitfield/raw — оставляем как есть (parser уже зафиксировал type).
+
     if component == "binary_sensor":
-        if isinstance(raw_val, bool):
+        # v1.33.14: сначала map из конфига (raw → ON/OFF) — tuya-local отдаёт
+        # состояния строками ("presence"/"none"), которых нет в whitelist ниже.
+        bmap = info.get("map")
+        if bmap and not isinstance(raw_val, bool):
+            sval = str(raw_val)
+            if sval in bmap:
+                payload = bmap[sval]
+            else:
+                lower_map = {str(k).lower(): v for k, v in bmap.items()}
+                if sval.lower() in lower_map:
+                    payload = lower_map[sval.lower()]
+                elif "__default_on__" in bmap:
+                    # #1144 batch D: default-ветка tuya-local (dps_val: null →
+                    # value) — легитимное «иначе», не ошибка конфига → без warning.
+                    payload = bmap["__default_on__"]
+                else:
+                    payload = "OFF"
+                    # v1.14.30: значение вне карты — это почти всегда ошибка конфига.
+                    _warn_unmapped_binary(dev_name, dp_str, info, raw_val, "нет в map")
+        elif isinstance(raw_val, bool):
             payload = "ON" if raw_val else "OFF"
         elif isinstance(raw_val, (int, float)):
             if name in ("fault", "problem"):
@@ -7123,12 +8326,64 @@ def _publish_sensor_value(dev_type, dev_name, dp_str, info, raw_val):
             else:
                 payload = "ON" if raw_val else "OFF"
         else:
-            payload = "ON" if str(raw_val).lower() in ("pir", "alarm", "true", "1", "open", "detected") else "OFF"
+            _wl = ("pir", "alarm", "true", "1", "open", "detected")
+            payload = "ON" if str(raw_val).lower() in _wl else "OFF"
+            # v1.14.30: строковое значение не из белого списка и без map → OFF навсегда.
+            if payload == "OFF":
+                _warn_unmapped_binary(dev_name, dp_str, info, raw_val,
+                                      "нет в белом списке " + str(_wl))
+        # страховка: map мог отдать не ON/OFF — приводим к канону HA.
+        payload = "ON" if str(payload).upper() == "ON" else "OFF"
     else:
+        # #1144 batch D: bitfield/bitmap sensor — text-decoder по mapping
+        # (tuya-local: dps_val — битмаска (raw & dps_val) == dps_val; dps_val:0 —
+        # точное совпадение; dps_val: null → value — default-ветка «иначе»).
+        # Срабатывание decode → публикуем текст и выходим ДО scale (scale сломал бы строку).
+        if component == "sensor" and _dtype in ("bitfield", "bitmap") \
+                and isinstance(info.get("mapping"), list) and info["mapping"]:
+            _raw_int = _raw_to_int(info, raw_val)
+            if _raw_int is not None:
+                _matched = None
+                _default = None
+                for _m in info["mapping"]:
+                    if not isinstance(_m, dict):
+                        continue
+                    if _m.get("dps_val") is None and "value" in _m:
+                        _default = _m["value"]
+                    elif _m.get("dps_val") is not None:
+                        _dv = _m.get("dps_val")
+                        if isinstance(_dv, int) and _dv != 0 \
+                                and (_raw_int & _dv) == _dv:
+                            _matched = _m.get("value")
+                            break
+                        elif str(_dv) == str(_raw_int):
+                            _matched = _m.get("value")
+                            break
+                _decoded = _matched if _matched is not None else _default
+                if _decoded is not None:
+                    topic = f"{TOPIC_PREFIX}/{dev_type}/{dev_name}/dps/{dp_str}/state"
+                    mqtt_client.publish(topic, str(_decoded), retain=True)
+                    return
+        # #1144 срез 4 (этап 2): инверсия диапазона на чтении (sensor component)
+        if component == "sensor" and info.get("invert"):
+            _sc = 10 ** int(scale or 0)
+            raw_val = _apply_invert(info, raw_val,
+                                    info.get("min", 0) * _sc,
+                                    info.get("max", 100) * _sc)
         try:
             value = float(raw_val) / (10 ** scale) if scale else raw_val
         except (TypeError, ValueError):
             value = raw_val
+        # 13.10.2026 01:20 (#1144 срез 10): precision из dps_map → округление float.
+        # Только sensor (не binary_sensor); bitfield-text уже ушёл return'ом выше.
+        if component == "sensor" and info.get("precision") is not None \
+                and isinstance(value, (int, float)):
+            try:
+                _prec = int(info["precision"])
+                if _prec >= 0:
+                    value = round(float(value), _prec)
+            except (TypeError, ValueError):
+                pass
         payload = str(value)
 
     topic = f"{TOPIC_PREFIX}/{dev_type}/{dev_name}/dps/{dp_str}/state"
@@ -7594,11 +8849,19 @@ def run_polling_device(dev):
         if UDP_ENABLED:
             try:
                 _now_udp = udp_detect.is_alive(name)
-                if _udp_alive_cache.get(name) != _now_udp:
-                    _udp_alive_cache[name] = _now_udp
+                _prev = _udp_alive_cache.get(name)
+                _now_ts = time.time()
+                if _prev is None or _prev[0] != _now_udp:
+                    _udp_alive_cache[name] = (_now_udp, _now_ts)
                     mqtt_client.publish(f"{TOPIC_PREFIX}/{name}/udp_alive",
                                         "true" if _now_udp else "false",
                                         qos=1, retain=True)
+                elif _now_ts - _prev[1] > _UDP_ALIVE_CACHE_TTL / 2:
+                    _udp_alive_cache[name] = (_now_udp, _now_ts)
+                if len(_udp_alive_cache) > _UDP_ALIVE_CACHE_MAX:
+                    for _k in [k for k, (_v, _ts) in _udp_alive_cache.items()
+                               if _now_ts - _ts > _UDP_ALIVE_CACHE_TTL]:
+                        del _udp_alive_cache[_k]
             except Exception:
                 pass
 
@@ -8141,6 +9404,8 @@ def health_worker():
         _publish_ping_mode()
         # v1.12.19: статистика отклика на команду (окно защиты от «эха»).
         _publish_cmd_ack_stats()
+        # v1.15.1 (#1226): счётчики пути команд (слот/вытеснения/пропущенные ретраи).
+        _publish_cmd_stats()
         cpu, rss = _read_bridge_metrics()
         if cpu is not None:
             mqtt_client.publish(
@@ -8237,6 +9502,13 @@ def main():
         sync_discovery_registry(scan_on_first=True)
     except Exception as e:
         log.warning(f"[Discovery] sync error: {e}")
+
+    # v1.14.28: стартовая реконсиляция — гасим retained-призраки удалённых
+    # устройств и чистим историю имён.
+    try:
+        sweep_stale_device_topics()
+    except Exception as e:
+        log.warning(f"[Sweep] startup error: {e}")
 
     log.info("[Bridge] Discovery опубликован. Запуск воркеров...")
 

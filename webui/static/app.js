@@ -144,6 +144,9 @@ let SCAN_RESULTS = [];
 let SCAN_SUBNET = "";
 let SCAN_TS = 0;                     // v1.28.74: когда был замер
 let BRIDGE_SCAN_RUNNING = false;
+// v1.34.9: Tuya broadcast-discovery (bridge) → {gwId(lower): ip}. Это самый
+// надёжный способ сопоставить Cloud-устройство с локальным IP по Tuya id.
+let TUYA_DISCOVER = {};
 // v1.28.74: результаты храним в sessionStorage (до закрытия вкладки),
 // старше 24 ч — затираем при загрузке.
 const SCAN_CACHE_KEY = "tuya_scan_results_v1";
@@ -1410,6 +1413,33 @@ function _guessSubnetPrefix() {
   return null;
 }
 
+// v1.34.8: локальный IP устройства по результатам скана/probe.
+// Tuya id устройства == gwId из UDP-пробы bridge (регистр не важен).
+function _scannedIpForDevice(tuyaId) {
+  const id = String(tuyaId || "").toLowerCase();
+  if (!id) return "";
+  if (TUYA_DISCOVER[id]) return TUYA_DISCOVER[id];   // v1.34.9: broadcast-discovery
+  for (const h of (SCAN_RESULTS || [])) {
+    const g = h && h.tuya && h.tuya.gwId;
+    if (g && String(g).toLowerCase() === id && h.ip) return h.ip;
+  }
+  return "";
+}
+
+// v1.34.9: прогнать Tuya broadcast-discovery в bridge и пополнить кэш id→ip.
+async function _runTuyaDiscover() {
+  const r = await fetch("/api/scan/tuya_discover", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  const data = await r.json();
+  if (!data.ok) throw new Error(data.error || "discovery error");
+  for (const [gw, info] of Object.entries(data.devices || {})) {
+    if (info && info.ip) TUYA_DISCOVER[String(gw).toLowerCase()] = info.ip;
+  }
+  return TUYA_DISCOVER;
+}
+
 // v1.27.6: проверка, что IP занят (кроме excludeIp — для edit).
 function _ipInUse(ip, excludeIp) {
   if (!ip) return false;
@@ -2529,7 +2559,8 @@ const _modalZoneHashes = {};
 const _CACHE_OPEN_STATE = {};
 // v1.31.10: фильтр «Кэша состояния» по источнику (только показ строк).
 const _srcLabels2 = { cloud: "Cloud", tuya_local: "tuya-local",
-                      local_db: "Локальная база", similar: "similar" };
+                      local_db: "Локальная база", similar: "похожее устройство",
+                      cache: "кэш bridge", heuristic: "Эвристика", auto: "авто" };
 
 function _cacheSrcFilter(src, btn) {
   const box = btn && btn.closest ? btn.closest(".cache-details") : null;
@@ -2673,6 +2704,9 @@ function _renderInfoHtml(d) {
   if (d.ip) html += `<tr><td>IP</td><td>${copyCode(d.ip)}</td></tr>`;
   if (d.version) html += `<tr><td>Версия протокола</td><td>${versionBadge(d.version)}</td></tr>`;
   if (d.tuya_id) html += `<tr><td>Tuya ID</td><td>${copyCode(d.tuya_id)}</td></tr>`;
+  // v1.34.24: Product ID сразу под Tuya ID (в конфиге моста его нет —
+  // WebUI отдаёт его из Cloud-кэша).
+  if (d.product_id) html += `<tr><td>Product ID</td><td>${copyCode(d.product_id)}</td></tr>`;
   html += `</table>`;
   return html;
 }
@@ -2760,7 +2794,9 @@ function _renderCacheHtml(d) {
     const rawName = (info.name || "").trim();
     const code = (info.code || "").trim();
     const origCn = (info._name_original || "").trim();
-    const src = info._name_source || "";
+    // 13.10.2026 07:33 (аудит webui): fallback на _dps_source — tuya-local/heuristic
+    // ставят только его, и per-row терял бейдж источника.
+    const src = info._name_source || info._dps_source || "";
     const fromCache = !!info._from_cache;
 
     // v1.25.0 (fix2): display = code || name(если не CJK) || "?".
@@ -2783,7 +2819,8 @@ function _renderCacheHtml(d) {
     // v1.31.9: бейдж = РЕАЛЬНЫЙ источник (было: любой _from_cache рисовался
     // облачком, хотя значение могло прийти из локальной базы/кэша).
     const _srcBadge = { cloud: "☁", tuya_local: "📚", local_db: "📦",
-                        similar: "🔗", dict: "📖", cn: "🈶" };
+                        similar: "🔗", dict: "📖", cn: "🈶",
+                        cache: "📦", cache_only: "❔", heuristic: "⚠️", auto: "✨" };
     if (display !== "?") {
       if (_srcBadge[src]) {
         badge = _srcBadge[src];
@@ -2825,7 +2862,9 @@ function _renderCacheHtml(d) {
       .map(([s, c]) => {
         const nm = c.name || c.code || "";
         if (!nm) return "";
-        const on = (s === "cloud");        // по умолчанию выбран Cloud
+        // 13.10.2026 07:33 (аудит webui): по умолчанию — источник самой строки (src);
+        // пустой src → Cloud (как раньше).
+        const on = (s === src) || (!src && s === "cloud");
         return `<span class="cache-view" data-src="${escapeAttr(s)}" `
           + `style="display:${on ? "" : "none"};">${escapeHtml(nm)} `
           + `<span class="dp-tip" data-tip="Источник: ${escapeAttr(_srcLabels2[s] || s)}">`
@@ -2846,7 +2885,8 @@ function _renderCacheHtml(d) {
 
   // v1.31.10: переключатель по источникам — видно, откуда взято сопоставление
   const _srcLabels = { cloud: "☁ Cloud", tuya_local: "📚 tuya-local",
-                       local_db: "📦 Локальная база", similar: "🔗 similar" };
+                       local_db: "📦 Локальная база", similar: "🔗 похожее устройство",
+                       cache: "📦 Кэш", heuristic: "⚠️ Эвристика" };
   // v1.31.17: источники берём из КАНДИДАТОВ по DP (а не из _name_source) — иначе
   // виден только тот источник, который «победил», и бар схлопывался в одну кнопку.
   const _have = [];
@@ -2862,7 +2902,7 @@ function _renderCacheHtml(d) {
   // но выбрать его можно: DP будут помечены «не найдено».
   // v1.31.16: только те источники, где есть хоть одно совпадение для устройства
   // (similar убран как бессмысленный), по умолчанию — Cloud (или первый доступный).
-  const _pickable = ["cloud", "tuya_local", "local_db"].filter(s => _have.includes(s));
+  const _pickable = ["cloud", "tuya_local", "local_db", "cache", "heuristic"].filter(s => _have.includes(s));
   const _defSrc = _pickable.includes("cloud") ? "cloud" : (_pickable[0] || "");
   const _srcBar = _pickable.length
     ? `<div class="cache-src-bar">`
@@ -2947,6 +2987,15 @@ async function toggleCloudRaw(el, name, tuyaId) {
                      : { _note: "нет данных Cloud для этого устройства" };
     delete dump.local_key;
     delete dump._raw_cloud;   // слишком объёмно, есть в Cloud-модалке
+    // v1.34.18: в блоке «сырые данные (Cloud)» — ТОЛЬКО данные Cloud.
+    // Производные (считаются у нас) поля не показываем: иначе блок
+    // выглядит как «кэш с мусором» и расходится с Cloud-модалкой.
+    for (const _dk of ["dps_map_generated", "type_guess", "_dps_source",
+                       "_dps_candidates", "_dps_source_reason",
+                       "type_suggest", "type_suggest_src",
+                       "_cloud_status_meta", "_raw_keys", "_key_from_parent"]) {
+      delete dump[_dk];
+    }
     codeEl.textContent = JSON.stringify(dump, null, 2);
     codeEl.dataset.loaded = "1";
     highlightJsonInto(codeEl);
@@ -3856,12 +3905,12 @@ async function submitEditDevice() {
   // v1.28.14: блокируем только IP (универсальная валидация IPv4).
   // Длину key решает bridge (_is_valid_key: 10–50). Если Tuya выдаст
   // нестандартный key — меняем только bridge, WebUI отдаёт как есть.
-  if (changes.ip !== undefined && !_isValidIPv4(changes.ip)) {
+  if (!ENGINEER_MODE && changes.ip !== undefined && !_isValidIPv4(changes.ip)) {
     errEl.style.display = "block";
     errEl.textContent = "Некорректный IP-адрес (0-255, без ведущих нулей)";
     return;
   }
-  if (changes.ip !== undefined && _ipInUse(changes.ip, d.ip)) {
+  if (!ENGINEER_MODE && changes.ip !== undefined && _ipInUse(changes.ip, d.ip)) {
     errEl.style.display = "block";
     errEl.textContent = "Этот IP уже используется другим устройством";
     return;
@@ -3879,7 +3928,7 @@ async function submitEditDevice() {
   try {
     const r = await fetch(`/api/device/${encodeURIComponent(EDIT_DEVICE_NAME)}/config`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ changes })
+      body: JSON.stringify({ changes, engineer_mode: ENGINEER_MODE })
     });
     const data = await r.json();
     if (data.ok) {
@@ -5233,6 +5282,10 @@ function pollTuyaLocalProgress() {
 // ===== Rebuild tinytuya.json =====
 // v1.31.0: сначала диалог с опциями — пересборка идёт отдельными
 // TCP-подключениями, поэтому параметры важны (правило №1).
+// v1.34.19: в этом же диалоге — список новых (cloud-only) устройств с
+// галочками «батарейное»: спрашиваем ДО скана, а не нативным confirm().
+let REBUILD_PLAN = [];
+
 function rebuildTinytuyaJson() {
   // v1.31.2: галки такие же, как в прошлый раз по смыслу по умолчанию —
   // «не опрашивать батарейные» и «стоп на первой версии» включены
@@ -5240,7 +5293,98 @@ function rebuildTinytuyaJson() {
   const _sf = document.getElementById("rebuild-stop-first");
   if (_sb) _sb.checked = true;
   if (_sf) _sf.checked = true;
+  // v1.34.19: список новых устройств подгружаем при каждом открытии —
+  // состояние Cloud могло измениться.
+  REBUILD_PLAN = [];
+  const _block = document.getElementById("rebuild-unknown-block");
+  const _empty = document.getElementById("rebuild-unknown-empty");
+  const _loading = document.getElementById("rebuild-unknown-loading");
+  const _list = document.getElementById("rebuild-unknown-list");
+  const _hint = document.getElementById("rebuild-unknown-hint");
+  const _all = document.getElementById("rebuild-unknown-all");
+  if (_block) _block.style.display = "none";
+  if (_empty) _empty.style.display = "none";
+  if (_all) _all.checked = false;
+  if (_list) _list.innerHTML = "";
+  if (_hint) _hint.textContent = "";
+  if (_loading) _loading.style.display = "";
   document.getElementById("rebuild-overlay").classList.add("open");
+  loadRebuildPlan();
+}
+
+async function loadRebuildPlan() {
+  const _loading = document.getElementById("rebuild-unknown-loading");
+  try {
+    const r = await fetch("/api/base/tinytuya/rebuild/plan", {
+      method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || "ошибка плана");
+    REBUILD_PLAN = data.unknown || [];
+    renderRebuildPlan(data);
+  } catch (e) {
+    // План не критичен: модалка всё равно открыта, просто без списка.
+    if (_loading) _loading.style.display = "none";
+    const _empty = document.getElementById("rebuild-unknown-empty");
+    if (_empty) {
+      _empty.style.display = "";
+      _empty.innerHTML = "⚠️ не удалось получить список из Cloud: " + escapeHtml(e.message)
+        + " — пересборка пойдёт по конфигу";
+    }
+  }
+}
+
+function renderRebuildPlan(data) {
+  const _loading = document.getElementById("rebuild-unknown-loading");
+  const _block = document.getElementById("rebuild-unknown-block");
+  const _empty = document.getElementById("rebuild-unknown-empty");
+  if (_loading) _loading.style.display = "none";
+  const list = REBUILD_PLAN || [];
+  if (!list.length) {
+    if (_empty) _empty.style.display = "";
+    return;
+  }
+  const _cfg = (data && data.config) || {};
+  const _count = document.getElementById("rebuild-unknown-count");
+  if (_count) {
+    _count.textContent = "(" + list.length + (isFinite(_cfg.total)
+      ? " · в конфиге " + _cfg.enabled + "/" + _cfg.total : "") + ")";
+  }
+  const _listEl = document.getElementById("rebuild-unknown-list");
+  if (_listEl) {
+    _listEl.innerHTML = list.map((d, i) => `
+      <label class="rebuild-unknown-row">
+        <input type="checkbox" data-rebuild-unknown="${i}" ${d.battery ? "checked" : ""}
+               onchange="updateRebuildUnknownHint()">
+        <span class="rebuild-unknown-name"><b>${escapeHtml(d.friendly_name || d.name)}</b></span>
+        <span class="rebuild-unknown-meta">${escapeHtml(d.model || "")}${d.id ? " · " + escapeHtml(d.id) : ""}</span>
+      </label>`).join("");
+  }
+  if (_block) _block.style.display = "";
+  updateRebuildUnknownHint();
+}
+
+function rebuildToggleAllUnknown(checked) {
+  document.querySelectorAll('input[data-rebuild-unknown]').forEach(cb => { cb.checked = !!checked; });
+  updateRebuildUnknownHint();
+}
+
+function rebuildCheckedUnknowns() {
+  const out = [];
+  document.querySelectorAll('input[data-rebuild-unknown]').forEach(cb => {
+    if (!cb.checked) return;
+    const idx = parseInt(cb.getAttribute("data-rebuild-unknown"), 10);
+    const d = REBUILD_PLAN[idx];
+    if (d && d.name) out.push(d.name);
+  });
+  return out;
+}
+
+function updateRebuildUnknownHint() {
+  const _hint = document.getElementById("rebuild-unknown-hint");
+  if (!_hint) return;
+  const checked = rebuildCheckedUnknowns().length;
+  const probed = Math.max(0, (REBUILD_PLAN || []).length - checked);
+  _hint.textContent = `будет опрошено новых: ${probed} · не опрашивается (батарейные): ${checked}`;
 }
 
 function closeRebuildDialog(evt) {
@@ -5251,6 +5395,8 @@ function closeRebuildDialog(evt) {
 async function startRebuild() {
   const skipBatt = !!document.getElementById("rebuild-skip-battery").checked;
   const stopFirst = !!document.getElementById("rebuild-stop-first").checked;
+  // v1.34.19: отметки «батарейное» из модалки (устройства не из конфига).
+  const batteryNames = rebuildCheckedUnknowns();
   closeRebuildDialog();
 
   const btn = document.getElementById("rebuild-btn");
@@ -5268,7 +5414,8 @@ async function startRebuild() {
   progressFill.style.width = "0%";
 
   try {
-    const r = await fetch("/api/base/tinytuya/rebuild", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ skip_battery: skipBatt, stop_first: stopFirst }) });
+    const r = await fetch("/api/base/tinytuya/rebuild", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ skip_battery: skipBatt, stop_first: stopFirst,
+      battery_names: batteryNames }) });
     const data = await r.json();
     if (!data.ok) {
       setStatus(progressText, false, "❌ " + (data.error || "ошибка"));
@@ -5344,6 +5491,16 @@ function pollRebuildProgress() {
                ? _rstat("батарейных пропущено", _rep.battery_skipped, "",
                         "Спящие батарейные не опрашивались: их mapping сохранён из прежней базы")
                : "")
+            + (_rep.battery_marked
+               ? _rstat("отмечено батарейными", _rep.battery_marked, "",
+                        "Новые устройства из Cloud, которые ты отметил батарейными в модалке —"
+                        + " не опрашивались, чтобы не будить спящие. Их mapping сохранён из прежней базы")
+               : "")
+            + (_rep.battery_unknown
+               ? _rstat("новых (питание неизвестно)", _rep.battery_unknown, "warn",
+                        "Устройства есть в Cloud, но не в конфиге. Запуск был без модалки"
+                        + " (по API), поэтому их не опрашивали — открой «🔄 Пересобрать» и отметь галочками.")
+               : "")
             + `</div>`
             + `<div class="muted" style="margin-top:6px; font-size:11px;">`
             + `собрано ${_rep.fetched_at ? new Date(_rep.fetched_at * 1000).toLocaleString("ru-RU") : "—"}`
@@ -5352,6 +5509,8 @@ function pollRebuildProgress() {
                ? `<div style="color:var(--red); margin-top:6px;">Ошибки: ${s.errors.slice(0,5).map(escapeHtml).join("; ")}${s.errors.length > 5 ? " …" : ""}</div>`
                : "");
         }
+        // v1.34.19: вопрос про батарейные задаётся ДО скана — в модалке
+        // пересборки (галочки). Нативный confirm() и повторный прогон убраны.
         if (s.ok) {
           setButtonState(btn, "ok", "Готово");
         } else {
@@ -5474,15 +5633,37 @@ function dismissCacheBanner() {
   hideCacheBanner();
 }
 
-async function loadCloudCacheServer() {
+async function loadCloudCacheServer(opts) {
   try {
     const r = await fetch("/api/cloud/cache");
     const data = await r.json();
     if (!data.ok || !data.exists) return false;
     if (!Array.isArray(data.devices) || data.devices.length === 0) return false;
+    // v1.34.38 (#1175): keepSelection — авто-обновление кэша не должно терять
+    // выбор пользователя в таблице импорта (иначе повторный запрос сервера
+    // обнулял бы CLOUD_SELECTED посреди превью).
+    const _keep = !!(opts && opts.keepSelection);
+    const _prevIds = _keep
+      ? Object.keys(CLOUD_SELECTED)
+          .map(i => { const d = CLOUD_DEVICES[parseInt(i)]; return d ? d.id : null; })
+          .filter(Boolean)
+      : null;
     CLOUD_DEVICES = data.devices;
-    CLOUD_SELECTED = {};
+    if (_keep && _prevIds && _prevIds.length) {
+      const _idx = new Map(CLOUD_DEVICES.map((d, i) => [String(d && d.id), i]));
+      CLOUD_SELECTED = {};
+      for (const _id of _prevIds) {
+        const _i = _idx.get(String(_id));
+        if (_i !== undefined) CLOUD_SELECTED[_i] = true;
+      }
+      try { updateSelectedCount(); } catch {}
+    } else {
+      CLOUD_SELECTED = {};
+    }
     CLOUD_CACHE_FETCHED_AT = data.fetched_at || 0;
+    // v1.34.38 (#1175): сервер сообщил, что индекс tuya-local ещё собирался —
+    // обогащение могло уйти без tuya-local/heuristic. Следим и перезапрашиваем.
+    TL_CACHE_PENDING = !!data.tl_pending;
     if (data.access_id && !document.getElementById("cloud-access-id").value) {
       document.getElementById("cloud-access-id").value = data.access_id;
     }
@@ -5491,11 +5672,62 @@ async function loadCloudCacheServer() {
     }
     renderCloudCacheInfo();
     maybeShowCacheBanner();
+    if (TL_CACHE_PENDING) _tlPendingWatch();
     return true;
   } catch (e) {
     console.warn("cache load err", e);
     return false;
   }
+}
+
+// v1.34.38 (#1175): наблюдатель за пересборкой индекса tuya-local. Пока сервер
+// отдаёт tl_pending, обогащение кэша неполное (без tuya-local/heuristic) —
+// превью импорта показывало бы «источник не прилипает» до ручной перезагрузки.
+let TL_CACHE_PENDING = false;
+let _tlPendingTimer = null;
+let _tlPendingDeadline = 0;   // общий бюджет наблюдения (не сбрасывается перезапросом)
+
+function _tlPendingNote(msg) {
+  const el = document.getElementById("base-tuya-local-info");
+  if (!el) return;
+  const cur = (el.textContent || "").trim();
+  if (cur && cur !== "—") el.textContent = cur + " · " + msg;
+  else el.textContent = msg;
+}
+
+async function _tlPendingWatchTick() {
+  let st = null;
+  try {
+    const r = await fetch("/api/base/tuya-local/progress");
+    st = await r.json();
+  } catch { st = null; }
+  if (st && st.running) return;              // ещё собирается — ждём дальше
+  clearInterval(_tlPendingTimer); _tlPendingTimer = null;
+  if (await loadCloudCacheServer({ keepSelection: true })) {
+    renderCloudDevices();
+    const pv = document.getElementById("preview-overlay");
+    if (pv && pv.classList.contains("open")) renderImportPreview();
+    if (!TL_CACHE_PENDING) {
+      _tlPendingDeadline = 0;               // вылечилось — следующее окно можно снова
+      _tlPendingNote("Индекс tuya-local дособрался — источники обновлены");
+    }
+  }
+}
+
+function _tlPendingWatch() {
+  if (_tlPendingTimer) return;               // наблюдатель уже один — не плодим
+  if (!_tlPendingDeadline) _tlPendingDeadline = Date.now() + 240000;
+  let ticks = 0;
+  _tlPendingTimer = setInterval(() => {
+    // Дедлайн общий: перезапуск таймера из loadCloudCacheServer бюджет НЕ сбрасывает
+    // (иначе вечный 3с-опрос, если индекс не собирается, например нет pyyaml).
+    if (++ticks > 80 || Date.now() > _tlPendingDeadline) {   // ~240 с — больше не ждём
+      clearInterval(_tlPendingTimer); _tlPendingTimer = null;
+      _tlPendingDeadline = 0;
+      return;
+    }
+    _tlPendingWatchTick();
+  }, 3000);
 }
 
 async function clearCloudCache() {
@@ -5684,8 +5916,23 @@ function showCloudDevice(idx) {
   html += `<tr><td>Online</td><td><span class="dot ${d.online ? 'online' : 'offline'}"></span></td></tr>`;
   html += row("Имя", d.name);
   html += row("ID", d.id, true);
-  html += `<tr><td>Category (raw)</td><td><span class="type-badge">${escapeHtml(d.category || '?')}</span> <span class="muted" style="font-size:11px;">(код Tuya)</span></td></tr>`;
-  html += `<tr><td>Тип устройства</td><td>${d.type_guess ? typeBadge(d.type_guess) : '<span class="muted">не определён — задайте в ✏️</span>'}</td></tr>`;
+  html += `<tr><td>Категория (raw)</td><td><span class="type-badge">${escapeHtml(d.category || '?')}</span> <span class="muted" style="font-size:11px;">(код Tuya)</span></td></tr>`;
+  // v1.34.24: у «Тип устройства» показываем ИСТОЧНИК (облачная категория) и,
+  // если схема tuya-local уверенно совпала, — её тип отдельной справкой.
+  // Конфиг уже добавленного прибора это не меняет: смена type переписывает
+  // MQTT-топики и discovery (см. карточку #1145).
+  const _tlTypeSrc = d.category
+    ? ` <span class="muted" style="font-size:11px;">— из категории облака «${escapeHtml(d.category)}»</span>`
+    : "";
+  const _tlTypeSug = (d.type_suggest && d.type_suggest !== d.type_guess)
+    ? `<br><span class="muted" style="font-size:11px;">по схеме: `
+      + typeBadge(d.type_suggest)
+      + (d.type_suggest_src ? ` — ${escapeHtml(d.type_suggest_src)}` : "")
+      + ` <span title="Тип, который уйдёт в конфиг НОВОГО прибора; у уже добавленных конфиг не меняется">(справка)</span></span>`
+    : "";
+  html += `<tr><td>Тип устройства</td><td>${d.type_guess
+    ? typeBadge(d.type_guess) + _tlTypeSrc
+    : '<span class="muted">не определён — задайте в ✏️</span>'}${_tlTypeSug}</td></tr>`;
   // v1.31.9: облако версию не отдаёт — берём из конфига, если устройство есть;
   // иначе честно «не определено» (без длинной подсказки).
   const _known = (typeof LAST_DEVICES !== "undefined" ? LAST_DEVICES : [])
@@ -5724,6 +5971,15 @@ function showCloudDevice(idx) {
   } else {
     html += `<tr><td>Local key</td><td class="muted">—</td></tr>`;
   }
+  // v1.34.8: локальный IP — в Cloud его нет, берём из скана/probe по Tuya id
+  // (gwId). Кнопка прогоняет скан и подставляет найденный IP при импорте.
+  const _scanIp = d.ip || _scannedIpForDevice(d.id);
+  html += `<tr><td>IP (локальный)</td><td>`
+    + (_scanIp
+        ? copyCode(_scanIp) + ` <span class="muted" style="font-size:11px;">${d.ip ? "найден" : "из скана"}</span>`
+        : `<span class="muted">не найден</span>`)
+    + ` <button id="cloud-find-ip-btn" onclick="findCloudDeviceIp(${idx})" title="Прогнать скан и найти IP по Tuya id (gwId)" style="margin-left:6px; padding:2px 8px; font-size:12px;">🔍 Найти IP</button>`
+    + `</td></tr>`;
   if (d.gateway_id) html += row("Gateway ID", d.gateway_id, true);
   if (d._key_from_parent) html += `<tr><td>Key source</td><td class="muted">взят от parent <code>${escapeHtml(d._key_from_parent)}</code></td></tr>`;
   html += `</table>`;
@@ -5740,9 +5996,11 @@ function showCloudDevice(idx) {
     Object.values(mapping).map(x => x && x.code).filter(Boolean));
   const _unmapped = _statusCodes.filter(c => !_mappedCodes.has(c)).sort();
 
-  html += `<h3 style="margin-top:16px;">${_cloudInCfg ? "Просмотр" : "Импорт"}</h3>`;
+  html += `<h3 style="margin-top:16px;">${_cloudInCfg ? (ENGINEER_MODE ? "Просмотр и перезапись конфигурации" : "Просмотр") : "Импорт"}</h3>`;
   if (_cloudInCfg) {
-    html += `<div class="muted" style="margin-bottom:8px;">⚠️ Устройство уже есть в конфиге — доступен только просмотр.</div>`;
+    // v1.34.34 (#1169): в инженерном режиме не пугаем «только просмотр» —
+    // доступна и перезапись конфигурации.
+    html += `<div class="muted" style="margin-bottom:8px;">⚠️ Устройство уже есть в конфиге — доступен только просмотр${ENGINEER_MODE ? " и перезапись конфигурации" : ""}.</div>`;
     html += `<button class="primary" onclick="previewSingleCloudDevice(${idx})">📦 Посмотреть это устройство</button>`;
   } else {
     html += `<button class="primary" onclick="previewSingleCloudDevice(${idx})">📦 Импортировать это устройство</button>`;
@@ -5856,6 +6114,10 @@ function getDeviceMapping(d) {
   //    иначе реальные значения из mapping не подмешивались.
   if (d.dps_map_generated && Object.keys(d.dps_map_generated).length > 0) {
     for (const [dp, info] of Object.entries(d.dps_map_generated)) {
+      // v1.34.20: «Авто» не берёт подсказки ⚠️ Эвристики (подбор похожего
+      // устройства) — только достоверные источники: Cloud / tuya-local /
+      // локальная база. Эвристику выбирают явно в источнике строки.
+      if (info && info._dps_source === "heuristic") continue;
       const e = { code: info.name || info.code || ("dp_" + dp) };
       if (info._cloud_type) e.type = info._cloud_type;
       if (info.name) e.name = info.name;
@@ -5942,9 +6204,14 @@ async function importSelected() {
   // v1.28.40: если все выбранные уже в конфиге — это просмотр, не импорт.
   const _allInConfig = sel.every(d => _isCloudDeviceInConfig(d));
   if (_allInConfig) {
+    // v1.34.34 (#1169): в инженерном режиме текст мягче — доступна перезапись.
+    const _wdMsg = ENGINEER_MODE
+      ? `Все выбранные устройства (${sel.length}) уже есть в конфиге.\n\n⚠️ Доступен только просмотр и перезапись конфигурации ⚠️`
+        + `\nВнимание: перезапись конфигурации может работать не стабильно.`
+      : `Все выбранные устройства (${sel.length}) уже есть в конфиге.\n\n⚠️ Доступен только просмотр ⚠️`;
     const _ok = await uiConfirm(
       "Уже добавлены",
-      `Все выбранные устройства (${sel.length}) уже есть в конфиге.\n\n⚠️ Доступен только просмотр ⚠️`,
+      _wdMsg,
       { okText: "Просмотр", cancelText: "Отмена" }
     );
     if (!_ok) return;
@@ -5975,10 +6242,12 @@ async function importSelected() {
       ip = _knownIp;
       friendly = (_knownCfg && _knownCfg.friendly_name) ? _knownCfg.friendly_name : (d.name || d.id);
     } else {
-      const _msg = `IP для "${d.name || d.id}":` + (netHint ? `\n\n${netHint}` : "");
+      const _scannedIp = d.ip || _scannedIpForDevice(d.id);   // v1.34.8: IP из скана/probe
+      const _msg = `IP для "${d.name || d.id}":` + (netHint ? `\n\n${netHint}` : "")
+        + (_scannedIp ? `\nНайден локальный IP: ${_scannedIp}` : "");
       const _opts = {
         placeholder: placeholder,
-        value: _knownIp || preValue,
+        value: _knownIp || _scannedIp || preValue,
         okText: "Далее",
         validate: (v) => {
           const t = (v || "").trim();
@@ -6000,9 +6269,22 @@ async function importSelected() {
     }
 
     // v1.28.41: friendly_name и name (латиница) — уникальные.
-    friendly = _uniquifyFriendly(friendly || d.name || d.id, _usedFriendly);
+    // v1.34.34 (#1169, баг-5 заказчика): при перезаписи УЖЕ добавленного
+    // устройства идентичность берём у него же, а не «уникализируем» от него
+    // самого. Иначе name уезжал как *_2, а мост отклонял импорт:
+    // «IP ... уже занят устройством '<то же имя>'» (мост исключает конфликт
+    // IP только при совпадении name, и мержит overwrite тоже по name).
+    let defaultName;
+    if (_knownCfg && _knownCfg.name) {
+      if (_knownCfg.friendly_name) _usedFriendly.delete(_knownCfg.friendly_name);
+      _usedNames.delete(_knownCfg.name);
+      friendly = _knownCfg.friendly_name || friendly || d.name || d.id;
+      defaultName = _knownCfg.name;
+    } else {
+      friendly = _uniquifyFriendly(friendly || d.name || d.id, _usedFriendly);
+      defaultName = _uniquifyName(_makeDeviceName(friendly, d.id), _usedNames);
+    }
     _usedFriendly.add(friendly);
-    const defaultName = _uniquifyName(_makeDeviceName(friendly, d.id), _usedNames);
     _usedNames.add(defaultName);
 
     let dps_map = d.dps_map_generated || {};
@@ -6027,7 +6309,7 @@ async function importSelected() {
     const _base = {
       id: d.id, name: defaultName, friendly_name: friendly.trim(),
       ip: ip.trim(), local_key: d.local_key || "",
-      version: version, type: d.type_guess || "switch",
+      version: version, type: d.type_suggest || d.type_guess || "switch",
       model: d.product_name || "",
       battery_powered: _isBattery, enabled: true,
       dps_map: dps_map,
@@ -6036,7 +6318,7 @@ async function importSelected() {
       version_source: versionSource,
       // v1.29.2: тип не определён (категория неизвестна) — показываем честно,
       // в конфиг уходит "switch" как безопасный дефолт (меняется в ✏️).
-      type_confirmed: !!d.type_guess,
+      type_confirmed: !!(d.type_suggest || d.type_guess),
       _cloud_ref: d,
       _probe: probeInfo,
     };
@@ -6087,7 +6369,7 @@ async function importSelected() {
     const _cfgMap = (_kc && _kc.dps_map) ? _kc.dps_map : null;
     // v1.28.40: для уже-в-конфиге — режим просмотра (правка по ✏️).
     item._isKnown = _isKnown;
-    item._edit = !_isKnown;
+    item._edit = ENGINEER_MODE || !_isKnown;   // v1.34.31 (#1167): в инженерном режиме редактируем и известные
     const _autoMap = getDeviceMapping(_cr);
     const _dps = _previewAllDps(item);
     item.enabled_dps = {};
@@ -6178,17 +6460,29 @@ function _updateImportButton() {
     newCount++;
     if (Object.values(it.enabled_dps || {}).some(Boolean)) enabledNew++;
   }
+  // v1.34.33 (#1167, баг-3 заказчика 13.10.2026 18:00): в ручном инженерном режиме
+  // уже добавленные устройства перезаписываются целиком — кнопка активная и
+  // красная «Перезаписать конфиг», а не неактивное «Форма только для просмотра».
+  if (ENGINEER_MODE && knownCount > 0) {
+    btn.disabled = false;
+    btn.className = "danger";
+    btn.textContent = "⚠️ Перезаписать конфиг";
+    return;
+  }
   if (newCount === 0) {
     btn.disabled = true;
+    btn.className = "primary";
     btn.textContent = "⚠️ Форма только для просмотра";
     return;
   }
   if (enabledNew === 0) {
     btn.disabled = true;
+    btn.className = "primary";
     btn.textContent = "⚠️ Не выбрано ни одного DP";
     return;
   }
   btn.disabled = false;
+  btn.className = "primary";
   btn.textContent = (knownCount > 0) ? "📦 Импортировать новые" : "📦 Импортировать всё";
 }
 
@@ -6266,22 +6560,52 @@ function _previewCurrentValues(d) {
   return out;
 }
 
+// v1.34.10: запись DP из dps_map_generated по источнику — сначала _dps_source,
+// затем _dps_candidates[src] ({источник: запись}). Так источник доступен для
+// выбора, даже если «победил» другой (например, Cloud).
+function _previewGenEntryForSource(dp, info, src) {
+  if (info && info._dps_source === src) {
+    return Object.assign({}, info, { code: info.name || info.code || ("dp_" + dp) });
+  }
+  const c = info && info._dps_candidates && info._dps_candidates[src];
+  if (c && typeof c === "object") {
+    return Object.assign({}, c, { code: c.name || c.code || ("dp_" + dp) });
+  }
+  return null;
+}
+
 // Карта источника: dp -> {code, type, values, name, component?}.
 function _previewSourceMapping(item, src) {
   const d = (item.device && item.device._cloud_ref) ? item.device._cloud_ref : {};
+  // v1.34.22: если пользователь выбрал ДРУГОЙ «тип устройства» tuya-local
+  // (выпадашка в карточке), схема берётся из него — сервер отдаёт её по
+  // /api/tuya-local/variant. Это и для 📚 tuya-local, и для ⚠️ Эвристики.
+  if ((src === "tuya_local" || src === "heuristic") && item._tl_pick
+      && item._tl_pick[src] && item._tl_pick[src].dps
+      && Object.keys(item._tl_pick[src].dps).length) {
+    const out = {};
+    for (const [dp, info] of Object.entries(item._tl_pick[src].dps)) {
+      if (info && typeof info === "object") out[dp] = Object.assign({}, info);
+    }
+    return out;
+  }
   if (src === "cloud") {
     const out = {};
     for (const [dp, m] of Object.entries(_previewCloudMapping(d) || {})) {
       if (m && typeof m === "object") out[dp] = Object.assign({}, m);
+    }
+    for (const [dp, info] of Object.entries(d.dps_map_generated || {})) {
+      if (out[dp]) continue;
+      const e = _previewGenEntryForSource(dp, info, "cloud");
+      if (e) out[dp] = e;
     }
     return out;
   }
   if (src === "tuya_local") {
     const out = {};
     for (const [dp, info] of Object.entries(d.dps_map_generated || {})) {
-      if (info && info._dps_source === "tuya_local") {
-        out[dp] = Object.assign({}, info, { code: info.name || info.code || ("dp_" + dp) });
-      }
+      const e = _previewGenEntryForSource(dp, info, "tuya_local");
+      if (e) out[dp] = e;
     }
     return out;
   }
@@ -6290,9 +6614,8 @@ function _previewSourceMapping(item, src) {
     // приходит с сервера в dps_map_generated с _dps_source="local_db".
     const out = {};
     for (const [dp, info] of Object.entries(d.dps_map_generated || {})) {
-      if (info && info._dps_source === "local_db") {
-        out[dp] = Object.assign({}, info, { code: info.name || info.code || ("dp_" + dp) });
-      }
+      const e = _previewGenEntryForSource(dp, info, "local_db");
+      if (e) out[dp] = e;
     }
     return out;
   }
@@ -6311,15 +6634,13 @@ function _previewSourceMapping(item, src) {
     return out;
   }
   if (src === "heuristic") {
-    // Component по текущему значению (bool→switch, number→number, строка→sensor).
-    const base = getDeviceMapping(d);
-    const vals = _previewCurrentValues(d);
+    // v1.34.20: «Эвристика» = подбор похожей схемы по совпадению номеров DP
+    // (приходит с сервера в dps_map_generated с _dps_source="heuristic").
+    // Прежнее угадывание component по значению/имени выпилено — смысла не было.
     const out = {};
-    for (const [dp, m] of Object.entries(base)) {
-      const code = m.code || "";
-      const comp = Object.prototype.hasOwnProperty.call(vals, code)
-        ? _dpsFillSuggestFromValue(vals[code]) : "sensor";
-      out[dp] = Object.assign({}, m, { component: comp });
+    for (const [dp, info] of Object.entries(d.dps_map_generated || {})) {
+      const e = _previewGenEntryForSource(dp, info, "heuristic");
+      if (e) out[dp] = e;
     }
     return out;
   }
@@ -6348,6 +6669,10 @@ function _previewResolveRow(item, idx, dp) {
 // v1.28.68: bridge-forced DP в превью — {key, info} или null.
 // Определяем по имени записи и/или облачному code этого DP.
 function _previewBridgeForced(item, dp, entry) {
+  // #1167 (баг заказчика 13.10.2026 17:51): в ручном инженерном режиме bridge-forced
+  // НЕ навязываем — иначе в списке «select», а в конфиг/карточку уезжает
+  // «binary_sensor» (рассинхрон Component).
+  if (ENGINEER_MODE) return null;
   const d = (item.device && item.device._cloud_ref) ? item.device._cloud_ref : {};
   const cm = _previewCloudMapping(d) || {};
   const code = (cm[dp] && cm[dp].code) || (entry && (entry.code || "")) || "";
@@ -6425,6 +6750,19 @@ function _diffHtmlOf(diff) {
     `<span class="preview-diff" title="Изменения относительно текущего конфига">Δ <b style="color:var(--green);">+${diff.add}</b> / <b style="color:var(--yellow);">~${diff.chg}</b> / <b style="color:var(--red);">−${diff.rem}</b></span>`;
 }
 
+function _previewSrcHasData(src) {
+  // v1.34.13: есть ли у источника ХОТЬ один DP для показанных устройств.
+  // Нужно, чтобы «☁ Tuya Cloud» / «📦 Локальная база» не были кликабельны,
+  // когда данных от них нет вовсе (иначе пользователь думает, что выбор сломан).
+  for (const it of PREVIEW_DEVICES) {
+    try {
+      const m = _previewSourceMapping(it, src);
+      if (m && Object.keys(m).length) return true;
+    } catch (e) { /* не роняем тулбар из-за одного устройства */ }
+  }
+  return false;
+}
+
 function _renderPreviewSourceBar() {
   const manual = _previewHasManualRows();
   const _hasNew = PREVIEW_DEVICES.some(it => !it._isKnown);
@@ -6440,7 +6778,11 @@ function _renderPreviewSourceBar() {
   for (const s of PREVIEW_SOURCES) {
     const active = !manual && PREVIEW_SOURCE === s.id;
     // v1.28.72: «Текущий» (конфиг как есть) — только для уже добавленных.
-    const _dis = (s.id === "cache") ? !_hasKnown : !_enable;
+    // v1.34.13: источник без данных (ни одного DP) — тоже недоступен.
+    let _dis;
+    if (s.id === "auto") _dis = false;
+    else if (s.id === "cache") _dis = !_hasKnown;
+    else _dis = !_enable || !_previewSrcHasData(s.id);
     btns += `<button type="button" class="${active ? "active" : ""}" ${_dis ? "disabled" : ""} onclick="setPreviewSource('${s.id}')" title="${s.label}">${s.icon} ${s.label}</button>`;
   }
   // v1.28.70: если новых устройств нет — шапка управляет уже добавленными,
@@ -6648,7 +6990,7 @@ function renderPreviewDeviceBlock(item, idx) {
   const _sandboxOn = item._edit === true;
   const _editBtn = _inCfg
     ? `<button type="button" class="preview-edit-btn${_sandboxOn ? " active" : ""}" onclick="previewToggleEdit(${idx})" title="${_sandboxOn ? "Выключить песочницу (вернуть «как настроено»)" : "Песочница: посмотреть все DP/значения (не сохраняется)"}">🧪</button>`
-      + `<span class="preview-sandbox-label">${_sandboxOn ? "Песочница (не сохраняется)" : "Как настроено"}</span>`
+      + `<span class="preview-sandbox-label">${_sandboxOn ? "Песочница" : "Как настроено"}</span>`
     : "";
 
   // v1.30.0: у устройств, которые уже в конфиге, кнопки опроса нет
@@ -6878,7 +7220,7 @@ function closePreview(evt) {
   PREVIEW_ROW_SOURCE = {};
   PREVIEW_SOURCE = "auto";
   for (const item of PREVIEW_DEVICES) {
-    if (item._isKnown) item._edit = false;
+    if (item._isKnown && !ENGINEER_MODE) item._edit = false;   // v1.34.31 (#1167)
   }
 }
 
@@ -7040,7 +7382,74 @@ function _previewVersionInner(item, idx) {
 
 function _previewDeviceRowsInner(item, idx) {
   return `<div class="preview-device-row">${_previewTypeInner(item, idx)}</div>`
-    + `<div class="preview-device-row">${_previewVersionInner(item, idx)}</div>`;
+    + `<div class="preview-device-row">${_previewVersionInner(item, idx)}</div>`
+    + _previewTlTypeInner(item, idx);
+}
+
+// v1.34.22: выбор «типа устройства» tuya-local — как список типов в HA при
+// добавлении устройства (лучший предвыбран, остальные можно выбрать).
+// Полные совпадения -> источник «📚 tuya-local», частичные -> «⚠️ Эвристика»
+// («похожее устройство»). Смена типа перечитывает схему с сервера.
+function _previewTlTypeInner(item, idx) {
+  const d = (item.device && item.device._cloud_ref) ? item.device._cloud_ref : {};
+  const cands = Array.isArray(d._tl_candidates) ? d._tl_candidates : [];
+  if (!cands.length) return "";
+  const wantMatch = PREVIEW_SOURCE !== "heuristic";
+  let list = cands.filter(c => wantMatch ? c.match : !c.match);
+  if (!list.length) list = cands;
+  const pick = (item._tl_pick && item._tl_pick[PREVIEW_SOURCE]) || null;
+  const best = list.find(c => c.match) || list[0] || {};
+  const cur = pick ? pick.file : (best.file || "");
+  const opts = list.map(c => {
+    const q = c.product_match
+      ? "product_id"
+      : ("покрытие " + (c.covered || 0) + "/" + (c.dev_total || 0) + " DP");
+    const mark = c.match ? "✅" : "~";
+    // 13.10.2026 07:33 (аудит webui): в тултип — missing/conflicts, чтобы было видно,
+    // почему схема не совпала.
+    const _diag = (c.missing && c.missing.length ? " · нет: " + c.missing.join(",") : "")
+                + (c.conflicts && c.conflicts.length ? " · конфликт: " + c.conflicts.join(",") : "");
+    return `<option value="${escapeHtml(c.file)}"${c.file === cur ? " selected" : ""}`
+      + ` title="${escapeAttr(q + _diag)}">`
+      + `${mark} ${escapeHtml(c.name)} (${escapeHtml(c.file)}) — ${q}</option>`;
+  }).join("");
+  const hint = pick
+    ? ' <span class="muted" style="font-size:11px;">(выбран вручную)</span>'
+    : (list.length > 1
+        ? ' <span class="muted" style="font-size:11px;">(можно выбрать другой тип)</span>'
+        : "");
+  return `<div class="preview-device-row preview-tl-type-row">
+    <label class="muted" style="font-size:12px;">Тип устройства tuya-local:${hint}</label>
+    <select class="preview-tl-type" onchange="previewSetTlType(${idx}, this.value)">${opts}</select>
+  </div>`;
+}
+
+async function previewSetTlType(idx, file) {
+  const item = PREVIEW_DEVICES[idx];
+  if (!item) return;
+  const d = (item.device && item.device._cloud_ref) ? item.device._cloud_ref : {};
+  const cands = Array.isArray(d._tl_candidates) ? d._tl_candidates : [];
+  const chosen = cands.find(c => c.file === file) || { file: file, match: true };
+  const src = chosen.match ? "tuya_local" : "heuristic";
+  try {
+    const r = await fetch("/api/tuya-local/variant?file=" + encodeURIComponent(file)
+      + "&id=" + encodeURIComponent(d.id || "")
+      + "&name=" + encodeURIComponent(chosen.name || file));
+    const data = await r.json();
+    if (!data || !data.ok) {
+      alert("Не удалось получить схему типа tuya-local: "
+        + ((data && data.error) || "неизвестная ошибка"));
+      return;
+    }
+    item._tl_pick = item._tl_pick || {};
+    item._tl_pick[src] = { file: data.file, name: data.name, dps: data.dps || {} };
+    for (const dp of Object.keys(data.dps || {})) {
+      if (!(dp in item.enabled_dps)) item.enabled_dps[dp] = true;
+    }
+    renderImportPreview();
+  } catch (e) {
+    alert("Ошибка загрузки схемы типа tuya-local: " + e);
+  }
 }
 
 // v1.30.1: точечно обновить строки и RAW-блок карточки — карточка целиком
@@ -7225,7 +7634,9 @@ async function confirmImport() {
   const _toImport = [];
   for (const item of PREVIEW_DEVICES) {
     const _cr = item.device && item.device._cloud_ref;
-    if (_cr && _isCloudDeviceInConfig(_cr)) {
+    // v1.34.31 (#1167): в инженерном режиме уже добавленное устройство НЕ
+    // пропускаем — его конфиг можно полностью перезаписать (пере-импорт).
+    if (_cr && _isCloudDeviceInConfig(_cr) && !ENGINEER_MODE) {
       _skippedAlreadyInConfig.push(item);
     } else {
       _toImport.push(item);
@@ -7276,9 +7687,15 @@ async function confirmImport() {
           entry.component = _res.m.component;
         }
         // v1.28.68: зарезервированный bridge DP — фиксируем name/component.
+        // v1.34.26: фиксируем ТОЛЬКО идентичность (name/component). Раньше запись
+        // заменялась целиком (`{name, component}`) и терялись остальные поля
+        // источника — map, device_class, unit, state_class, hidden. Из-за этого
+        // повторный импорт радара «Датчик присутствия Туалет» (/api/cloud/cache
+        // для DP 101 даёт map {presence:ON, none:OFF}) приходил без map и
+        // сущность motion всегда публиковалась OFF.
         if (entry) {
           const _bf = _previewBridgeForced(item, dp, entry);
-          if (_bf) entry = { name: _bf.key, component: _bf.info.comp };
+          if (_bf) entry = Object.assign({}, entry, { name: _bf.key, component: _bf.info.comp });
           filtered_dps[dp] = entry;
         }
       }
@@ -7303,7 +7720,7 @@ async function confirmImport() {
 
     const r = await fetch("/api/import_devices", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ devices: prepared, overwrite: false })
+      body: JSON.stringify({ devices: prepared, overwrite: ENGINEER_MODE, engineer_mode: ENGINEER_MODE })
     });
     const data = await r.json();
 
@@ -7407,7 +7824,7 @@ function updateScanHint() {
   const el = document.getElementById("scan-subnet");
   const hint = document.getElementById("scan-subnet-hint");
   if (!hint) return;
-  const v = ((el && el.value) || "").trim() || "192.168.0";
+  const v = ((el && el.value) || "").trim() || "192.168.1";
   hint.textContent = `${v}.1–254`;
 }
 
@@ -7579,6 +7996,81 @@ async function doBridgeScan() {
   BRIDGE_SCAN_RUNNING = false;
   const b = document.getElementById("bridge-scan-btn");
   if (b) b.disabled = false;
+}
+
+// v1.34.8: прогон bridge-скана и вливание результатов в SCAN_RESULTS —
+// без зависимости от DOM вкладки «Скан» (для кнопки «Найти IP»).
+async function _runBridgeScan(subnet) {
+  const r = await fetch("/api/scan/bridge", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ subnet })
+  });
+  const data = await r.json();
+  if (!data.ok) throw new Error(data.error || "ошибка скана");
+  const byIp = {};
+  for (const h of SCAN_RESULTS) byIp[h.ip] = h;
+  for (const bh of (data.hosts || [])) {
+    if (byIp[bh.ip]) {
+      byIp[bh.ip].bridge = true;
+      if (bh.ms !== undefined) byIp[bh.ip].bridge_ms = bh.ms;
+      if (bh.tuya) byIp[bh.ip].tuya = bh.tuya;
+      if (bh.tuya_unknown) byIp[bh.ip].tuya_unknown = true;
+      if (bh.known === true) byIp[bh.ip].known_bridge = true;
+    } else {
+      SCAN_RESULTS.push({
+        ip: bh.ip, ms: bh.ms, bridge: true, bridge_new: true,
+        known_bridge: bh.known === true,
+        tuya: bh.tuya || null,
+        tuya_unknown: bh.tuya_unknown === true,
+      });
+    }
+  }
+  SCAN_TS = Math.floor(Date.now() / 1000);
+  SCAN_SUBNET = SCAN_SUBNET || subnet;
+  _saveScanCache();
+  return SCAN_RESULTS;
+}
+
+// v1.34.8: «🔍 Найти IP» в модалке Cloud-устройства — прогоняет скан
+// (если в кэше пусто) и ищет локальный IP по Tuya id (gwId).
+async function findCloudDeviceIp(idx) {
+  const d = CLOUD_DEVICES[idx];
+  if (!d) return;
+  const btnId = "cloud-find-ip-btn";
+  const _btn = () => document.getElementById(btnId);
+  const b0 = _btn();
+  if (b0) { b0.disabled = true; b0.textContent = "⏳ Сканирую…"; }
+  try {
+    let ip = d.ip || _scannedIpForDevice(d.id);
+    if (!ip) {
+      // v1.34.9: сначала широковещательный Tuya-discovery (отдаёт id→ip).
+      try { await _runTuyaDiscover(); } catch (e) {}
+      ip = _scannedIpForDevice(d.id);
+    }
+    if (!ip) {
+      // Фолбэк — bridge-скан сети (по gwId, если прибор ответил на пробу).
+      const subnet = _guessSubnetPrefix();
+      if (!subnet) { uiAlert("Найти IP", "Устройство не найдено в Tuya-discovery, а подсеть не определить (нет IP в конфиге и MQTT-брокере).", "warning"); return; }
+      if (BRIDGE_SCAN_RUNNING) { uiAlert("Найти IP", "Скан уже выполняется, подожди.", "warning"); return; }
+      BRIDGE_SCAN_RUNNING = true;
+      try { await _runBridgeScan(subnet); }
+      finally { BRIDGE_SCAN_RUNNING = false; }
+      ip = _scannedIpForDevice(d.id);
+    }
+    if (ip) {
+      d.ip = ip;                 // подставится при импорте
+      showCloudDevice(idx);      // перерисовка модалки — IP в строке
+      const el = _btn();
+      if (el) el.textContent = "✅ " + ip;
+    } else {
+      uiAlert("Найти IP", `Устройство «${d.name || d.id}» не найдено в скане.\nУбедись, что оно в сети, и повтори.`, "warning");
+    }
+  } catch (e) {
+    uiAlert("Найти IP", "Ошибка скана: " + e.message, "warning");
+  } finally {
+    const b2 = _btn();
+    if (b2) b2.disabled = false;
+  }
 }
 
 // ===== Tools =====
@@ -7843,7 +8335,9 @@ const HELP_TEXT = {
         <li><code>LOCK_ACQUIRE_TIMEOUT=0.05</code> — сколько секунд ждать блокировку сокета;</li>
         <li><code>MIN_CMD_INTERVAL_STREAM=0.15</code> — минимальный интервал команд для light/climate/number, сек;</li>
         <li><code>SWITCH_DEBOUNCE_MS=0</code> — дебаунс (склейка) быстрых команд switch/light:
-            первая команда уходит сразу, хвост серии — одной финальной; <code>0</code> = выключено;</li>
+            первая команда уходит сразу, окно тянется за <b>последней</b> командой серии, поэтому
+            промежуточные значения прибору не отправляются — уходит только финальное (v1.15.1);
+            <code>0</code> = выключено;</li>
         <li><code>SWITCH_DEBOUNCE_MAX_MS=1200</code> — потолок ожидания финальной команды при спаме;</li>
         <li><code>UDP_ENABLED=0</code> — пассивный UDP-детектор вещаний Tuya (порт 6667):
             прибор считается живым, пока вещает; <code>0</code> = выключено (v1.14.0);</li>
@@ -7852,6 +8346,25 @@ const HELP_TEXT = {
         <li><code>UDP_NO_TCP_MAX_CYCLES=3</code> — потолок продления offline при живом UDP (против «вечного online»);</li>
         <li><code>UDP_RECONNECT_COOLDOWN=120</code> — минимальный интервал форс-реконнекта TCP, сек;</li>
         <li><code>MIN_CMD_INTERVAL_SWITCH=0</code> — то же для switch/select (без ограничения);</li>
+        <li><code>TUYA_MAX_QUEUE_DEPTH=10</code> — страховочный потолок очереди команд на прибор
+            (v1.15.1: очередь работает как «последнее значение» на пару <b>прибор + DP</b> —
+            старые значения вытесняются, новая команда не теряется; при нештатном переполнении
+            пишется warning); <code>0</code> = выключено;</li>
+        <li><code>TUYA_CMD_DEDUP_WINDOW_MS=200</code> — дедуп идентичных команд в окне, мс
+            (лог дедупа на DEBUG); <code>0</code> = выключено;</li>
+        <li><code>TUYA_SEND_PER_DEVICE_MS=0</code> — пейсинг отправки <strong>по прибору</strong> вместо
+            общего <code>GLOBAL_SEND_LOCK</code>, мс — медленный прибор не тормозит остальные;
+            <code>0</code> = прежний глобальный режим;</li>
+        <li><code>TUYA_TRACK_TTL_SEC=10</code>, <code>TUYA_TRACK_RETRY_SEC=3</code>,
+            <code>TUYA_TRACK_BACKOFF=1.7</code>, <code>TUYA_TRACK_RETRY_MAX=3</code> — окно
+            подтверждения команды и повторы: пока прибор не подтвердил, состояние помечается
+            <code>pending</code>, повтор идёт с нарастающей паузой;</li>
+        <li><b>Наблюдаемость команд</b> (v1.15.x): retained-топики <code>tuya/bridge/cmd_stats</code>
+            (<code>slot_pending</code>, <code>superseded</code>, <code>overflow</code>,
+            <code>retry_skipped</code>, <code>queue_depth_max</code>) и
+            <code>tuya/bridge/cmd_ack</code> (отклик «команда → отчёт» и текущее окно защиты от
+            «эха»); в логе — <code>[SlowCmd]</code> WARNING, если отправка в прибор заняла больше
+            секунды (v1.15.3: погашены встроенные повторы tinytuya, которые держали лок 10–15 с);</li>
         <li><code>DEBOUNCE_BY_TYPE</code> — окна дебаунса команд по типу устройства (гасят дребезг);</li>
         <li><code>REPEAT_RESET_SECONDS=120</code> — через сколько секунд сбрасывать счётчики повторов 914/905;</li>
         <li><code>CLEANUP_DISCOVERY=0</code> — <code>1</code> — очистить Discovery при старте;</li>
@@ -8163,6 +8676,26 @@ const HELP_TEXT = {
             к низу окна; <b>справка «MQTT-топики»</b> — полный список <code>*_result</code>
             и retained-топик <code>cmd_ack</code>; <b>доступность</b> — все поля связаны
             с подписями.</li>
+      </ul>
+      <h3>Релиз 1.5 — мост 1.13 → 1.15.4, WebUI 1.33.23 → 1.34.42</h3>
+      <ul>
+        <li><b>Устранён «залип» устройств</b> (1.15.3): команда могла стоять под внутренним локом
+            10–15 с — встроенные повторы tinytuya (таймаут сокета 0.3 с) не отпускали лок. Теперь
+            отправка занимает 49–97 мс, а полный путь «команда → подтверждение прибора» —
+            300–500 мс (было 10 000–15 000 мс);</li>
+        <li><b>Очередь команд — «последнее намерение»</b> (1.15.1): вместо FIFO, из которой при
+            переполнении выбрасывалась <b>новая</b> команда, — слот на пару прибор + DP. При спаме
+            старые значения вытесняются, финальное доезжает всегда, переполнение невозможно;</li>
+        <li><b>Дебаунс не отправляет устаревшее</b> (1.15.1): окно тянется за последней командой
+            серии, промежуточные ON/OFF прибору не уходят — после шторма лампа не «мигает»;</li>
+        <li><b>Ретраи не забивают очередь</b> (1.15.1): если у прибора есть неотправленная команда
+            пользователя, повтор пропускается (счётчик <code>retry_skipped</code>);</li>
+        <li><b>Сторож медленных отправок</b> (1.15.3/1.15.4): <code>[SlowCmd]</code> WARNING при
+            отправке дольше секунды — «залип» больше не спрячется; диагностические метки убраны в DEBUG;</li>
+        <li><b>Наблюдаемость и справка</b>: retained-топики <code>tuya/bridge/cmd_stats</code> и
+            <code>tuya/bridge/cmd_ack</code>, новые регуляторы очереди и трекера — в разделе
+            «Переменные окружения bridge»;</li>
+        <li><b>WebUI 1.34.42</b>: обновлён раздел справки под релиз 1.5.</li>
       </ul>`,
     overview: `
       <h3>Что такое WebUI</h3>
@@ -8408,6 +8941,9 @@ const HELP_TEXT = {
       <ul>
         <li><code>WEBUI_PORT=5386</code> — HTTP-порт WebUI;</li>
         <li><code>WEBUI_HOST=0.0.0.0</code> — адрес прослушивания;</li>
+        <li><code>RELEASE_TAG=1.5</code> — публичный номер релиза: подвал «Release X» и проверка на
+            GitHub, нет ли версии новее (значение от внутренней <code>WEBUI_VERSION</code> намеренно
+            отличается — публичные теги нумеруются сами по себе);</li>
         <li><code>ANALYTICS_ENABLED</code> — включает полную аналитику (задержки, хронология, мерцания);</li>
         <li><code>STATUS_HISTORY_ENABLED</code> — минимальная история (события и задержки) без полной аналитики;</li>
         <li><code>BRIDGE_STARTUP_GRACE_SEC=60</code> — сколько секунд после старта bridge игнорировать online/offline;</li>
@@ -10104,7 +10640,7 @@ function _dpsRenderSection(d) {
       <th class="col-type">Тип</th>
       <th class="col-values">Значения</th>
       <th class="col-current">Текущее</th>
-      <th class="col-src"></th>
+      <th class="col-src">Источник</th>
       <th class="col-act"></th>
     </tr></thead><tbody>`;
     for (const row of rows1) {
@@ -10120,11 +10656,15 @@ function _dpsRenderSection(d) {
 
       // v1.28.68: зарезервированные bridge DP — только просмотр (🔒).
       const _bfRow = _bridgeForcedInfo(code, code);
-      const btnEdit = _bfRow
+      // v1.34.31 (#1167): в инженерном режиме зарезервированный DP тоже редактируем.
+      // v1.34.33 (#1167, баг-3): в инженерном режиме «добавленный» DP всегда
+      // открывается на правку (✏️), а не «только просмотр» (👁).
+      const _rowEditable = editMode || ENGINEER_MODE;
+      const btnEdit = (_bfRow && !ENGINEER_MODE)
         ? `<button onclick="dpsViewDp('${escapeAttr(dp)}')" title="Зарезервировано bridge (${escapeAttr(_bfRow.why)}) — только просмотр">🔒</button>`
         : (isAdded
             ? `<button onclick="dpsEditAdded('${escapeAttr(dp)}')" title="Редактировать">✏️</button>`
-            : (editMode
+            : (_rowEditable
                 ? `<button onclick="dpsEditOld('${escapeAttr(dp)}')" title="Редактировать">✏️</button>`
                 : `<button onclick="dpsViewDp('${escapeAttr(dp)}')" title="Просмотр">👁</button>`));
       const btnRevert = isModified
@@ -10155,7 +10695,7 @@ function _dpsRenderSection(d) {
         <td class="col-type">${_typeCell}</td>
         <td class="col-values">${_valuesCell}</td>
         <td class="col-current">${_curCell}</td>
-        <td class="col-src"></td>
+        <td class="col-src">${_dpsSrcBadgeCell(info._dps_source || info._name_source || "")}</td>
         <td class="col-act dps-actions">${btnEdit}${btnRevert}${btnRemove}</td>
       </tr>`;
     }
@@ -10195,7 +10735,10 @@ function _dpsRenderSection(d) {
       // v1.28.70: модалку «Добавить» показываем только ненадёжным
       // источникам (нет сопоставления / эвристика). cloud/tuya-local/similar
       // добавляются сразу.
-      const needsFill = !_isTrustedSource(src) && src !== "removed";
+      // v1.34.34 (#1169): у 🔒 bridge-forced DP выбор источника обязателен —
+      // показываем модалку с превью источников, а не молчаливый «первый».
+      const _bfRow2 = _bridgeForcedInfo(info.name || code, code);
+      const needsFill = src !== "removed" && (_bfRow2 || !_isTrustedSource(src));
       // v1.28.33.fixup5b: 6 групп источника + fallback ❓ unknown.
       // Приоритет: cloud → tuya_local → similar → cache_only
       // → config_only → heuristic → unknown.
@@ -10250,7 +10793,7 @@ function _dpsRenderSection(d) {
       const addBtn = (src === "removed")
         ? `<button onclick="dpsMoveIn('${escapeAttr(dp)}')" title="Вернуть в конфиг">↩️</button>`
         : needsFill
-          ? `<button onclick="dpsOpenFillModal('${escapeAttr(dp)}')" title="Нет надёжного сопоставления — проверьте поля">➕</button>`
+          ? `<button onclick="dpsOpenFillModal('${escapeAttr(dp)}')" title="${_bfRow2 ? "Bridge-forced DP — выберите источник (с превью)" : "Нет надёжного сопоставления — проверьте поля"}">➕</button>`
           : `<button onclick="dpsMoveIn('${escapeAttr(dp)}')" title="Добавить в конфиг">➕</button>`;
       const _translate2 = _dpTranslateCell(code, "", (info.name || ""));
       // v1.28.35: единый порядок; источник — в бейдже «Источник».
@@ -10370,7 +10913,9 @@ function dpsEditAdded(dp) {
 
 function dpsEditOld(dp) {
   // v1.27.1: редактировать старый (только при _editMode === true).
-  if (!DPS_EDIT || !DPS_EDIT._editMode) return;
+  // v1.34.33 (#1167, баг-3): в ручном инженерном режиме тумблер
+  // «Режим редактирования» не нужен — правим и без него.
+  if (!DPS_EDIT || !(DPS_EDIT._editMode || ENGINEER_MODE)) return;
   dpsOpenFillModal(dp, "edit");
 }
 
@@ -10453,6 +10998,10 @@ function dpsMoveIn(dp) {
         for (const [k, v] of Object.entries(_info)) {
           if (!k.startsWith("_")) _clean[k] = v;
         }
+        // v1.34.37: `_dps_source` нужен ТОЛЬКО бейджу «Источник» в списке
+        // (рендер читает info._dps_source/_name_source). В payload он не попадёт:
+        // `_cleanDpInfo` срезает все `_`-поля.
+        _clean._dps_source = (_disc && _disc.source) || "";
         DPS_EDIT._added.push({ dp, info: _clean, source: (_disc && _disc.source) || "" });
       }
     }
@@ -10479,6 +11028,7 @@ function dpsMoveIn(dp) {
       if (!k.startsWith("_")) _clean[k] = v;
     }
     if (!DPS_EDIT._added.some(a => a.dp === dp)) {
+      _clean._dps_source = disc.source;  // v1.34.37: бейдж «Источник» (в payload не идёт)
       DPS_EDIT._added.push({ dp, info: _clean, source: disc.source });
     }
     dpsRenderSection();
@@ -10561,6 +11111,12 @@ const _BRIDGE_FORCED_NAMES = {
   "moisture":    { cloud: "watersensor_state", comp: "binary_sensor", why: "HA device_class=moisture" },
 };
 
+// v1.34.35 (#1169-баг-6, заказчик): ключ bridge-forced DP, чья модалка сейчас
+// открыта. Нужен валидации Code: СВОЙ зарезервированный DP добавлять можно —
+// иначе в обычном (не инженерном) режиме «➕» по «motion» всегда падал
+// «Имя 'motion' зарезервировано bridge (HA MQTT). Используйте другое.».
+let _DPS_FILL_BF_KEY = null;
+
 // true, если name — bridge-forced для данного component.
 function _isBridgeForcedName(name, comp) {
   const info = _BRIDGE_FORCED_NAMES[name];
@@ -10598,6 +11154,8 @@ function _bridgeForcedInfo(name, code) {
 //   err  — блокирующая (regex, длина, дубликат, bridge-forced).
 //   warn — облачный code отличается (можно продолжить).
 function _validateDpCode(code, component, currentDp) {
+  // v1.34.31 (#1167): ручной инженерный режим — валидации Code отключены.
+  if (ENGINEER_MODE) return { level: "ok", msg: "" };
   const c = String(code || "").trim();
   if (!c) return { level: "err", msg: "Code обязателен" };
   if (c.length > 100) return { level: "err", msg: "Code слишком длинный (макс 100)" };
@@ -10611,7 +11169,9 @@ function _validateDpCode(code, component, currentDp) {
     return { level: "err", msg: "Code: только A-Z, a-z, 0-9, _, -" };
   }
   // bridge-forced name? — блок, если это НЕ текущий DP
-  if (_BRIDGE_FORCED_NAMES[c]) {
+  // v1.34.35 (#1169-баг-6): сам bridge-forced DP добавляется СВОИМ
+  // зарезервированным именем — это штатное добавление, не коллизия.
+  if (_BRIDGE_FORCED_NAMES[c] && _DPS_FILL_BF_KEY !== c) {
     return { level: "err", msg: "Имя '" + c + "' зарезервировано bridge (HA MQTT). Используйте другое." };
   }
   // v1.28.68: имена системных сущностей Discovery (RESERVED_DP_NAMES).
@@ -10690,6 +11250,7 @@ async function dpsJunkConfirm(dp, code) {
     return;
   }
   if (!info.name) info.name = info.code;
+  info._dps_source = (disc && disc.source) || "";  // v1.34.37: бейдж «Источник»
   DPS_EDIT._added.push({ dp, info, source: (disc && disc.source) || "" });
   dpsRenderSection();
 }
@@ -10732,6 +11293,20 @@ function _cleanDpInfo(info) {
   for (const [k, v] of Object.entries(info || {})) {
     if (!k.startsWith("_")) out[k] = v;
   }
+  // v1.34.36 (#1170-3 заказчика): в старых конфигах варианты select лежат в
+  // values.range/range, а мост (dps_map/apply → _validate_dps_map, main.py:1934)
+  // требует непустой `options` и ОТКЛОНЯЕТ всю карту («invalid dps_map: dp 9:
+  // select requires non-empty options list»). Из-за этого не сохранялось ничего,
+  // включая map добавленного DP. Нормализуем на выходе: options из легаси-поля.
+  if (out.component === "select") {
+    const _o = out.options;
+    if (!Array.isArray(_o) || _o.length === 0) {
+      const _v = (out.values && typeof out.values === "object") ? out.values : {};
+      const _r = Array.isArray(_v.range) ? _v.range
+        : (Array.isArray(out.range) ? out.range : null);
+      if (_r && _r.length) out.options = _r.slice();
+    }
+  }
   return out;
 }
 
@@ -10752,6 +11327,8 @@ function dpsBuildFinalMap() {
 
 function dpsOpenPreview() {
   if (!DPS_EDIT) return;
+  // v1.34.25: привести кнопку «✅» в шапке окна к текущему режиму проверки.
+  _dpsValidateSyncBtn();
   // v1.28.33.fixup2: если ничего не изменилось — не открываем
   // превью (защита от случайного клика «Сохранить»).
   if (!dpsIsDirty()) {
@@ -10826,10 +11403,76 @@ const _COMPS_ALLOWED = new Set([
   "cover","fan",
 ]);
 
+// v1.34.25: проверка превью apply — теперь ОТКЛЮЧАЕМАЯ кнопкой «✅» слева
+// в шапке окна превью. По умолчанию ВКЛЮЧЕНА, выбор запоминается в браузере.
+// Выключил — окно не показывает «Проблемы» и не блокирует «Применить»
+// (мост всё равно валидирует конфиг сам и вернёт ошибку, если что-то не так).
+let _dpsValidateOn = true;
+try {
+  const _savedValidate = localStorage.getItem("dpsValidateOn");
+  if (_savedValidate !== null) _dpsValidateOn = (_savedValidate !== "0");
+} catch (e) { /* приватный режим — остаёмся на «включено» */ }
+
+// v1.34.31 (#1167): Ручной инженерный режим. Отключает ВСЕ валидации при
+// редактировании DP и настроек конфига (клиент + мост). Метки 🔒 остаются
+// видимыми, но поля свободно редактируемы. Также разрешает полную перезапись
+// конфига уже добавленного устройства через «Превью импорта».
+// Выбор запоминается в браузере; флаг уходит и в мост (engineer_mode).
+let ENGINEER_MODE = false;
+try {
+  ENGINEER_MODE = (localStorage.getItem("tuya_webui_engineer_mode") === "1");
+} catch (e) { /* приватный режим */ }
+
+function _engineerModeSyncUI() {
+  const cb = document.getElementById("engineer-mode-toggle");
+  if (cb) cb.checked = ENGINEER_MODE;
+  const hint = document.getElementById("engineer-mode-hint");
+  if (hint) hint.style.display = ENGINEER_MODE ? "block" : "none";
+}
+
+function setEngineerMode(on) {
+  ENGINEER_MODE = !!on;
+  try {
+    localStorage.setItem("tuya_webui_engineer_mode", ENGINEER_MODE ? "1" : "0");
+  } catch (e) {}
+  _engineerModeSyncUI();
+  // Перерисовать открытое превью импорта, если оно открыто.
+  try {
+    const _pv = document.getElementById("preview-overlay");
+    if (_pv && _pv.classList.contains("open")
+        && typeof renderImportPreview === "function") renderImportPreview();
+  } catch (e) {}
+}
+
+function toggleEngineerMode(on) { setEngineerMode(on); }
+_engineerModeSyncUI();
+
+function _dpsValidateSyncBtn() {
+  const b = document.getElementById("dps-validate-toggle");
+  if (!b) return;
+  b.classList.toggle("off", !_dpsValidateOn);
+  b.style.opacity = _dpsValidateOn ? "0.95" : "0.4";
+  b.style.filter = _dpsValidateOn ? "none" : "grayscale(1)";
+  b.setAttribute("aria-pressed", _dpsValidateOn ? "true" : "false");
+  b.title = _dpsValidateOn
+    ? "Проверка DP включена — нажмите, чтобы выключить"
+    : "Проверка DP выключена — нажмите, чтобы включить";
+}
+
+function toggleDpsValidate() {
+  _dpsValidateOn = !_dpsValidateOn;
+  try { localStorage.setItem("dpsValidateOn", _dpsValidateOn ? "1" : "0"); } catch (e) {}
+  _dpsValidateSyncBtn();
+  dpsOpenPreview();   // перерисовать превью с новым режимом
+}
+
 // v1.27.1: пре-валидация финальной карты (зеркало bridge _validate_dps_map).
 function _dpsPreValidate(finalMap) {
   const issues = [];
   const seen = new Set();
+  // v1.34.26: кнопка «✅» — проверку можно выключить (см. выше).
+  // v1.34.31 (#1167): в ручном инженерном режиме проверка тоже выключена.
+  if (!_dpsValidateOn || ENGINEER_MODE) return issues;
   // v1.28.32: bridge не принимает пустой dps_map (_validate_dps_map).
   // Ловим это ДО отправки, чтобы пользователь увидел проблему
   // в превью apply, а не получил ошибку от bridge.
@@ -10863,6 +11506,28 @@ function _dpsPreValidate(finalMap) {
     if (info.scale !== undefined) {
       if (typeof info.scale !== "number" || info.scale < 0 || !Number.isInteger(info.scale)) {
         issues.push({dp, msg: "scale: целое >= 0"});
+      }
+    }
+    // v1.34.26: map — зеркало bridge _validate_dps_map: binary_sensor → значения
+    // строго ON/OFF; select → ключи должны быть из options.
+    if (info.map !== undefined && info.map !== null) {
+      if (typeof info.map !== "object" || Array.isArray(info.map)) {
+        issues.push({dp, msg: "map: нужен объект {raw: состояние}"});
+      } else if (comp === "binary_sensor") {
+        for (const [mk, mv] of Object.entries(info.map)) {
+          if (mv !== "ON" && mv !== "OFF") {
+            issues.push({dp, msg: "map['" + mk + "']: только 'ON'/'OFF'"});
+            break;
+          }
+        }
+      } else if (comp === "select") {
+        const _opts = Array.isArray(info.options) ? info.options : [];
+        for (const mk of Object.keys(info.map)) {
+          if (!_opts.includes(mk)) {
+            issues.push({dp, msg: "map['" + mk + "']: нет в options"});
+            break;
+          }
+        }
       }
     }
     // v1.27.10: light — name только из LIGHT_DP_NAMES_FRONT
@@ -10932,7 +11597,7 @@ async function dpsConfirmApply() {
     const r = await fetch(`/api/device/${encodeURIComponent(devName)}/dps_map/apply`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dps_map: finalMap }),
+      body: JSON.stringify({ dps_map: finalMap, engineer_mode: ENGINEER_MODE }),
     });
     const data = await r.json();
     if (data.ok) {
@@ -11033,16 +11698,22 @@ function _isNumberCode(code) {
 
 // v1.27.1: список device_class из DEVICE_CLASSES_ALLOWED (bridge 1.8.5).
 // Используется для datalist — подсказки, но не жёсткого ограничения.
+// v1.34.25 (жалоба заказчика): список разошёлся с мостом — не было `distance`
+// (и cover-классов), из-за чего превью apply ругалось «device_class 'distance'
+// не из белого списка» на валидный конфиг tuya-local. Держим ЗЕРКАЛОМ моста:
+// main.py DEVICE_CLASSES_ALLOWED (+ COVER_DEVICE_CLASSES_ALLOWED).
 const _DC_ALLOWED = [
   // sensor
   "temperature","humidity","battery","energy","power","current",
   "voltage","frequency","power_factor","illuminance","pressure",
-  "signal_strength","timestamp","duration",
+  "signal_strength","timestamp","duration","distance",
   // binary_sensor
   "problem","door","motion","moisture","smoke","gas","light",
   "opening","window","garage_door","lock","presence","running",
   "plug","sound","vibration","update","connectivity","tamper",
   "heat","cold","moving","occupancy","safety",
+  // cover
+  "curtain","blind","shade","shutter","garage","gate","awning","damper",
 ];
 const _SC_ALLOWED = ["measurement","total","total_increasing"];
 const _LIGHT_DP_NAMES_FRONT = [
@@ -11130,6 +11801,10 @@ let _dpsFillDp = null;
 let _dpsFillMode = "add";   // "add" | "edit" | "view"
 let _dpsFillDirty = false;
 let _dpsFillSource = "";    // v1.28.66: выбранный источник ("" = не выбран)
+// v1.34.26: база записи DP — то, что реально уйдёт в конфиг (см. _dpsFillBaseClean).
+// Форма перекрывает только СВОИ поля; остальные (map, values, role, ...) сохраняются,
+// иначе любое сохранение DP молча теряло поля, которых нет в форме.
+let _dpsFillBase = null;
 let _dpsFillOrigSnapshot = null;  // v1.28.75: снимок DOM-полей формы (объект)
 let _dpsFillValidateTimer = null;
 
@@ -11143,9 +11818,73 @@ function dpsFillToggleSource(src) {
 
 // v1.28.66: короткий ярлык источника для кнопок.
 function _srcLabelRu(s) {
-  const m = { cloud: "☁ Cloud", tuya_local: "📚 tuya-local", similar: "🔗 similar",
-              local_db: "📦 Локальная база", heuristic: "⚠️ Эвристика" };
+  const m = { cloud: "☁ Cloud", tuya_local: "📚 tuya-local",
+              similar: "🔗 похожее устройство", local_db: "📦 Локальная база",
+              heuristic: "⚠️ Эвристика", cache: "📦 Кэш", auto: "✨ Авто" };
   return m[s] || s;
+}
+
+// v1.34.34 (#1169, заказчик): превью источников в модалке DP — что подставит
+// каждый источник (component/name/device_class/unit/state_class/map), чтобы
+// выбрать осознанно, а не «первый доступный». Для 🔒 bridge-forced идентичность
+// (name/component) задаёт мост — источник наполняет только прочие поля.
+// v1.34.35 (#1169-баг-6, заказчик): раскрытие превью — ТОЛЬКО вручную.
+// Раньше блок рендерился «open», пока источник не выбран, и раскрывался сам
+// при снятии выбора/перерисовке модалки. Теперь состояние живёт в _srcPrevOpen
+// и переживает перерисовку.
+let _srcPrevOpen = false;
+function _srcPrevToggle(open) { _srcPrevOpen = !!open; }
+function _srcPreviewHtml(sources, candBase, selected) {
+  if (!sources || sources.length < 1) return "";
+  const _cell = (v) => (v === undefined || v === null || v === "")
+    ? '<span class="muted">—</span>' : escapeHtml(String(v));
+  const rows = sources.map(s => {
+    const c = candBase[s] || {};
+    let _map = "—";
+    const _mv = (c.map && typeof c.map === "object" && Object.keys(c.map).length)
+      ? c.map
+      : ((c.values && typeof c.values === "object" && Object.keys(c.values).length) ? c.values : null);
+    if (_mv) { try { _map = escapeHtml(JSON.stringify(_mv)); } catch (e) { _map = "—"; } }
+    const _on = (s === selected);
+    return `<tr${_on ? ' style="background:rgba(3,102,214,0.10);"' : ""}>`
+      + `<td><strong>${escapeHtml(_srcLabelRu(s))}${_on ? " ✅" : ""}</strong></td>`
+      + `<td>${_cell(c.component)}</td>`
+      + `<td>${_cell(c.name || c.code)}</td>`
+      + `<td>${_cell(c.device_class)}</td>`
+      + `<td>${_cell(c.unit || c.unit_of_measurement)}</td>`
+      + `<td>${_cell(c.state_class)}</td>`
+      + `<td style="max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"`
+      + ` title="${escapeAttr(_map)}">${_map}</td></tr>`;
+  }).join("");
+  return `<details class="dps-fill-ref" style="margin-top:6px;"${_srcPrevOpen ? " open" : ""}`
+    + ` ontoggle="_srcPrevToggle(this.open)">`
+    + `<summary class="muted">▶ Превью источников — что подставит каждый`
+    + `<span class="muted" style="font-size:11px; margin-left:6px;">раскрывается только вручную</span></summary>`
+    + `<div class="dps-src-prev-scroll"><table class="detail-table" style="font-size:12px; margin-bottom:6px;">`
+    + `<thead><tr><th>Источник</th><th>component</th><th>name/code</th>`
+    + `<th>device_class</th><th>unit</th><th>state_class</th><th>map/values</th></tr></thead>`
+    + `<tbody>${rows}</tbody></table></div>`
+    + `<div class="dps-fill-hint" style="margin-top:4px;">Для 🔒 bridge-forced DP `
+    + `name/component фиксирует мост — источник наполняет map/device_class/unit/state_class.</div>`
+    + `</details>`;
+}
+
+// v1.34.28: единые словари источников DP (иконка/подпись) — раньше были разрознь
+// по ~7 локальным словарям и рассинхронизировались (аудит 13.10.2026 07:33: cache/
+// heuristic/auto пропадали, similar не был переведён).
+const SRC_ICON = { cloud: "☁", tuya_local: "📚", local_db: "📦", similar: "🔗",
+                   cache: "📦", cache_only: "❔", config_only: "⚙️", removed: "🗑",
+                   heuristic: "⚠️", unknown: "❓", dict: "📖", cn: "🈶", auto: "✨" };
+const SRC_LABEL = { cloud: "Cloud", tuya_local: "tuya-local", local_db: "Локальная база",
+                    similar: "похожее устройство", cache: "кэш bridge",
+                    cache_only: "нет сопоставления", config_only: "из конфига",
+                    removed: "удалён", heuristic: "Эвристика", unknown: "не определён",
+                    dict: "словарь кодов", cn: "словарь CN", auto: "авто" };
+// Бейдж-ячейка «Источник» для таблицы «На устройстве».
+function _dpsSrcBadgeCell(src) {
+  const icon = SRC_ICON[src];
+  if (!icon) return '<span class="muted">—</span>';
+  return `<span title="${escapeAttr(SRC_LABEL[src] || src)}">${icon}</span>`;
 }
 
 // v1.28.69: честная причина сопоставления (одна строка, без дублирования).
@@ -11157,7 +11896,7 @@ function _srcReasonText(src, entry) {
   if (s === "local_db")   return "локальная база tinytuya_devices.json";
   if (s === "similar")    return "такое же устройство (тот же product_id)";
   if (s === "cache")      return "нет сопоставления — только значение из кэша bridge";
-  if (s === "heuristic")  return "компонент угадан по имени/значению";
+  if (s === "heuristic")  return "схема подобрана по похожему устройству (совпадение DP)";
   return s;
 }
 
@@ -11209,6 +11948,7 @@ function _dpsFillFieldLabel(id) {
     "dps-fill-max": "max",
     "dps-fill-step": "step",
     "dps-fill-options": "options",
+    "dps-fill-map": "map",
   };
   return m[id] || id.replace("dps-fill-", "");
 }
@@ -11310,6 +12050,10 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
   if (!DPS_EDIT) return;
   _dpsFillDp = dp;
   _dpsFillMode = mode || "add";
+  // v1.34.33 (#1167, баг-3 заказчика 13.10.2026 18:00): в ручном инженерном режиме
+  // «просмотр» DP приравниваем к правке — иначе у уже добавленного DP форма
+  // «только просмотр» без кнопки «Сохранить» (скриншот: «DP 1 — только просмотр»).
+  if (_dpsFillMode === "view" && ENGINEER_MODE) _dpsFillMode = "edit";
   if (!keepDirty) { _dpsFillDirty = false; _dpsFillSource = ""; }
 
   // Приоритет источников: _added → _modified → _on_device → _discovered.
@@ -11344,11 +12088,17 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
     || _bridgeForcedKey(_rawCloudCode, _rawName);   // cloud-code ∈ .cloud (mode→preset_mode)
   const _bridgeForced = !!_bfKey;
   const _bfInfo = _bridgeForced ? _BRIDGE_FORCED_NAMES[_bfKey] : null;
-  if (_bridgeForced) _dpsFillSource = "";     // RO: источник не применяем
+  // v1.34.35 (#1169-баг-6): сообщаем валидации Code, какой bridge-forced DP
+  // сейчас открыт в модалке — его собственное имя не считается коллизией.
+  _DPS_FILL_BF_KEY = _bfKey || null;
+  // (v1.34.26: раньше здесь было `_dpsFillSource = ""` — источник сбрасывался
+  // для bridge-forced DP, и разрешённые поля источника (map/device_class/…)
+  // не подставлялись. Теперь источник применяется, а identity фиксируется ниже.)
 
   // v1.28.58: кандидаты источников — выбор источника в форме.
-  // v1.28.59: всегда добавляем «эвристику», чтобы выбор был даже если
-  // Cloud/tuya-local дают только один вариант.
+  // v1.34.20: «эвристику» здесь больше не досочиняем — источник
+  // «⚠️ Эвристика» (подбор похожей схемы) приходит кандидатом с сервера,
+  // если подбор есть; нет подбора — нет и источника.
   const _candBase = Object.assign({},
     (info && info._dps_candidates)
     || (discRec && discRec.info && discRec.info._dps_candidates) || {});
@@ -11359,19 +12109,10 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
   if (_baseSrc && !_candBase[_baseSrc] && info && Object.keys(info).length) {
     _candBase[_baseSrc] = Object.assign({}, info);
   }
-  const _hCode = (discRec && discRec.cloud_meta && discRec.cloud_meta.code)
-    || info.code || info.name || "";
-  if (_hCode && !_candBase.heuristic) {
-    // v1.28.67: component угадываем по Cloud-type; если Cloud молчит —
-    // по значению и code (раньше всегда получался sensor).
-    const _hComp = (discRec && discRec.cloud_meta && discRec.cloud_meta.type)
-      ? _dpsCompFromCloudType(discRec.cloud_meta.type, _hCode, undefined, _devTypeSafe())
-      : _dpsGuessComponent(_hCode, val);
-    const _hMeta = _dpsHeuristicMeta(_hCode, _hComp);
-    const _hEntry = Object.assign({ component: _hComp, name: _hCode }, _hMeta);
-    _hEntry._meta_guess = Object.keys(_hMeta);
-    _candBase.heuristic = _hEntry;
-  }
+  // v1.34.20: «⚠️ Эвристика» больше НЕ угадывает component по имени/значению
+  // (это был мёртвый функционал). Теперь это подбор похожей схемы по
+  // совпадению номеров DP — приходит с сервера кандидатом
+  // _dps_candidates.heuristic. Нет серверного подбора — нет и источника.
   // v1.28.69: кандидат «cache» из источников убран — он не «берёт из кэша»,
   // а угадывал component по значению (это эвристика, не источник).
   // Значение и так видно строкой «Значение с устройства».
@@ -11390,8 +12131,23 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
   if (_dpsFillSource && !_sources.includes(_dpsFillSource)) _dpsFillSource = "";
   if (_dpsFillSource) {
     const _c = _candBase[_dpsFillSource];
-    if (_c && typeof _c === "object") info = Object.assign({}, info, _c);
+    if (_c && typeof _c === "object") {
+      if (_bridgeForced) {
+        // v1.34.26: identity за мостом — из источника берём только «прочие»
+        // поля (map/device_class/unit/state_class/hidden), не подменяя
+        // component/name (иначе кандидат local_db сделал бы из motion switch).
+        const _c2 = Object.assign({}, _c);
+        delete _c2.component; delete _c2.name; delete _c2.code;
+        info = Object.assign({}, info, _c2);
+      } else {
+        info = Object.assign({}, info, _c);
+      }
+    }
   }
+
+  // v1.34.26: база для submit — запись «как уйдёт в конфиг», если форму не править.
+  // Благодаря ей сохраняются поля, которых нет в форме (map, values, role, ...).
+  _dpsFillBase = Object.assign({}, info);
 
   const cloudMeta = discRec ? discRec.cloud_meta : null;
 
@@ -11462,6 +12218,10 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
   }
   const hasCloudOptions = Array.isArray(cvals.range) && cvals.range.length > 0;
 
+  // v1.34.26: map (raw → ON/OFF) — поле конфига моста (select/binary_sensor).
+  const preMap = (info.map && typeof info.map === "object" && !Array.isArray(info.map))
+    ? JSON.stringify(info.map) : "";
+
   // v1.28.69: одна честная подсказка про источник сопоставления.
   // Раньше склеивались «Источник: X» + причина от другого источника +
   // «Component из Cloud-mapping» — и путали.
@@ -11486,7 +12246,10 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
       ? "🔒 Bridge зарезервировал «" + _bfKey + "» (" + _bfInfo.why
         + ") — имя и компонент фиксированы."
       : "🔒 Bridge зарезервировал «" + _bfKey + "» (" + _bfInfo.why
-        + "). Изменять нельзя: ошиблись — удалите DP и добавьте заново.");
+        + "). Изменять нельзя: ошиблись — удалите DP и добавьте заново.")
+      // v1.34.26: источник для такого DP разрешён — он подставляет не
+      // идентичность, а остальные поля (map, device_class, unit, hidden).
+      + " Источник (например 📚 tuya-local) подставит остальные поля — map, device_class и т.п.";
   } else if (!_effSrc) {
     hint = "Поля «как есть». Выбери источник — подставятся его компонент и тип.";
   } else if (_effSrc === "heuristic") {
@@ -11527,7 +12290,7 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
 
   // v1.28.68: bridge-forced DP — все поля только для чтения; добавлять
   // зарезервированный DP можно, но с фиксированными name/component.
-  const disAttr = (isView || _bridgeForced) ? "disabled" : "";
+  const disAttr = (isView || (_bridgeForced && !ENGINEER_MODE)) ? "disabled" : "";
 
   // Кнопка submit
   let submitLabel = "Добавить";
@@ -11543,8 +12306,8 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
   }
 
   let html = `<p class="muted" style="margin-top:0;font-size:12px;">DP ${escapeHtml(dp)}</p>    <div class="dps-fill-hint">${escapeHtml(hint)}</div>
-    ${(!_bridgeForced && _sources.length >= 1) ? `<div class="form-group">
-      <label>Источник сопоставления</label>
+    ${(_sources.length >= 1) ? `<div class="form-group">
+      <label style="cursor:default;" onclick="event.preventDefault();">Источник сопоставления</label>
       <div class="src-btns">
         ${_sources.map(s => {
           const _c = _candBase[s] || {};
@@ -11554,12 +12317,13 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
         }).join("")}
       </div>
       <div class="dps-fill-hint" style="margin-top:4px;">Клик по источнику подставит его поля; повторный клик — снять выбор.</div>
+      ${_srcPreviewHtml(_sources, _candBase, _dpsFillSource)}
     </div>` : ""}
 
     <div class="form-group">
       <label>Code * ${_bridgeForced ? '<span class="badge-locked" data-tip="' + escapeAttr("Bridge-forced: облако '" + _bfInfo.cloud + "' → '" + preName + "' для " + _bfInfo.why + ". Изменить нельзя.") + '">🔒</span>' : ''}</label>
       <input id="dps-fill-code" type="text" value="${escapeAttr(preCode)}"
-             placeholder="например temp_correction" ${_bridgeForced ? "disabled" : disAttr}
+             placeholder="например temp_correction" ${(_bridgeForced && !ENGINEER_MODE) ? "disabled" : disAttr}
              oninput="_dpsFillMarkDirty(); dpsFillValidateCodeLive()"
              onblur="dpsFillValidateCode(true)">
       <div id="dps-fill-code-err" class="dps-fill-warn-msg" style="display:none;"></div>
@@ -11569,7 +12333,7 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
 
     <div class="form-group">
       <label>Component * ${_bridgeForced ? '<span class="badge-locked" data-tip="' + escapeAttr("Bridge-forced: облако '" + _bfInfo.cloud + "' → '" + preName + "' (" + _bfInfo.why + "). Компонент изменить нельзя.") + '">🔒</span>' : ''}</label>
-      <select id="dps-fill-component" ${_bridgeForced ? "disabled" : disAttr} onchange="_dpsFillMarkDirty(); dpsFillUpdateVisibility(); dpsFillValidateCodeLive()">
+      <select id="dps-fill-component" ${(_bridgeForced && !ENGINEER_MODE) ? "disabled" : disAttr} onchange="_dpsFillMarkDirty(); dpsFillUpdateVisibility(); dpsFillValidateCodeLive()">
         ${comps.map(c => `<option value="${c.v}" ${c.v === preComponent ? "selected" : ""}>${escapeHtml(c.label)}</option>`).join("")}
       </select>
     </div>
@@ -11645,6 +12409,24 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
                  style="font-size:11px; margin-top:4px; color:var(--yellow); display:none;"></div>
           </div>
         </div>
+        <!-- v1.34.26: map (raw → состояние HA) — поле конфига моста для
+             binary_sensor (значения строго ON/OFF) и select (ключи из options). -->
+        <div id="dps-fill-map-block" style="display:none;">
+          <div class="form-group">
+            <label>map (raw → ON/OFF, JSON-объект)</label>
+            <textarea id="dps-fill-map" rows="2"
+              placeholder='Пример: {"presence": "ON", "none": "OFF"}'
+              style="width:100%; font-family:ui-monospace,monospace; font-size:12px;"
+              ${isView ? "disabled" : ""} oninput="_dpsFillMarkDirty(); dpsFillUpdateVisibility()"
+              onblur="_dpsFillUpdateSubmitState()">${escapeHtml(preMap)}</textarea>
+            <div id="dps-fill-map-preview" class="muted"
+                 style="font-size:11px; margin-top:4px; display:none;"></div>
+            <div class="dps-fill-hint" style="margin-top:2px;">
+              Сырые значения прибора → состояния HA. binary_sensor — только ON/OFF;
+              select — ключи из options.
+            </div>
+          </div>
+        </div>
       </div>
     </details>
 
@@ -11666,8 +12448,12 @@ function dpsOpenFillModal(dp, mode, keepDirty) {
   const titleEl = document.getElementById("dps-fill-title");
   // v1.28.68: bridge-forced — read-only. Добавлять зарезервированный DP
   // можно (поля фиксированы), редактировать существующий — нельзя.
-  const _ro = isView || (_bridgeForced && !isAdd);
-  if (_bridgeForced) titleEl.textContent = `DP ${dp} — `
+  // #1167-баг (заказчик 13.10.2026 17:51): в ручном инженерном режиме bridge-forced
+  // DP НЕ read-only — иначе поля редактируемы (disAttr), а кнопки «Сохранить»
+  // нет. _ro остаётся только для явного просмотра.
+  const _bfHardRo = _bridgeForced && !isAdd && !ENGINEER_MODE;
+  const _ro = isView || _bfHardRo;
+  if (_bridgeForced && !ENGINEER_MODE) titleEl.textContent = `DP ${dp} — `
     + (isAdd ? "добавление (зарезервировано bridge)" : "только просмотр");
   else if (isView) titleEl.textContent = `DP ${dp} — просмотр`;
   else if (isEdit) titleEl.textContent = `Редактировать DP ${dp}`;
@@ -11698,6 +12484,64 @@ function _devTypeSafe() {
   return (DPS_EDIT && DPS_EDIT._devType) ? DPS_EDIT._devType : "";
 }
 
+// v1.34.26: разбор поля map — зеркало bridge _validate_dps_map (main.py
+// DP_FIELDS_KEEP): binary_sensor → значения строго ON/OFF; select → ключи из options.
+function _parseDpMapField(comp, optionsArr) {
+  const ta = document.getElementById("dps-fill-map");
+  const raw = ta ? String(ta.value || "").trim() : "";
+  if (!raw) return { ok: true, map: null, err: "" };
+  let mp;
+  try { mp = JSON.parse(raw); } catch (e) {
+    return { ok: false, map: null, err: "map: невалидный JSON" };
+  }
+  if (!mp || typeof mp !== "object" || Array.isArray(mp)) {
+    return { ok: false, map: null, err: "map: нужен JSON-объект {raw: состояние}" };
+  }
+  if (comp === "binary_sensor") {
+    for (const [k, v] of Object.entries(mp)) {
+      if (v !== "ON" && v !== "OFF") {
+        return { ok: false, map: null, err: "map['" + k + "']: только \"ON\" или \"OFF\"" };
+      }
+    }
+  } else if (comp === "select") {
+    const opts = Array.isArray(optionsArr) ? optionsArr : [];
+    for (const k of Object.keys(mp)) {
+      if (!opts.includes(k)) {
+        return { ok: false, map: null, err: "map['" + k + "']: ключа нет в options" };
+      }
+    }
+  }
+  return { ok: true, map: mp, err: "" };
+}
+
+// v1.34.26: живая подсказка под полем map.
+function _dpsFillUpdateMapPreview() {
+  const el = document.getElementById("dps-fill-map-preview");
+  if (!el) return;
+  const comp = (document.getElementById("dps-fill-component") || {}).value || "";
+  let opts = [];
+  if (comp === "select") {
+    const ta = document.getElementById("dps-fill-options");
+    try {
+      const p = JSON.parse((ta && ta.value) || "[]");
+      if (Array.isArray(p)) opts = p;
+    } catch (e) { /* options ещё не введены */ }
+  }
+  const r = _parseDpMapField(comp, opts);
+  if (!r.ok) {
+    el.style.display = "block";
+    el.style.color = "var(--red)";
+    el.textContent = r.err;
+  } else if (r.map) {
+    el.style.display = "block";
+    el.style.color = "";
+    el.textContent = "map: " + Object.keys(r.map).length + " ключ(а) — будет записано.";
+  } else {
+    el.style.display = "none";
+    el.textContent = "";
+  }
+}
+
 // v1.28.30: единая точка для состояния submit-кнопки.
 // Учитывает и Code (regex/дубликаты/light), и Options (только select).
 // Раньше каждый валидатор ставил submitBtn.disabled независимо:
@@ -11708,12 +12552,14 @@ function _dpsFillUpdateSubmitState() {
   const codeInput = document.getElementById("dps-fill-code");
   const compInput = document.getElementById("dps-fill-component");
   if (!codeInput || !compInput) return;
+  const comp = compInput.value || "";
   const codeValid = codeInput.disabled
     ? true
     : _validateDpCode((codeInput.value || "").trim(),
-                      compInput.value || "", _dpsFillDp).level !== "err";
+                      comp, _dpsFillDp).level !== "err";
   let optionsValid = true;
-  if ((compInput.value || "") === "select") {
+  let parsedOptions = [];
+  if (comp === "select") {
     const ta = document.getElementById("dps-fill-options");
     const val = ta ? (ta.value || "").trim() : "";
     if (!val) {
@@ -11723,10 +12569,18 @@ function _dpsFillUpdateSubmitState() {
         const parsed = JSON.parse(val);
         optionsValid = Array.isArray(parsed) && parsed.length > 0
           && parsed.every(x => typeof x === "string");
+        if (optionsValid) parsedOptions = parsed;
       } catch (e) { optionsValid = false; }
     }
   }
-  submitBtn.disabled = !(codeValid && optionsValid);
+  // v1.34.26: map проверяем для компонентов, где мост его читает.
+  let mapValid = true;
+  if (comp === "select" || comp === "binary_sensor") {
+    mapValid = _parseDpMapField(comp, parsedOptions).ok;
+  }
+  _dpsFillUpdateMapPreview();
+  // v1.34.31 (#1167): инженерный режим — кнопка «Сохранить» всегда активна.
+  submitBtn.disabled = ENGINEER_MODE ? false : !(codeValid && optionsValid && mapValid);
 }
 
 function dpsFillUpdateVisibility() {
@@ -11736,6 +12590,13 @@ function dpsFillUpdateVisibility() {
   if (numBlock) numBlock.style.display = comp === "number" ? "block" : "none";
   // v1.27.11: options-блок только для select (preset не требует).
   if (optBlock) optBlock.style.display = comp === "select" ? "block" : "none";
+  // v1.34.26: map-блок — только там, где мост читает map (DP_FIELDS_KEEP в
+  // main.py): binary_sensor (значения ON/OFF) и select (ключи из options).
+  const mapBlock = document.getElementById("dps-fill-map-block");
+  if (mapBlock) {
+    mapBlock.style.display = (comp === "select" || comp === "binary_sensor") ? "block" : "none";
+  }
+  if (typeof _dpsFillUpdateMapPreview === "function") _dpsFillUpdateMapPreview();
 
   // v1.27.1: авто-раскрытие <details> для компонентов, требующих доп. поля.
   const det = document.getElementById("dps-fill-details");
@@ -11776,9 +12637,23 @@ async function closeDpsFill(evt, force) {
   _dpsFillDp = null;
   _dpsFillMode = "add";
   _dpsFillSource = "";
+  _dpsFillBase = null;   // v1.34.26: база записи живёт только пока открыта карточка
   _dpsFillDirty = false;
   const prev = document.getElementById("dps-fill-options-preview");
   if (prev) { prev.style.display = "none"; prev.textContent = ""; }
+}
+
+// v1.34.26: база записи DP для submit — без внутренних `_`-полей (их в конфиг
+// не пишем; см. _dpsMapStripped). Всё остальное сохраняется, включая поля,
+// которых нет в форме (map, values, role, inverted, ...).
+function _dpsFillBaseClean() {
+  const out = {};
+  const base = (_dpsFillBase && typeof _dpsFillBase === "object") ? _dpsFillBase : {};
+  for (const [k, v] of Object.entries(base)) {
+    if (k.startsWith("_")) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 function dpsFillSubmit() {
@@ -11808,7 +12683,7 @@ function dpsFillSubmit() {
 
   // v1.27.11: для light — Code из LIGHT_DP_NAMES_FRONT
   // (сообщение — «Code», а не «name» — так пользователю понятнее).
-  if (_devTypeSafe() === "light" && !forcedName) {
+  if (!ENGINEER_MODE && _devTypeSafe() === "light" && !forcedName) {   // v1.34.31 (#1167)
     if (!_LIGHT_DP_NAMES_FRONT.includes(finalName)) {
       errEl.style.display = "block";
       errEl.textContent =
@@ -11817,52 +12692,96 @@ function dpsFillSubmit() {
     }
   }
 
-  const info = { component: component, name: finalName };
-  if (deviceClass) info.device_class = deviceClass;
-  if (stateClass) info.state_class = stateClass;
-  if (unit) info.unit = unit;
+  // v1.34.26: база — запись из конфига (см. _dpsFillBase) без внутренних
+  // `_`-полей. Форма перекрывает только СВОИ поля, остальное (map, values,
+  // role, inverted и любые прочие ключи) сохраняется. Раньше запись собиралась
+  // с нуля, поэтому, например, map молча терялся при сохранении DP.
+  const info = _dpsFillBaseClean();
+  info.component = component;
+  info.name = finalName;
+  if (deviceClass) info.device_class = deviceClass; else delete info.device_class;
+  if (stateClass) info.state_class = stateClass; else delete info.state_class;
+  if (unit) info.unit = unit; else delete info.unit;
   const scale = parseInt(scaleStr, 10);
-  if (!isNaN(scale) && scale > 0) info.scale = scale;
+  if (!isNaN(scale) && scale > 0) info.scale = scale; else delete info.scale;
 
   if (component === "number") {
     const minV = parseFloat(document.getElementById("dps-fill-min").value);
     const maxV = parseFloat(document.getElementById("dps-fill-max").value);
     const stepV = parseFloat(document.getElementById("dps-fill-step").value);
-    if (isNaN(minV) || isNaN(maxV)) {
+    // v1.34.31 (#1167): в инженерном режиме не блокируем — пишем, что разобралось.
+    if (!ENGINEER_MODE && (isNaN(minV) || isNaN(maxV))) {
       errEl.style.display = "block";
       errEl.textContent = "number: нужно указать min и max";
       return;
     }
-    if (minV >= maxV) {
+    if (!ENGINEER_MODE && minV >= maxV) {
       errEl.style.display = "block";
       errEl.textContent = "number: min < max";
       return;
     }
-    info.min = minV;
-    info.max = maxV;
+    if (!isNaN(minV)) info.min = minV;
+    if (!isNaN(maxV)) info.max = maxV;
     if (!isNaN(stepV) && stepV > 0) info.step = stepV;
+  } else if ((_dpsFillBase || {}).component === "number") {
+    // v1.34.26: поля number не тянем в запись другого компонента. У light/
+    // climate свои min/max (они в базе) — их не трогаем.
+    delete info.min; delete info.max; delete info.step;
   }
 
   // v1.27.11: options обязателен только для select (preset — нет).
   if (component === "select") {
     const optStr = (document.getElementById("dps-fill-options").value || "").trim();
-    if (!optStr) {
+    // v1.34.31 (#1167): в инженерном режиме без блокировок — пишем, что разобралось.
+    if (ENGINEER_MODE) {
+      if (optStr) {
+        try {
+          const _o = JSON.parse(optStr);
+          if (Array.isArray(_o)) info.options = _o;
+        } catch (e) { /* инженерный режим: оставляем как ввёл пользователь */ }
+      }
+    } else {
+      if (!optStr) {
+        errEl.style.display = "block";
+        errEl.textContent = "options: нужен непустой JSON-массив строк";
+        return;
+      }
+      let opts;
+      try { opts = JSON.parse(optStr); } catch (e) {
+        errEl.style.display = "block";
+        errEl.textContent = "options: невалидный JSON";
+        return;
+      }
+      if (!Array.isArray(opts) || opts.length === 0 || !opts.every(x => typeof x === "string")) {
+        errEl.style.display = "block";
+        errEl.textContent = "options: должен быть непустой массив строк";
+        return;
+      }
+      info.options = opts;
+    }
+  }
+
+  // v1.34.26: map — как у моста (binary_sensor: значения ON/OFF; select: ключи
+  // из options). Правило одно и то же в live-проверке, при submit и в превью.
+  if (component === "select" || component === "binary_sensor") {
+    const _mr = _parseDpMapField(component,
+      Array.isArray(info.options) ? info.options : []);
+    // v1.34.31 (#1167): в инженерном режиме map не блокирует.
+    if (!_mr.ok && !ENGINEER_MODE) {
       errEl.style.display = "block";
-      errEl.textContent = "options: нужен непустой JSON-массив строк";
+      errEl.textContent = _mr.err;
       return;
     }
-    let opts;
-    try { opts = JSON.parse(optStr); } catch (e) {
-      errEl.style.display = "block";
-      errEl.textContent = "options: невалидный JSON";
-      return;
+    // v1.34.36 (#1170-3): пустое поле map не должно затирать map, который уже
+    // подставил выбранный источник (иначе «источник вроде выбран, а map не
+    // применяется»). Удаляем только если источника-мap'а тоже нет.
+    if (_mr.ok) {
+      if (_mr.map) {
+        info.map = _mr.map;
+      } else if (!(info.map && typeof info.map === "object" && Object.keys(info.map).length)) {
+        delete info.map;
+      }
     }
-    if (!Array.isArray(opts) || opts.length === 0 || !opts.every(x => typeof x === "string")) {
-      errEl.style.display = "block";
-      errEl.textContent = "options: должен быть непустой массив строк";
-      return;
-    }
-    info.options = opts;
   }
 
   // v1.27.1: логика по режиму.
@@ -11877,7 +12796,10 @@ function dpsFillSubmit() {
     }
   } else {
     // add
-    DPS_EDIT._added.push({ dp: _dpsFillDp, info: info, source: _dpsFillSource || "" });
+    // v1.34.37: источник из модалки — в info._dps_source, иначе колонка «Источник»
+  // у добавленного DP пуста (рендер смотрит info._dps_source || info._name_source).
+  if (_dpsFillSource) info._dps_source = _dpsFillSource;
+  DPS_EDIT._added.push({ dp: _dpsFillDp, info: info, source: _dpsFillSource || "" });
   }
 
   _dpsFillDirty = false;
@@ -11919,6 +12841,7 @@ function dpsFillValidateOptionsLive() {
 // v1.27.10: live-проверка Code (debounce 300мс).
 let _dpsFillCodeTimer = null;
 function dpsFillValidateCodeLive() {
+  if (ENGINEER_MODE) return;   // v1.34.31 (#1167): инженерный режим — без live-проверки
   if (_dpsFillCodeTimer) clearTimeout(_dpsFillCodeTimer);
   _dpsFillCodeTimer = setTimeout(() => dpsFillValidateCode(false), 300);
 }
@@ -11926,6 +12849,16 @@ function dpsFillValidateCodeLive() {
 function dpsFillValidateCode() {
   const inp = document.getElementById("dps-fill-code");
   if (!inp || inp.disabled) return;   // bridge-forced — не проверяем
+  // v1.34.31 (#1167): инженерный режим — не проверяем и не блокируем.
+  if (ENGINEER_MODE) {
+    inp.classList.remove("dps-fill-field-error", "dps-fill-input-warn");
+    const _e = document.getElementById("dps-fill-code-err");
+    const _w = document.getElementById("dps-fill-code-warn");
+    if (_e) { _e.style.display = "none"; _e.textContent = ""; }
+    if (_w) { _w.style.display = "none"; _w.textContent = ""; }
+    _dpsFillUpdateSubmitState();
+    return;
+  }
   const errEl = document.getElementById("dps-fill-code-err");
   const warnEl = document.getElementById("dps-fill-code-warn");
   const code = (inp.value || "").trim();
@@ -11992,6 +12925,13 @@ function dpsFillValidateOptions(isBlur) {
   const ta = document.getElementById("dps-fill-options");
   if (!ta) return;
   const prev = document.getElementById("dps-fill-options-preview");
+  // v1.34.31 (#1167): инженерный режим — валидации options отключены.
+  if (ENGINEER_MODE) {
+    ta.classList.remove("dps-fill-field-error");
+    if (prev) { prev.style.display = "none"; prev.textContent = ""; }
+    _dpsFillUpdateSubmitState();
+    return;
+  }
   const comp = (document.getElementById("dps-fill-component") || {}).value || "";
   if (comp !== "select") {
     if (prev) { prev.style.display = "none"; prev.textContent = ""; }

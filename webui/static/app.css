@@ -1214,6 +1214,18 @@
   .radio-row label { cursor:pointer; margin:0; font-size:13px; color:var(--fg); }
   /* v1.31.0: чекбоксы в модалках (опции пересборки) */
   .radio-row input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; flex:0 0 auto; }
+  /* v1.34.19: список новых (cloud-only) устройств в модалке пересборки */
+  .rebuild-unknown-list { max-height:220px; overflow:auto; border:1px solid var(--border);
+    border-radius:6px; margin-top:4px; }
+  .rebuild-unknown-row { display:flex; gap:8px; align-items:center; padding:6px 8px;
+    cursor:pointer; border-bottom:1px solid var(--border); font-size:12px; line-height:1.25; }
+  .rebuild-unknown-row:last-child { border-bottom:none; }
+  .rebuild-unknown-row:hover { background:var(--bg); }
+  .rebuild-unknown-row input[type="checkbox"] { width:16px; height:16px; margin:0;
+    flex:0 0 auto; accent-color:var(--accent); cursor:pointer; }
+  .rebuild-unknown-name { flex:1 1 auto; min-width:0; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .rebuild-unknown-meta { flex:0 0 auto; font-size:11px; color:var(--muted); }
   /* v1.31.0: список бэкапов для отката конфига */
   .restore-list { max-height:240px; overflow:auto; border:1px solid var(--border); border-radius:6px; }
   .restore-item { display:flex; gap:8px; align-items:center; padding:6px 8px; cursor:pointer; border-bottom:1px solid var(--border); font-size:12px; line-height:1.25; }
@@ -2556,6 +2568,24 @@
     color: var(--muted);
     min-width: 150px;
   }
+  /* v1.34.35 (#1169-баг-6, заказчик): превью источников — тонкая полоса
+     прокрутки + отступ, чтобы скроллбар не перекрывал последнюю строку. */
+  .dps-src-prev-scroll {
+    overflow: auto;
+    margin-top: 6px;
+    padding-bottom: 8px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(140,140,140,0.55) transparent;
+  }
+  .dps-src-prev-scroll::-webkit-scrollbar { height: 8px; width: 8px; }
+  .dps-src-prev-scroll::-webkit-scrollbar-track { background: transparent; }
+  .dps-src-prev-scroll::-webkit-scrollbar-thumb {
+    background: rgba(140,140,140,0.55);
+    border-radius: 4px;
+  }
+  .dps-src-prev-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(140,140,140,0.8);
+  }
   /* v1.28.71: сырые данные устройства (модалка дашборда).
      v1.28.73: тот же вертикальный ритм, что у остальных секций. */
   .raw-details {
@@ -2729,6 +2759,13 @@
       max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .dps-table td code { white-space: nowrap; word-break: normal; }
+    /* #1182 (заказчик 13.10.2026 22:40): «Превью источников» в редакторе DP на
+       мобильном складывалось в столбик — виноват `.detail-table{width:100%}`,
+       сжимавший 7 колонок. На мобиле даём таблице расти по содержимому, а
+       обрезку делает контейнер `.dps-src-prev-scroll` (у него overflow:auto). */
+    .dps-src-prev-scroll > table { width: max-content; min-width: 100%; }
+    .dps-src-prev-scroll > table th,
+    .dps-src-prev-scroll > table td { white-space: nowrap; vertical-align: top; }
     .dps-actions button { min-width: 30px; min-height: 30px; font-size: 15px; padding: 0; line-height: 1; }
     /* Модалки: full-width на мобиле */
     #dps-preview-overlay .modal,

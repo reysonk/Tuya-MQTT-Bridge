@@ -38,6 +38,10 @@ services:
       # 600 = включить защиту от спама кликов.
       - SWITCH_DEBOUNCE_MS=${SWITCH_DEBOUNCE_MS:-0}
       - SWITCH_DEBOUNCE_MAX_MS=${SWITCH_DEBOUNCE_MAX_MS:-1200}
+      # v1.15.1: очередь команд прибора - свежая команда больше не теряется.
+      - TUYA_MAX_QUEUE_DEPTH=${TUYA_MAX_QUEUE_DEPTH:-10}
+      - TUYA_CMD_DEDUP_WINDOW_MS=${TUYA_CMD_DEDUP_WINDOW_MS:-200}
+      - TUYA_SEND_PER_DEVICE_MS=${TUYA_SEND_PER_DEVICE_MS:-1}
       # v1.14.0: пассивный UDP-детектор вещаний Tuya.
       # 0 = выключен (мгновенный откат без пересборки образа).
       - UDP_ENABLED=${UDP_ENABLED:-1}

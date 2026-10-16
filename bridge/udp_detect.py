@@ -144,6 +144,27 @@ def _bump(key, n=1):
         _stats[key] = _stats.get(key, 0) + n
 
 
+# v1.14.29: пауза слушателя. tinytuya.deviceScan() биндится на тот же порт
+# 6667 и падает с EADDRINUSE, если порт занят нами.
+_PAUSE = threading.Event()
+_PAUSED_ACK = threading.Event()
+
+
+def pause(timeout=6.0):
+    """Освободить порт 6667 на время внешнего скана.
+
+    True — слушатель подтвердил, что сокет закрыт.
+    """
+    _PAUSED_ACK.clear()
+    _PAUSE.set()
+    return _PAUSED_ACK.wait(timeout)
+
+
+def resume():
+    """Вернуть слушатель после внешнего скана."""
+    _PAUSE.clear()
+
+
 def run(stop_event, port=6667, alive_window=30, reconnect_cooldown=120):
     """Цикл слушателя. Блокирующий — запускать в демон-треде.
 
@@ -171,6 +192,25 @@ def run(stop_event, port=6667, alive_window=30, reconnect_cooldown=120):
     known_ip = {}
     try:
         while not stop_event.is_set():
+            # v1.14.29: пауза — освобождаем порт для tinytuya.deviceScan.
+            if _PAUSE.is_set():
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                _PAUSED_ACK.set()
+                while _PAUSE.is_set() and not stop_event.is_set():
+                    time.sleep(0.05)
+                if stop_event.is_set():
+                    break
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(("0.0.0.0", port))
+                except OSError as e:
+                    log.error("[UDP] rebind после паузы: %s", e)
+                    break
+                continue
             try:
                 ready, _, _ = select.select([sock], [], [], 0.5)
             except (OSError, ValueError):
